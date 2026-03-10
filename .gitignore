@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+
+# Data files (large, downloaded locally)
+data/*.parquet
+data/*.csv
+data/*.h5
+
+# Backtest results (generated locally)
+backtest/results/*.csv
+backtest/results/*.json
+backtest/results/*.png
+backtest/results/*.html
+
+# Optuna storage
+*.db
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/.env
+
+# Logs
+*.log

@@ -1,0 +1,91 @@
+# ═══════════════════════════════════════════════════════════════════
+#  SMC Crypto Trading Bot – Default Configuration
+#  All tunable parameters for Optuna optimization and live trading
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Account & Risk ────────────────────────────────────────────────
+account:
+  size: 100_000            # USDT starting balance (fixed)
+  currency: "USDT"
+
+leverage:
+  min: 5
+  max: 15                  # Hard cap – funding & liquidation safety
+
+risk_per_trade:
+  min: 0.003               # 0.3 %
+  max: 0.015               # 1.5 %
+
+risk_reward:
+  options: [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]   # 1:2 … 1:5
+
+# ── Volume Filter ─────────────────────────────────────────────────
+volume_filter:
+  enabled: true
+  rank_threshold: 100      # Only trade coins inside top-100 by 30d volume
+  lookback_days: 30        # Rolling window for volume ranking
+  update_interval_hours: 1 # Live: re-rank every hour
+
+# ── Trading Styles ────────────────────────────────────────────────
+styles:
+  scalp:
+    entry_tf: "1m"         # Entry timeframe
+    confirm_tf: "5m"       # Confirmation timeframe
+    weight: 1.0            # Alignment-score weight (tunable)
+    max_hold_bars: 60      # Max hold time in entry-TF bars
+  day:
+    entry_tf: "15m"
+    confirm_tf: "1h"
+    weight: 1.0
+    max_hold_bars: 96      # ~24 h in 15 m bars
+  swing:
+    entry_tf: "4h"
+    confirm_tf: "1d"
+    weight: 1.0
+    max_hold_bars: 120     # ~20 d in 4 h bars
+
+# ── SMC Indicator Settings ────────────────────────────────────────
+smc:
+  swing_length: 10                # Swing detection lookback
+  fvg_threshold: 0.001            # Min FVG gap as fraction of price
+  order_block_lookback: 20        # Bars to look back for OB detection
+  liquidity_range_percent: 0.005  # ±0.5 % around swing highs/lows
+  bos_choch_lookback: 50          # Bars for BOS/CHoCH detection
+  session_ranges:                 # UTC times
+    asian:  ["00:00", "06:00"]
+    london: ["07:00", "10:00"]
+    new_york: ["13:00", "16:00"]
+
+# ── Top-Down Analysis ────────────────────────────────────────────
+top_down:
+  bias_tf: "1d"            # Daily bias direction
+  structure_tf: "4h"       # 4 h structure confirmation
+  entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
+  precision_tfs: ["5m", "1m"]  # Fine-tuning entry
+  alignment_threshold: 0.6 # Min alignment score [0-1] to take a trade
+
+# ── Data ──────────────────────────────────────────────────────────
+data:
+  exchange: "binanceusdm"  # CCXT exchange id (Binance USDT-M Futures)
+  base_tf: "1m"            # Lowest timeframe to download
+  resample_tfs: ["5m", "15m", "1h", "4h", "1d"]
+  start_date: "2019-11-01" # Earliest available Binance Futures data
+  data_dir: "data"         # Where Parquet files are stored
+
+# ── Backtest / Optuna ────────────────────────────────────────────
+backtest:
+  train_months: 6          # Walk-forward training window
+  test_months: 3           # Walk-forward test window
+  n_trials: 2000           # Optuna trials per window
+  top_percent: 0.20        # Extract top 20 % parameter sets
+  study_name: "smc_wfo"
+  storage: "sqlite:///backtest/results/optuna_study.db"
+  results_dir: "backtest/results"
+  commission_pct: 0.0004   # 0.04 % taker fee (Binance Futures)
+  slippage_pct: 0.0001     # 0.01 % estimated slippage
+
+# ── Live / Paper Trading (Phase 2) ───────────────────────────────
+live:
+  testnet: true            # Start on Binance Futures Testnet
+  poll_interval_sec: 5     # Order-book polling interval
+  max_open_trades: 5
