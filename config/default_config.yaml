@@ -74,8 +74,8 @@ data:
 
 # ── Backtest / Optuna ────────────────────────────────────────────
 backtest:
-  train_months: 6          # Walk-forward training window
-  test_months: 3           # Walk-forward test window
+  train_months: 2          # Walk-forward training window
+  test_months: 1           # Walk-forward test window
   n_trials: 2000           # Optuna trials per window
   top_percent: 0.20        # Extract top 20 % parameter sets
   study_name: "smc_wfo"
