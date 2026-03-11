@@ -257,10 +257,17 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     until_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     # ── 1. Connect & list symbols ─────────────────────────────────
-    logger.info("Connecting to exchange …")
+    logger.info("Connecting to exchange ...")
     exchange = create_exchange(cfg)
-    symbols = get_usdt_perp_symbols(exchange)
-    logger.info("Found %d USDT-perp symbols", len(symbols))
+
+    # === ULTRA-SCHNELL: Nur Top 20 Coins + letzte 12 Monate ===
+    symbols = [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "TONUSDT",
+        "ADAUSDT", "AVAXUSDT", "SHIBUSDT", "LINKUSDT", "DOTUSDT", "TRXUSDT", "BCHUSDT",
+        "NEARUSDT", "LTCUSDT", "PEPEUSDT", "SUIUSDT", "UNIUSDT", "HBARUSDT"
+    ]
+
+    logger.info(f"🚀 Schneller Test-Modus: Nur {len(symbols)} Top Coins + letzte 12 Monate")
 
     # ── 2. Download 1 m candles per symbol ────────────────────────
     for symbol in tqdm(symbols, desc="Downloading 1m data"):
