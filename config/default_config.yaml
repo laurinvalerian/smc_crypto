@@ -69,7 +69,7 @@ data:
   exchange: "binanceusdm"  # CCXT exchange id (Binance USDT-M Futures)
   base_tf: "1m"            # Lowest timeframe to download
   resample_tfs: ["5m", "15m", "1h", "4h", "1d"]
-  start_date: "2019-11-01" # Earliest available Binance Futures data
+  start_date: "2025-03-01" # letzte 12 Monate
   data_dir: "data"         # Where Parquet files are stored
 
 # ── Backtest / Optuna ────────────────────────────────────────────
