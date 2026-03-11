@@ -263,7 +263,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     # === ULTRA-SCHNELL: Nur Top 20 Coins + letzte 12 Monate ===
     symbols = [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "TONUSDT",
-        "ADAUSDT", "AVAXUSDT", "SHIBUSDT", "LINKUSDT", "DOTUSDT", "TRXUSDT", "BCHUSDT",
+        "ADAUSDT", "AVAXUSDT", "1000SHIBUSDT", "LINKUSDT", "DOTUSDT", "TRXUSDT", "BCHUSDT",
         "NEARUSDT", "LTCUSDT", "1000PEPEUSDT", "SUIUSDT", "UNIUSDT", "HBARUSDT"
     ]
 
