@@ -5,8 +5,9 @@
  Walk-Forward Optimization with Optuna Bayesian search.
 
  Features:
-   • Rolling walk-forward windows (6-month train / 3-month test)
-   • Optuna Bayesian optimisation (≥ 2 000 trials per window)
+   • Rolling walk-forward windows (2-month train / 1-month test)
+   • Optuna Bayesian optimisation (800 trials per window)
+   • Trades all available coins from data/ (no volume ranking)
    • Extracts top 20 % best parameter sets automatically
    • Generates parameter-importance ranking (plot + CSV)
    • Full performance metrics per trial:
@@ -387,34 +388,20 @@ def compute_param_importance(study: optuna.Study, results_dir: Path) -> pd.DataF
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Volume-filtered symbol list
+#  Available symbols (all Parquet files in data/)
 # ═══════════════════════════════════════════════════════════════════
 
-def get_top_symbols(
-    data_dir: Path,
-    month: pd.Period | None = None,
-    rank_threshold: int = 100,
-) -> list[str]:
+def get_available_symbols(data_dir: Path) -> list[str]:
     """
-    Read the pre-computed volume rankings and return symbols inside
-    the top *rank_threshold* for the given month.
-    Falls back to all available symbols if ranking file is missing.
+    Return all symbols for which a 1m Parquet file exists in *data_dir*.
+    No volume ranking or filtering – we simply trade all available coins.
     """
-    ranking_path = data_dir / "volume_rankings.parquet"
-    if not ranking_path.exists():
-        logger.warning("Volume ranking file not found – using all available symbols")
-        parquets = list(data_dir.glob("*_1m.parquet"))
-        return [
-            p.stem.replace("_1m", "").replace("_", "/").replace("/USDT/USDT", "/USDT:USDT")
-            for p in parquets
-        ]
-
-    rank_df = pd.read_parquet(ranking_path)
-    if month is not None:
-        rank_df = rank_df[rank_df["month"] == month]
-
-    top = rank_df[rank_df["rank"] <= rank_threshold]
-    return top["symbol"].unique().tolist()
+    parquets = sorted(data_dir.glob("*_1m.parquet"))
+    symbols = [
+        p.stem.replace("_1m", "").replace("_", "/").replace("/USDT/USDT", "/USDT:USDT")
+        for p in parquets
+    ]
+    return symbols
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -456,11 +443,8 @@ def run(config_path: str = "config/default_config.yaml") -> None:
             window["test_end"].date(),
         )
 
-        # Determine symbols for this window's training period
-        month = window["train_start"].to_period("M")
-        symbols = get_top_symbols(
-            data_dir, month=month, rank_threshold=cfg["volume_filter"]["rank_threshold"]
-        )
+        # Use all available coins from data/ (no volume ranking)
+        symbols = get_available_symbols(data_dir)
         if not symbols:
             logger.warning("No symbols for window %d – skipping", wi)
             continue

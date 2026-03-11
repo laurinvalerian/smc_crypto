@@ -21,7 +21,7 @@ risk_reward:
 
 # ── Volume Filter ─────────────────────────────────────────────────
 volume_filter:
-  enabled: true
+  enabled: false           # Disabled – we use all available coins
   rank_threshold: 100      # Only trade coins inside top-100 by 30d volume
   lookback_days: 30        # Rolling window for volume ranking
   update_interval_hours: 1 # Live: re-rank every hour
@@ -74,9 +74,9 @@ data:
 
 # ── Backtest / Optuna ────────────────────────────────────────────
 backtest:
-  train_months: 6          # Walk-forward training window
-  test_months: 3           # Walk-forward test window
-  n_trials: 2000           # Optuna trials per window
+  train_months: 2          # Walk-forward training window
+  test_months: 1           # Walk-forward test window
+  n_trials: 800            # Optuna trials per window
   top_percent: 0.20        # Extract top 20 % parameter sets
   study_name: "smc_wfo"
   storage: "sqlite:///backtest/results/optuna_study.db"
