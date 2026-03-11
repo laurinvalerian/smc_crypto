@@ -264,7 +264,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     symbols = [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "TONUSDT",
         "ADAUSDT", "AVAXUSDT", "SHIBUSDT", "LINKUSDT", "DOTUSDT", "TRXUSDT", "BCHUSDT",
-        "NEARUSDT", "LTCUSDT", "PEPEUSDT", "SUIUSDT", "UNIUSDT", "HBARUSDT"
+        "NEARUSDT", "LTCUSDT", "1000PEPEUSDT", "SUIUSDT", "UNIUSDT", "HBARUSDT"
     ]
 
     logger.info(f"🚀 Schneller Test-Modus: Nur {len(symbols)} Top Coins + letzte 12 Monate")
