@@ -36,6 +36,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import yaml
+from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from strategies.smc_multi_style import SMCMultiStyleStrategy, TradeSignal
@@ -292,14 +293,20 @@ def _build_objective(
         }
 
         strategy = SMCMultiStyleStrategy(config, params)
-        all_signals: list[TradeSignal] = []
 
-        for sym in symbols:
+        def _gen_signals(sym):
             try:
-                sigs = strategy.generate_signals(sym, start=train_start, end=train_end)
-                all_signals.extend(sigs)
+                return strategy.generate_signals(sym, start=train_start, end=train_end)
             except Exception as exc:
                 logger.debug("Signal gen failed for %s: %s", sym, exc)
+                return []
+
+        all_signals_list = Parallel(n_jobs=-1)(
+            delayed(_gen_signals)(sym) for sym in symbols
+        )
+        all_signals: list[TradeSignal] = [
+            s for sublist in all_signals_list for s in sublist
+        ]
 
         if not all_signals:
             return 0.0
@@ -485,7 +492,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
             cfg, symbols, window["train_start"], window["train_end"],
             window_index=wi, results_dir=results_dir,
         )
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        study.optimize(objective, n_trials=n_trials, n_jobs=-1, show_progress_bar=True)
 
         # ── Out-of-sample test with best params ──────────────────
         best_params = study.best_trial.params
@@ -495,15 +502,22 @@ def run(config_path: str = "config/default_config.yaml") -> None:
         }
 
         strategy = SMCMultiStyleStrategy(cfg, best_params)
-        oos_signals: list[TradeSignal] = []
-        for sym in symbols:
+
+        def _gen_oos_signals(sym):
             try:
-                sigs = strategy.generate_signals(
+                return strategy.generate_signals(
                     sym, start=window["test_start"], end=window["test_end"]
                 )
-                oos_signals.extend(sigs)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("OOS signal gen failed for %s: %s", sym, exc)
+                return []
+
+        oos_signals_list = Parallel(n_jobs=-1)(
+            delayed(_gen_oos_signals)(sym) for sym in symbols
+        )
+        oos_signals: list[TradeSignal] = [
+            s for sublist in oos_signals_list for s in sublist
+        ]
 
         oos_trades = simulate_trades(
             oos_signals,
