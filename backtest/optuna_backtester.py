@@ -12,7 +12,7 @@
    • Generates parameter-importance ranking (plot + CSV)
    • Full performance metrics per trial:
        Profit Factor, Max Drawdown, Sharpe, Winrate, #Trades,
-       Profit per Style (Scalp / Day / Swing), Recovery Factor
+       Recovery Factor
    • All results stored in /backtest/results
 
  Usage:
@@ -181,7 +181,7 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
             "total_pnl": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0,
             "sharpe": 0.0, "winrate": 0.0, "total_trades": 0,
             "recovery_factor": 0.0,
-            "pnl_scalp": 0.0, "pnl_day": 0.0, "pnl_swing": 0.0,
+            "pnl_day": 0.0,
         }
 
     pnl = trades_df["pnl"]
@@ -211,10 +211,8 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     max_dd_usd = abs(max_drawdown * account_size) if max_drawdown != 0 else 1e-9
     recovery_factor = total_pnl / max_dd_usd if max_dd_usd > 0 else 0.0
 
-    # PnL per style
-    pnl_scalp = float(trades_df.loc[trades_df["style"] == "scalp", "pnl"].sum())
+    # PnL per style (day only)
     pnl_day = float(trades_df.loc[trades_df["style"] == "day", "pnl"].sum())
-    pnl_swing = float(trades_df.loc[trades_df["style"] == "swing", "pnl"].sum())
 
     return {
         "total_pnl": total_pnl,
@@ -224,9 +222,7 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
         "winrate": winrate,
         "total_trades": int(len(pnl)),
         "recovery_factor": recovery_factor,
-        "pnl_scalp": pnl_scalp,
         "pnl_day": pnl_day,
-        "pnl_swing": pnl_swing,
     }
 
 
@@ -265,9 +261,7 @@ def _build_objective(
                 "alignment_threshold", 0.4, 0.9, step=0.05
             ),
             "style_weights": {
-                "scalp": trial.suggest_float("weight_scalp", 0.5, 1.5, step=0.1),
                 "day": trial.suggest_float("weight_day", 0.5, 1.5, step=0.1),
-                "swing": trial.suggest_float("weight_swing", 0.5, 1.5, step=0.1),
             },
             "order_block_lookback": trial.suggest_int("order_block_lookback", 10, 40),
             "liquidity_range_percent": trial.suggest_float(
@@ -466,9 +460,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
         best_params = study.best_trial.params
         # Reconstruct nested style_weights
         best_params["style_weights"] = {
-            "scalp": best_params.pop("weight_scalp", 1.0),
             "day": best_params.pop("weight_day", 1.0),
-            "swing": best_params.pop("weight_swing", 1.0),
         }
 
         strategy = SMCMultiStyleStrategy(cfg, best_params)
