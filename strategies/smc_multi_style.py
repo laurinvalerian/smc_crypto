@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -566,9 +566,6 @@ class SMCMultiStyleStrategy:
 
         # ── Precompute running arrays (O(n) once) ────────────────
         running_bias_1d = _precompute_running_bias(ind_1d, df_1d)
-        ema_bias = _compute_ema_bias(df_1d)
-        logger.info("[%s] Bias stats: BOS/CHoCH used on %d bars, EMA fallback on %d bars",
-                    symbol, (running_bias_1d != ema_bias).sum(), (running_bias_1d == ema_bias).sum())
         running_struct_1h = _precompute_running_structure(ind_1h)
         bull_trigger_5m, bear_trigger_5m = (
             _precompute_5m_trigger_mask(ind_5m)
@@ -601,11 +598,6 @@ class SMCMultiStyleStrategy:
 
         min_start = self.swing_length * 2
         total_bars = len(decision_df)
-
-        logger.info(
-            "[%s] Starting 5m bar-by-bar scan: %d bars (from idx %d)",
-            symbol, total_bars, min_start,
-        )
 
         # Iterate over 5m bars
         for i in range(min_start, total_bars):
@@ -689,12 +681,6 @@ class SMCMultiStyleStrategy:
                 take_profit = entry_price - sl_dist * self.rr_ratio
                 direction = "short"
 
-            # Debug: log every potential signal (passed all filters)
-            logger.info(
-                "[%s] POTENTIAL | ts=%s | bias=%s | h1_ok=%s | zone=%s | trigger=%s | score=%.2f | sl_dist=%.4f",
-                symbol, ts, bias, h1_ok, bool(entry_zone), precision_ok, score, sl_dist_pct,
-            )
-
             # ── Position sizing ───────────────────────────────────
             qty = compute_position_size(
                 self.account_size,
@@ -707,10 +693,6 @@ class SMCMultiStyleStrategy:
                 continue
 
             n_emitted += 1
-            logger.info(
-                "[%s] → SIGNAL EMITTED | Score=%.2f | SL_dist=%.4f",
-                symbol, score, sl_dist_pct,
-            )
             signals.append(
                 TradeSignal(
                     timestamp=ts,
@@ -736,9 +718,15 @@ class SMCMultiStyleStrategy:
         # ── Summary statistics ────────────────────────────────────
         avg_score = np.mean([s.alignment_score for s in signals]) if signals else 0
         logger.info(
-            "[%s] FINAL: signals=%d | avg_score=%.2f | neutral=%d | no_confirm=%d "
-            "| no_zone=%d | no_trigger=%d | low_score=%d | sl_too_small=%d",
-            symbol, len(signals), avg_score, n_neutral, n_no_confirm,
-            n_no_zone, n_no_trigger, n_low_score, n_sl_too_small,
+            "[%s] FINAL SIGNALS: %d | avg_score=%.2f",
+            symbol, len(signals), avg_score,
         )
+
+        # Save signals for debugging
+        if signals:
+            results_dir = Path("backtest/results")
+            results_dir.mkdir(parents=True, exist_ok=True)
+            sig_df = pd.DataFrame([asdict(s) for s in signals])
+            sig_df.to_csv(results_dir / f"signals_{symbol.replace('/', '_')}.csv", index=False)
+
         return signals

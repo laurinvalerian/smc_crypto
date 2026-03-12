@@ -52,7 +52,16 @@ top_down:
   structure_tf: "1h"       # 1H structure confirmation
   entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
   decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
-  alignment_threshold: 0.55 # Min alignment score [0-1] to take a trade
+  alignment_threshold: 0.50 # Min alignment score [0-1] to take a trade
+
+# ── Tuning Ranges (Optuna overrides) ─────────────────────────────
+tuning:
+  alignment_threshold_min: 0.35
+  alignment_threshold_max: 0.70
+  swing_length_min: 6
+  swing_length_max: 14
+  fvg_threshold_min: 0.0002
+  fvg_threshold_max: 0.0008
 
 # ── Data ──────────────────────────────────────────────────────────
 data:
