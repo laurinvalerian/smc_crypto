@@ -302,7 +302,7 @@ def _precompute_5m_trigger_mask(indicators_5m: dict[str, Any]) -> tuple[np.ndarr
             elif pd.notna(fvg_dir) and fvg_dir < 0:
                 bear_raw[i] = True
 
-    # Compute rolling window (lookback=6 bars) trigger
+    # Compute rolling window trigger — 6 bars × 5m = 30 min of signal persistence
     lookback = 6
     for i in range(n):
         start = max(0, i - lookback + 1)
@@ -625,12 +625,13 @@ class SMCMultiStyleStrategy:
                 else:
                     stop_loss = entry_zone["top"] * (1 + self.liq_range_pct)
             else:
-                # Fallback: use recent swing low/high from 5m
+                # Fallback SL: use recent 5m swing low/high (20 bars ≈ 100 min)
+                _sl_lookback = 20
                 if bias == "bullish":
-                    recent_lows = decision_df["low"].iloc[max(0, i - 20): i + 1]
+                    recent_lows = decision_df["low"].iloc[max(0, i - _sl_lookback): i + 1]
                     stop_loss = float(recent_lows.min()) * (1 - self.liq_range_pct)
                 else:
-                    recent_highs = decision_df["high"].iloc[max(0, i - 20): i + 1]
+                    recent_highs = decision_df["high"].iloc[max(0, i - _sl_lookback): i + 1]
                     stop_loss = float(recent_highs.max()) * (1 + self.liq_range_pct)
 
             sl_dist = abs(entry_price - stop_loss)
