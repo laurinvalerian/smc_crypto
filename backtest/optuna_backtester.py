@@ -41,10 +41,19 @@ from tqdm import tqdm
 from strategies.smc_multi_style import SMCMultiStyleStrategy, TradeSignal
 
 # ── Logging ───────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# File handler: all detailed logs go to backtest.log
+_results_dir = Path("backtest/results")
+_results_dir.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(_results_dir / "backtest.log", mode="w")
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+# Console handler: only WARNING+ (tqdm provides progress)
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.WARNING)
+_console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 logger = logging.getLogger(__name__)
 # Suppress noisy Optuna trial logs
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -235,11 +244,14 @@ def _build_objective(
     symbols: list[str],
     train_start: pd.Timestamp,
     train_end: pd.Timestamp,
+    window_index: int = 0,
+    results_dir: Path | None = None,
 ):
     """Return an Optuna objective function closed over the training window."""
 
     def objective(trial: optuna.Trial) -> float:
         # ── Sample hyperparameters ────────────────────────────────
+        tuning = config.get("tuning", {})
         params: dict[str, Any] = {
             "leverage": trial.suggest_int(
                 "leverage", config["leverage"]["min"], config["leverage"]["max"]
@@ -253,12 +265,22 @@ def _build_objective(
             "risk_reward": trial.suggest_categorical(
                 "risk_reward", config["risk_reward"]["options"]
             ),
-            "swing_length": trial.suggest_int("swing_length", 5, 20),
-            "fvg_threshold": trial.suggest_float(
-                "fvg_threshold", 0.0005, 0.005, step=0.0005
-            ),
             "alignment_threshold": trial.suggest_float(
-                "alignment_threshold", 0.4, 0.9, step=0.05
+                "alignment_threshold",
+                tuning.get("alignment_threshold_min", 0.35),
+                tuning.get("alignment_threshold_max", 0.70),
+                step=0.05,
+            ),
+            "swing_length": trial.suggest_int(
+                "swing_length",
+                tuning.get("swing_length_min", 6),
+                tuning.get("swing_length_max", 14),
+            ),
+            "fvg_threshold": trial.suggest_float(
+                "fvg_threshold",
+                tuning.get("fvg_threshold_min", 0.0002),
+                tuning.get("fvg_threshold_max", 0.0008),
+                step=0.0001,
             ),
             "style_weights": {
                 "day": trial.suggest_float("weight_day", 0.5, 1.5, step=0.1),
@@ -288,6 +310,14 @@ def _build_objective(
             slippage_pct=config["backtest"]["slippage_pct"],
         )
         metrics = compute_metrics(trades, account_size=config["account"]["size"])
+
+        # Save trades for this trial
+        if results_dir is not None and not trades.empty:
+            trades_sorted = trades.sort_values("timestamp")
+            trades_sorted.to_csv(
+                results_dir / f"trades_window{window_index}_trial{trial.number}.csv",
+                index=False,
+            )
 
         # Multi-objective proxy: Profit Factor × (1 − |MaxDD|) × Sharpe
         score = (
@@ -452,7 +482,8 @@ def run(config_path: str = "config/default_config.yaml") -> None:
             load_if_exists=True,
         )
         objective = _build_objective(
-            cfg, symbols, window["train_start"], window["train_end"]
+            cfg, symbols, window["train_start"], window["train_end"],
+            window_index=wi, results_dir=results_dir,
         )
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
@@ -480,6 +511,11 @@ def run(config_path: str = "config/default_config.yaml") -> None:
             slippage_pct=cfg["backtest"]["slippage_pct"],
         )
         oos_metrics = compute_metrics(oos_trades, account_size=cfg["account"]["size"])
+
+        # Save all trades for this window (all coins, sorted by timestamp)
+        if not oos_trades.empty:
+            all_trades_sorted = oos_trades.sort_values("timestamp")
+            all_trades_sorted.to_csv(results_dir / f"all_trades_w{wi}.csv", index=False)
 
         # Save window results
         window_result = {"window": wi, **oos_metrics, **best_params}
