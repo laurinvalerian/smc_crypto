@@ -52,7 +52,7 @@ top_down:
   structure_tf: "1h"       # 1H structure confirmation
   entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
   decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
-  alignment_threshold: 0.35 # Min alignment score [0-1] to take a trade
+  alignment_threshold: 0.40 # Min alignment score [0-1] to take a trade
 
 # ── Data ──────────────────────────────────────────────────────────
 data:

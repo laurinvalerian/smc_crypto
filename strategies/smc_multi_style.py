@@ -139,10 +139,47 @@ def compute_smc_indicators(
 #  Precomputed running arrays for temporal slicing (no future peek)
 # ═══════════════════════════════════════════════════════════════════
 
-def _precompute_running_bias(indicators: dict[str, Any]) -> np.ndarray:
+def _compute_ema_bias(df_1d: pd.DataFrame, period: int = 200) -> np.ndarray:
+    """Fallback: EMA200 Trend auf 1D (bullish wenn close > EMA)."""
+    if len(df_1d) < period:
+        return np.zeros(len(df_1d), dtype=np.int8)
+    ema = df_1d["close"].ewm(span=period, adjust=False).mean()
+    bias = np.where(df_1d["close"] > ema, 1, -1)
+    return bias.astype(np.int8)
+
+
+def _precompute_running_bias(indicators: dict[str, Any], df_1d: pd.DataFrame) -> np.ndarray:
     """
-    For each bar index i, compute the bias if we only look at rows 0..i.
-    Returns an array of ints: +1 (bullish), -1 (bearish), 0 (neutral).
+    Primary: BOS/CHoCH (wie bisher)
+    Fallback: EMA200 Trend, wenn BOS/CHoCH neutral bleibt.
+    """
+    bos_choch = indicators.get("bos_choch")
+    n = len(df_1d)
+    running = np.zeros(n, dtype=np.int8)
+    last_sig = 0
+
+    # 1. BOS/CHoCH (primary)
+    if bos_choch is not None and not bos_choch.empty:
+        for i in range(n):
+            choch = bos_choch["CHOCH"].iat[i]
+            bos = bos_choch["BOS"].iat[i]
+            val = choch if (pd.notna(choch) and choch != 0) else bos
+            if pd.notna(val) and val != 0:
+                last_sig = 1 if val > 0 else -1
+            running[i] = last_sig
+
+    # 2. EMA-Fallback nur wo immer noch neutral
+    ema_bias = _compute_ema_bias(df_1d)
+    mask = running == 0
+    running[mask] = ema_bias[mask]
+
+    return running
+
+
+def _precompute_running_structure(indicators: dict[str, Any]) -> np.ndarray:
+    """
+    For each bar index i, compute the latest BOS/CHoCH direction (+1/-1/0).
+    Used for 1H structure confirmation (no EMA fallback needed).
     """
     bos_choch = indicators.get("bos_choch")
     if bos_choch is None or bos_choch.empty:
@@ -150,7 +187,7 @@ def _precompute_running_bias(indicators: dict[str, Any]) -> np.ndarray:
 
     n = len(bos_choch)
     running = np.zeros(n, dtype=np.int8)
-    last_sig = 0  # 0 = neutral
+    last_sig = 0
 
     for i in range(n):
         choch = bos_choch["CHOCH"].iat[i]
@@ -161,13 +198,6 @@ def _precompute_running_bias(indicators: dict[str, Any]) -> np.ndarray:
         running[i] = last_sig
 
     return running
-
-
-def _precompute_running_structure(indicators: dict[str, Any]) -> np.ndarray:
-    """
-    For each bar index i, compute the latest BOS/CHoCH direction (+1/-1/0).
-    """
-    return _precompute_running_bias(indicators)
 
 
 def _bias_from_running(running: np.ndarray, valid_len: int) -> str:
@@ -302,8 +332,8 @@ def _precompute_5m_trigger_mask(indicators_5m: dict[str, Any]) -> tuple[np.ndarr
             elif pd.notna(fvg_dir) and fvg_dir < 0:
                 bear_raw[i] = True
 
-    # Compute rolling window trigger — 6 bars × 5m = 30 min of signal persistence
-    lookback = 6
+    # Compute rolling window trigger — 3 bars × 5m = 15 min of signal persistence
+    lookback = 3
     for i in range(n):
         start = max(0, i - lookback + 1)
         bull[i] = bull_raw[start:i + 1].any()
@@ -532,7 +562,10 @@ class SMCMultiStyleStrategy:
         df_5m = decision_df
 
         # ── Precompute running arrays (O(n) once) ────────────────
-        running_bias_1d = _precompute_running_bias(ind_1d)
+        running_bias_1d = _precompute_running_bias(ind_1d, df_1d)
+        ema_bias = _compute_ema_bias(df_1d)
+        logger.info("[%s] Bias stats: BOS/CHoCH used on %d bars, EMA fallback on %d bars",
+                    symbol, (running_bias_1d != ema_bias).sum(), (running_bias_1d == ema_bias).sum())
         running_struct_1h = _precompute_running_structure(ind_1h)
         bull_trigger_5m, bear_trigger_5m = (
             _precompute_5m_trigger_mask(ind_5m)
