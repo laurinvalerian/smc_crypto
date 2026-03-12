@@ -236,17 +236,21 @@ def _find_entry_zone_at(
     """
     On the 15m timeframe, locate the most recent FVG or OB that
     aligns with the daily bias, only considering first *valid_len* rows.
+
+    Strict version: only zones from the last **6** 15m-bars (max 1.5 hours).
+    Additionally, price must be at least 30 % into the FVG/OB zone.
     """
     if valid_len <= 0:
         return None
 
     current_price = float(df_15m["close"].iloc[valid_len - 1])
+    max_zone_bars = 6  # 6 × 15m = 1.5 hours
 
     # Check FVGs
     fvg_data = indicators_15m.get("fvg")
     if fvg_data is not None and not fvg_data.empty:
         end = min(valid_len, len(fvg_data))
-        scan_start = max(0, end - 40)
+        scan_start = max(0, end - max_zone_bars)
         for idx in range(end - 1, scan_start - 1, -1):
             row = fvg_data.iloc[idx]
             fvg_dir = row.get("FVG", 0)
@@ -260,16 +264,24 @@ def _find_entry_zone_at(
             if gap_size < fvg_threshold:
                 continue
 
+            zone_range = abs(top_val - bottom_val)
+            if zone_range == 0:
+                continue
+
             if bias == "bullish" and fvg_dir > 0 and current_price >= bottom_val:
-                return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bullish"}
+                penetration = (current_price - bottom_val) / zone_range
+                if penetration >= 0.30:
+                    return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bullish"}
             if bias == "bearish" and fvg_dir < 0 and current_price <= top_val:
-                return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bearish"}
+                penetration = (top_val - current_price) / zone_range
+                if penetration >= 0.30:
+                    return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bearish"}
 
     # Fallback: check Order Blocks
     ob_data = indicators_15m.get("order_blocks")
     if ob_data is not None and not ob_data.empty:
         end = min(valid_len, len(ob_data))
-        scan_start = max(0, end - 30)
+        scan_start = max(0, end - max_zone_bars)
         for idx in range(end - 1, scan_start - 1, -1):
             row = ob_data.iloc[idx]
             ob_dir = row.get("OB", 0)
@@ -279,10 +291,18 @@ def _find_entry_zone_at(
             if pd.isna(ob_top) or pd.isna(ob_bottom) or pd.isna(ob_dir) or ob_dir == 0:
                 continue
 
+            zone_range = abs(ob_top - ob_bottom)
+            if zone_range == 0:
+                continue
+
             if bias == "bullish" and ob_dir > 0 and current_price >= ob_bottom:
-                return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bullish"}
+                penetration = (current_price - ob_bottom) / zone_range
+                if penetration >= 0.30:
+                    return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bullish"}
             if bias == "bearish" and ob_dir < 0 and current_price <= ob_top:
-                return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bearish"}
+                penetration = (ob_top - current_price) / zone_range
+                if penetration >= 0.30:
+                    return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bearish"}
 
     return None
 
@@ -290,54 +310,37 @@ def _find_entry_zone_at(
 def _precompute_5m_trigger_mask(indicators_5m: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     """
     Precompute boolean arrays for bullish/bearish triggers on 5m.
-    For each bar i, trigger[i] = True if there's a BOS/CHoCH or FVG signal
-    within the last few bars up to i (no future peek).
+
+    Strict version: only **real BOS or CHoCH** on exactly the current bar
+    or the immediately preceding bar (max 1 bar lookback, no rolling window).
+    FVG is excluded from the trigger (too noisy for 5m).
 
     Returns (bullish_trigger, bearish_trigger) arrays.
     """
-    n = 0
     bos_choch = indicators_5m.get("bos_choch")
-    fvg_data = indicators_5m.get("fvg")
 
-    if bos_choch is not None and not bos_choch.empty:
-        n = len(bos_choch)
-    elif fvg_data is not None and not fvg_data.empty:
-        n = len(fvg_data)
-
-    if n == 0:
+    if bos_choch is None or bos_choch.empty:
         return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
 
-    bull = np.zeros(n, dtype=bool)
-    bear = np.zeros(n, dtype=bool)
-
-    # Mark raw signal bars
+    n = len(bos_choch)
     bull_raw = np.zeros(n, dtype=bool)
     bear_raw = np.zeros(n, dtype=bool)
 
-    if bos_choch is not None and not bos_choch.empty:
-        for i in range(len(bos_choch)):
-            choch = bos_choch["CHOCH"].iat[i]
-            bos = bos_choch["BOS"].iat[i]
-            val = choch if (pd.notna(choch) and choch != 0) else bos
-            if pd.notna(val) and val > 0:
-                bull_raw[i] = True
-            elif pd.notna(val) and val < 0:
-                bear_raw[i] = True
-
-    if fvg_data is not None and not fvg_data.empty:
-        for i in range(min(len(fvg_data), n)):
-            fvg_dir = fvg_data["FVG"].iat[i]
-            if pd.notna(fvg_dir) and fvg_dir > 0:
-                bull_raw[i] = True
-            elif pd.notna(fvg_dir) and fvg_dir < 0:
-                bear_raw[i] = True
-
-    # Compute rolling window trigger — 3 bars × 5m = 15 min of signal persistence
-    lookback = 3
     for i in range(n):
-        start = max(0, i - lookback + 1)
-        bull[i] = bull_raw[start:i + 1].any()
-        bear[i] = bear_raw[start:i + 1].any()
+        choch = bos_choch["CHOCH"].iat[i]
+        bos = bos_choch["BOS"].iat[i]
+        val = choch if (pd.notna(choch) and choch != 0) else bos
+        if pd.notna(val) and val > 0:
+            bull_raw[i] = True
+        elif pd.notna(val) and val < 0:
+            bear_raw[i] = True
+
+    # Only allow current bar or previous bar (max 1 bar lookback)
+    bull = np.zeros(n, dtype=bool)
+    bear = np.zeros(n, dtype=bool)
+    for i in range(n):
+        bull[i] = bull_raw[i] or (i > 0 and bull_raw[i - 1])
+        bear[i] = bear_raw[i] or (i > 0 and bear_raw[i - 1])
 
     return bull, bear
 
@@ -593,6 +596,7 @@ class SMCMultiStyleStrategy:
         n_no_zone = 0
         n_no_trigger = 0
         n_low_score = 0
+        n_sl_too_small = 0
         n_emitted = 0
 
         min_start = self.swing_length * 2
@@ -671,12 +675,25 @@ class SMCMultiStyleStrategy:
             if sl_dist == 0:
                 continue
 
+            sl_dist_pct = sl_dist / entry_price
+
+            # ── SL distance filter (crypto daytrading minimum) ────
+            if sl_dist_pct < 0.0035:
+                n_sl_too_small += 1
+                continue
+
             if bias == "bullish":
                 take_profit = entry_price + sl_dist * self.rr_ratio
                 direction = "long"
             else:
                 take_profit = entry_price - sl_dist * self.rr_ratio
                 direction = "short"
+
+            # Debug: log every potential signal (passed all filters)
+            logger.info(
+                "[%s] POTENTIAL | ts=%s | bias=%s | h1_ok=%s | zone=%s | trigger=%s | score=%.2f | sl_dist=%.4f",
+                symbol, ts, bias, h1_ok, bool(entry_zone), precision_ok, score, sl_dist_pct,
+            )
 
             # ── Position sizing ───────────────────────────────────
             qty = compute_position_size(
@@ -690,6 +707,10 @@ class SMCMultiStyleStrategy:
                 continue
 
             n_emitted += 1
+            logger.info(
+                "[%s] → SIGNAL EMITTED | Score=%.2f | SL_dist=%.4f",
+                symbol, score, sl_dist_pct,
+            )
             signals.append(
                 TradeSignal(
                     timestamp=ts,
@@ -713,10 +734,11 @@ class SMCMultiStyleStrategy:
             )
 
         # ── Summary statistics ────────────────────────────────────
+        avg_score = np.mean([s.alignment_score for s in signals]) if signals else 0
         logger.info(
-            "[%s] Signal stats | total_bars=%d | neutral=%d | no_confirm=%d "
-            "| no_zone=%d | no_trigger=%d | low_score=%d | SIGNALS=%d | style=day",
-            symbol, total_bars, n_neutral, n_no_confirm,
-            n_no_zone, n_no_trigger, n_low_score, n_emitted,
+            "[%s] FINAL: signals=%d | avg_score=%.2f | neutral=%d | no_confirm=%d "
+            "| no_zone=%d | no_trigger=%d | low_score=%d | sl_too_small=%d",
+            symbol, len(signals), avg_score, n_neutral, n_no_confirm,
+            n_no_zone, n_no_trigger, n_low_score, n_sl_too_small,
         )
         return signals
