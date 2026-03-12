@@ -28,28 +28,18 @@ volume_filter:
 
 # ── Trading Styles ────────────────────────────────────────────────
 styles:
-  scalp:
-    entry_tf: "1m"         # Entry timeframe
-    confirm_tf: "5m"       # Confirmation timeframe
-    weight: 1.2            # Alignment-score weight (tunable)
-    max_hold_bars: 60      # Max hold time in entry-TF bars
   day:
-    entry_tf: "15m"
-    confirm_tf: "1h"
+    entry_tf: "5m"         # 5m decision/entry timeframe (crypto sweet spot)
+    confirm_tf: "1h"       # 1H structure confirmation
     weight: 1.0
-    max_hold_bars: 96      # ~24 h in 15 m bars
-  swing:
-    entry_tf: "4h"
-    confirm_tf: "1d"
-    weight: 0.8
-    max_hold_bars: 120     # ~20 d in 4 h bars
+    max_hold_bars: 96      # ~8 h in 5 m bars
 
 # ── SMC Indicator Settings ────────────────────────────────────────
 smc:
-  swing_length: 10                # Swing detection lookback
-  fvg_threshold: 0.0008           # Min FVG gap as fraction of price
-  order_block_lookback: 20        # Bars to look back for OB detection
-  liquidity_range_percent: 0.007  # ±0.7 % around swing highs/lows
+  swing_length: 8                 # Swing detection lookback (tighter for crypto)
+  fvg_threshold: 0.0004           # Min FVG gap as fraction of price (lower for crypto volatility)
+  order_block_lookback: 15        # Bars to look back for OB detection
+  liquidity_range_percent: 0.005  # ±0.5 % around swing highs/lows
   bos_choch_lookback: 50          # Bars for BOS/CHoCH detection
   session_ranges:                 # UTC times
     asian:  ["00:00", "06:00"]
@@ -59,10 +49,10 @@ smc:
 # ── Top-Down Analysis ────────────────────────────────────────────
 top_down:
   bias_tf: "1d"            # Daily bias direction
-  structure_tf: "4h"       # 4 h structure confirmation
+  structure_tf: "1h"       # 1H structure confirmation
   entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
-  precision_tfs: ["5m", "1m"]  # Fine-tuning entry
-  alignment_threshold: 0.45 # Min alignment score [0-1] to take a trade
+  decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
+  alignment_threshold: 0.35 # Min alignment score [0-1] to take a trade
 
 # ── Data ──────────────────────────────────────────────────────────
 data:

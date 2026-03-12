@@ -2,19 +2,17 @@
 ═══════════════════════════════════════════════════════════════════
  strategies/smc_multi_style.py
  ─────────────────────────────
- Smart-Money-Concepts (SMC / ICT) multi-style strategy.
+ Smart-Money-Concepts (SMC / ICT) Day-Trading-Only strategy,
+ optimised for high-volatility Crypto Perpetuals (BTC, SOL, ETH …).
 
- Responsibilities:
-   • Load & resample OHLCV data for every required timeframe
-   • Compute all SMC indicators via the 'smartmoneyconcepts' package:
-       FVG, Order Blocks, BOS / CHoCH, Liquidity Pools,
-       Swing High / Low, Previous High / Low, Sessions
-   • Top-Down analysis: Daily Bias → 4 h Structure → 15 m Entry
-     Zone → 5 m / 1 m precision entry
-   • Automatic style decision (Scalp / Day / Swing) based on an
-     alignment score
-   • Exact position-size calculation (risk % × leverage × SL distance)
-   • Return a list of trade signals for the backtester
+ Top-Down Flow (2025/2026 community best-practice):
+   1. Daily Bias          → 1D BOS/CHoCH
+   2. Structure Confirm   → 1H alignment
+   3. Entry Zone          → 15m FVG + OB + Liquidity
+   4. Decision & Trigger  → 5m bar-by-bar (BOS/CHoCH or FVG mitigation)
+
+ All SMC indicators are temporally sliced to the current 5m bar
+ (no future-peeking).
 
  Usage (from project root):
      from strategies.smc_multi_style import SMCMultiStyleStrategy
@@ -48,7 +46,7 @@ class TradeSignal:
     timestamp: pd.Timestamp
     symbol: str
     direction: str            # "long" | "short"
-    style: str                # "scalp" | "day" | "swing"
+    style: str                # "day" (only style)
     entry_price: float
     stop_loss: float
     take_profit: float
@@ -94,10 +92,10 @@ def _to_ohlc(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_smc_indicators(
     df: pd.DataFrame,
-    swing_length: int = 10,
-    fvg_threshold: float = 0.0008,
-    ob_lookback: int = 20,
-    liq_range_pct: float = 0.007,
+    swing_length: int = 8,
+    fvg_threshold: float = 0.0004,
+    ob_lookback: int = 15,
+    liq_range_pct: float = 0.005,
 ) -> dict[str, Any]:
     """
     Compute all SMC indicators on a single-timeframe OHLCV DataFrame
@@ -134,44 +132,63 @@ def compute_smc_indicators(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Bias & structure helpers
+#  Bias & structure helpers (temporally-safe slicing)
 # ═══════════════════════════════════════════════════════════════════
 
-def _daily_bias(indicators: dict[str, Any], df: pd.DataFrame) -> str:
+# ═══════════════════════════════════════════════════════════════════
+#  Precomputed running arrays for temporal slicing (no future peek)
+# ═══════════════════════════════════════════════════════════════════
+
+def _precompute_running_bias(indicators: dict[str, Any]) -> np.ndarray:
     """
-    Determine bullish / bearish / neutral daily bias from the latest
-    BOS/CHoCH and swing structure.
+    For each bar index i, compute the bias if we only look at rows 0..i.
+    Returns an array of ints: +1 (bullish), -1 (bearish), 0 (neutral).
     """
-    bos_choch = indicators["bos_choch"]
+    bos_choch = indicators.get("bos_choch")
     if bos_choch is None or bos_choch.empty:
-        return "neutral"
+        return np.zeros(0, dtype=np.int8)
 
-    # The SMC lib returns columns BOS and CHOCH with +1 (bullish) / -1 (bearish) / 0
-    last_valid_idx = bos_choch[["BOS", "CHOCH"]].replace(0, np.nan).last_valid_index()
-    if last_valid_idx is None:
-        return "neutral"
+    n = len(bos_choch)
+    running = np.zeros(n, dtype=np.int8)
+    last_sig = 0  # 0 = neutral
 
-    row = bos_choch.loc[last_valid_idx]
-    value = row["CHOCH"] if row["CHOCH"] != 0 else row["BOS"]
-    if value > 0:
+    for i in range(n):
+        choch = bos_choch["CHOCH"].iat[i]
+        bos = bos_choch["BOS"].iat[i]
+        val = choch if (pd.notna(choch) and choch != 0) else bos
+        if pd.notna(val) and val != 0:
+            last_sig = 1 if val > 0 else -1
+        running[i] = last_sig
+
+    return running
+
+
+def _precompute_running_structure(indicators: dict[str, Any]) -> np.ndarray:
+    """
+    For each bar index i, compute the latest BOS/CHoCH direction (+1/-1/0).
+    """
+    return _precompute_running_bias(indicators)
+
+
+def _bias_from_running(running: np.ndarray, valid_len: int) -> str:
+    """Look up precomputed running bias."""
+    if valid_len <= 0 or len(running) == 0:
+        return "neutral"
+    idx = min(valid_len - 1, len(running) - 1)
+    val = running[idx]
+    if val > 0:
         return "bullish"
-    if value < 0:
+    if val < 0:
         return "bearish"
     return "neutral"
 
 
-def _structure_confirms(indicators: dict[str, Any], bias: str) -> bool:
-    """Check whether the 4 h structure aligns with the daily bias."""
-    bos_choch = indicators["bos_choch"]
-    if bos_choch is None or bos_choch.empty:
+def _structure_confirms_from_running(running: np.ndarray, bias: str, valid_len: int) -> bool:
+    """Check if running structure matches bias."""
+    if valid_len <= 0 or len(running) == 0:
         return False
-
-    last_idx = bos_choch[["BOS", "CHOCH"]].replace(0, np.nan).last_valid_index()
-    if last_idx is None:
-        return False
-
-    row = bos_choch.loc[last_idx]
-    val = row["CHOCH"] if row["CHOCH"] != 0 else row["BOS"]
+    idx = min(valid_len - 1, len(running) - 1)
+    val = running[idx]
     if bias == "bullish" and val > 0:
         return True
     if bias == "bearish" and val < 0:
@@ -179,32 +196,34 @@ def _structure_confirms(indicators: dict[str, Any], bias: str) -> bool:
     return False
 
 
-def _find_entry_zone(
-    indicators: dict[str, Any],
-    df: pd.DataFrame,
+def _find_entry_zone_at(
+    indicators_15m: dict[str, Any],
+    df_15m: pd.DataFrame,
     bias: str,
     fvg_threshold: float,
+    valid_len: int,
 ) -> dict[str, Any] | None:
     """
-    On the 15 m timeframe, locate the most recent FVG or OB that
-    aligns with the daily bias.  Returns a dict with zone boundaries
-    or None if no valid zone exists.
+    On the 15m timeframe, locate the most recent FVG or OB that
+    aligns with the daily bias, only considering first *valid_len* rows.
     """
-    fvg_data = indicators["fvg"]
-    ob_data = indicators["order_blocks"]
-    current_price = float(df["close"].iloc[-1])
+    if valid_len <= 0:
+        return None
+
+    current_price = float(df_15m["close"].iloc[valid_len - 1])
 
     # Check FVGs
+    fvg_data = indicators_15m.get("fvg")
     if fvg_data is not None and not fvg_data.empty:
-        for idx in range(len(fvg_data) - 1, max(len(fvg_data) - 30, -1), -1):
+        end = min(valid_len, len(fvg_data))
+        scan_start = max(0, end - 40)
+        for idx in range(end - 1, scan_start - 1, -1):
             row = fvg_data.iloc[idx]
             fvg_dir = row.get("FVG", 0)
             top_val = row.get("Top", np.nan)
             bottom_val = row.get("Bottom", np.nan)
 
-            if pd.isna(top_val) or pd.isna(bottom_val):
-                continue
-            if fvg_dir == 0:
+            if pd.isna(top_val) or pd.isna(bottom_val) or pd.isna(fvg_dir) or fvg_dir == 0:
                 continue
 
             gap_size = abs(top_val - bottom_val) / current_price
@@ -217,14 +236,17 @@ def _find_entry_zone(
                 return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bearish"}
 
     # Fallback: check Order Blocks
+    ob_data = indicators_15m.get("order_blocks")
     if ob_data is not None and not ob_data.empty:
-        for idx in range(len(ob_data) - 1, max(len(ob_data) - 20, -1), -1):
+        end = min(valid_len, len(ob_data))
+        scan_start = max(0, end - 30)
+        for idx in range(end - 1, scan_start - 1, -1):
             row = ob_data.iloc[idx]
             ob_dir = row.get("OB", 0)
             ob_top = row.get("Top", np.nan)
             ob_bottom = row.get("Bottom", np.nan)
 
-            if pd.isna(ob_top) or pd.isna(ob_bottom) or ob_dir == 0:
+            if pd.isna(ob_top) or pd.isna(ob_bottom) or pd.isna(ob_dir) or ob_dir == 0:
                 continue
 
             if bias == "bullish" and ob_dir > 0 and current_price >= ob_bottom:
@@ -233,6 +255,61 @@ def _find_entry_zone(
                 return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bearish"}
 
     return None
+
+
+def _precompute_5m_trigger_mask(indicators_5m: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Precompute boolean arrays for bullish/bearish triggers on 5m.
+    For each bar i, trigger[i] = True if there's a BOS/CHoCH or FVG signal
+    within the last few bars up to i (no future peek).
+
+    Returns (bullish_trigger, bearish_trigger) arrays.
+    """
+    n = 0
+    bos_choch = indicators_5m.get("bos_choch")
+    fvg_data = indicators_5m.get("fvg")
+
+    if bos_choch is not None and not bos_choch.empty:
+        n = len(bos_choch)
+    elif fvg_data is not None and not fvg_data.empty:
+        n = len(fvg_data)
+
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+
+    bull = np.zeros(n, dtype=bool)
+    bear = np.zeros(n, dtype=bool)
+
+    # Mark raw signal bars
+    bull_raw = np.zeros(n, dtype=bool)
+    bear_raw = np.zeros(n, dtype=bool)
+
+    if bos_choch is not None and not bos_choch.empty:
+        for i in range(len(bos_choch)):
+            choch = bos_choch["CHOCH"].iat[i]
+            bos = bos_choch["BOS"].iat[i]
+            val = choch if (pd.notna(choch) and choch != 0) else bos
+            if pd.notna(val) and val > 0:
+                bull_raw[i] = True
+            elif pd.notna(val) and val < 0:
+                bear_raw[i] = True
+
+    if fvg_data is not None and not fvg_data.empty:
+        for i in range(min(len(fvg_data), n)):
+            fvg_dir = fvg_data["FVG"].iat[i]
+            if pd.notna(fvg_dir) and fvg_dir > 0:
+                bull_raw[i] = True
+            elif pd.notna(fvg_dir) and fvg_dir < 0:
+                bear_raw[i] = True
+
+    # Compute rolling window (lookback=6 bars) trigger
+    lookback = 6
+    for i in range(n):
+        start = max(0, i - lookback + 1)
+        bull[i] = bull_raw[start:i + 1].any()
+        bear[i] = bear_raw[start:i + 1].any()
+
+    return bull, bear
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -276,38 +353,33 @@ def compute_position_size(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Alignment score
+#  Alignment score (4-step, 0.25 per step)
 # ═══════════════════════════════════════════════════════════════════
 
 def _compute_alignment_score(
     daily_bias: str,
-    h4_confirms: bool,
+    h1_confirms: bool,
     entry_zone: dict | None,
-    precision_indicators: dict[str, Any] | None,
-    style_weight: float,
+    precision_trigger: bool,
+    style_weight: float = 1.0,
 ) -> float:
     """
     Combine top-down alignment signals into a 0–1 score.
-      • Daily bias present          → +0.25
-      • 4 h structure confirms      → +0.25
-      • 15 m entry zone exists      → +0.25
-      • 5 m / 1 m precision signal  → +0.25
-    Each component is multiplied by *style_weight* and clamped to [0, 1].
+      • Daily bias present (1D)       → +0.25
+      • 1H structure confirms          → +0.25
+      • 15m entry zone exists          → +0.25
+      • 5m precision trigger active    → +0.25
+    Multiplied by *style_weight* and clamped to [0, 1].
     """
     score = 0.0
     if daily_bias in ("bullish", "bearish"):
         score += 0.25
-    if h4_confirms:
+    if h1_confirms:
         score += 0.25
     if entry_zone is not None:
         score += 0.25
-    if precision_indicators is not None:
-        # Check for recent BOS on precision TF
-        bos = precision_indicators.get("bos_choch")
-        if bos is not None and not bos.empty:
-            last_idx = bos[["BOS", "CHOCH"]].replace(0, np.nan).last_valid_index()
-            if last_idx is not None:
-                score += 0.25
+    if precision_trigger:
+        score += 0.25
 
     return min(score * style_weight, 1.0)
 
@@ -318,7 +390,7 @@ def _compute_alignment_score(
 
 class SMCMultiStyleStrategy:
     """
-    Multi-style SMC / ICT strategy.
+    Day-trading-only SMC / ICT strategy for Crypto Perpetuals.
 
     Parameters
     ----------
@@ -327,8 +399,7 @@ class SMCMultiStyleStrategy:
     params : dict
         Tunable parameters for this trial (from Optuna or manual).
         Expected keys: leverage, risk_per_trade, risk_reward,
-                        style_weights (dict), swing_length,
-                        fvg_threshold, alignment_threshold.
+                        swing_length, fvg_threshold, alignment_threshold.
     """
 
     def __init__(self, config: dict[str, Any], params: dict[str, Any]) -> None:
@@ -348,13 +419,9 @@ class SMCMultiStyleStrategy:
             "alignment_threshold", config["top_down"]["alignment_threshold"]
         )
 
-        # Style weights
+        # Day style weight (only style)
         sw = params.get("style_weights", {})
-        self.style_weights: dict[str, float] = {
-            "scalp": sw.get("scalp", config["styles"]["scalp"]["weight"]),
-            "day": sw.get("day", config["styles"]["day"]["weight"]),
-            "swing": sw.get("swing", config["styles"]["swing"]["weight"]),
-        }
+        self.style_weight: float = sw.get("day", config["styles"]["day"]["weight"])
 
         self.data_dir = Path(config["data"]["data_dir"])
         self.commission_pct: float = config["backtest"].get("commission_pct", 0.0004)
@@ -371,7 +438,7 @@ class SMCMultiStyleStrategy:
 
     def _load_all_timeframes(self, symbol: str) -> dict[str, pd.DataFrame]:
         """Load or resample all required timeframes from 1 m base."""
-        tfs_needed = {"1m", "5m", "15m", "1h", "4h", "1d"}
+        tfs_needed = {"1m", "5m", "15m", "1h", "1d"}
         frames: dict[str, pd.DataFrame] = {}
 
         # Try loading pre-saved Parquet for each TF
@@ -397,7 +464,13 @@ class SMCMultiStyleStrategy:
         end: pd.Timestamp | None = None,
     ) -> list[TradeSignal]:
         """
-        Walk bar-by-bar through the data and generate trade signals.
+        Walk bar-by-bar through 5m data and generate day-trade signals.
+
+        Top-down flow per bar:
+          1. 1D daily bias (BOS/CHoCH)
+          2. 1H structure confirmation
+          3. 15m entry zone (FVG or OB)
+          4. 5m precision trigger (BOS/CHoCH or FVG mitigation)
 
         Parameters
         ----------
@@ -406,11 +479,11 @@ class SMCMultiStyleStrategy:
         """
         frames = self._load_all_timeframes(symbol)
         if not frames:
-            logger.warning("No data for %s", symbol)
+            logger.warning("[%s] No data available – skipping", symbol)
             return []
 
         # Slice to window
-        for tf in frames:
+        for tf in list(frames.keys()):
             df = frames[tf]
             if start is not None:
                 df = df[df["timestamp"] >= start]
@@ -420,7 +493,7 @@ class SMCMultiStyleStrategy:
 
         signals: list[TradeSignal] = []
 
-        # Pre-compute SMC indicators for each timeframe
+        # Pre-compute SMC indicators for each timeframe (full range)
         indicators: dict[str, dict[str, Any]] = {}
         for tf, df in frames.items():
             if df.empty or len(df) < self.swing_length * 2:
@@ -434,78 +507,130 @@ class SMCMultiStyleStrategy:
                     liq_range_pct=self.liq_range_pct,
                 )
             except Exception as exc:
-                logger.debug("SMC computation failed for %s %s: %s", symbol, tf, exc)
+                logger.debug("[%s] SMC computation failed for %s: %s", symbol, tf, exc)
 
-        # Reference frame for iteration: use 15 m as the "decision" cadence
-        decision_tf = "15m"
+        # Decision timeframe: 5m (the crypto sweet spot)
+        decision_tf = "5m"
         decision_df = frames.get(decision_tf)
         if decision_df is None or decision_df.empty:
+            logger.info("[%s] No 5m data – 0 signals", symbol)
             return signals
 
-        # Iterate over decision-TF bars
-        for i in range(self.swing_length * 2, len(decision_df)):
+        # Required higher-TF indicators
+        ind_1d = indicators.get("1d")
+        ind_1h = indicators.get("1h")
+        ind_15m = indicators.get("15m")
+        ind_5m = indicators.get("5m")
+
+        if ind_1d is None or ind_1h is None:
+            logger.info("[%s] Missing 1D or 1H indicators – 0 signals", symbol)
+            return signals
+
+        df_1d = frames.get("1d", pd.DataFrame())
+        df_1h = frames.get("1h", pd.DataFrame())
+        df_15m = frames.get("15m", pd.DataFrame())
+        df_5m = decision_df
+
+        # ── Precompute running arrays (O(n) once) ────────────────
+        running_bias_1d = _precompute_running_bias(ind_1d)
+        running_struct_1h = _precompute_running_structure(ind_1h)
+        bull_trigger_5m, bear_trigger_5m = (
+            _precompute_5m_trigger_mask(ind_5m)
+            if ind_5m is not None else (np.zeros(0, dtype=bool), np.zeros(0, dtype=bool))
+        )
+
+        # ── Precompute temporal index maps (searchsorted, O(n log m)) ─
+        ts_5m = decision_df["timestamp"].values
+
+        def _build_valid_len_map(htf_df: pd.DataFrame) -> np.ndarray:
+            """Return an array where each entry is the count of HTF rows
+            with timestamp <= the corresponding 5m timestamp."""
+            if htf_df.empty:
+                return np.zeros(len(ts_5m), dtype=np.int64)
+            htf_ts = htf_df["timestamp"].values
+            return np.searchsorted(htf_ts, ts_5m, side="right").astype(np.int64)
+
+        vlen_1d = _build_valid_len_map(df_1d)
+        vlen_1h = _build_valid_len_map(df_1h)
+        vlen_15m = _build_valid_len_map(df_15m)
+
+        # Debug counters
+        n_neutral = 0
+        n_no_confirm = 0
+        n_no_zone = 0
+        n_no_trigger = 0
+        n_low_score = 0
+        n_emitted = 0
+
+        min_start = self.swing_length * 2
+        total_bars = len(decision_df)
+
+        logger.info(
+            "[%s] Starting 5m bar-by-bar scan: %d bars (from idx %d)",
+            symbol, total_bars, min_start,
+        )
+
+        # Iterate over 5m bars
+        for i in range(min_start, total_bars):
             bar = decision_df.iloc[i]
-            ts = bar["timestamp"]
+            ts = pd.Timestamp(bar["timestamp"])
 
-            # ── Step 1: Daily bias ────────────────────────────────
-            daily_ind = indicators.get("1d")
-            if daily_ind is None:
-                continue
-            bias = _daily_bias(daily_ind, frames["1d"])
-
+            # ── Step 1: Daily bias (1D) ───────────────────────────
+            bias = _bias_from_running(running_bias_1d, int(vlen_1d[i]))
             if bias == "neutral":
+                n_neutral += 1
                 continue
 
-            # ── Step 2: 4 h structure confirmation ────────────────
-            h4_ind = indicators.get("4h")
-            if h4_ind is None:
-                continue
-            h4_ok = _structure_confirms(h4_ind, bias)
-
-            # ── Step 3: 15 m entry zone ───────────────────────────
-            m15_ind = indicators.get("15m")
-            if m15_ind is None:
-                continue
-            # Slice indicators to current bar index
-            entry_zone = _find_entry_zone(
-                m15_ind,
-                decision_df.iloc[: i + 1],
-                bias,
-                self.fvg_threshold,
+            # ── Step 2: 1H structure confirmation ─────────────────
+            h1_ok = _structure_confirms_from_running(
+                running_struct_1h, bias, int(vlen_1h[i])
             )
 
-            # ── Step 4: Precision TF check ────────────────────────
-            precision_ind = indicators.get("5m") or indicators.get("1m")
-
-            # ── Alignment score & style decision ──────────────────
-            best_style = None
-            best_score = 0.0
-            for style_name, weight in self.style_weights.items():
-                score = _compute_alignment_score(
-                    bias, h4_ok, entry_zone, precision_ind, weight
+            # ── Step 3: 15m entry zone (FVG / OB) ────────────────
+            entry_zone = None
+            if ind_15m is not None and not df_15m.empty:
+                entry_zone = _find_entry_zone_at(
+                    ind_15m, df_15m, bias, self.fvg_threshold, int(vlen_15m[i]),
                 )
-                if score > best_score:
-                    best_score = score
-                    best_style = style_name
 
-            if best_score < self.alignment_threshold or best_style is None:
+            # ── Step 4: 5m precision trigger ──────────────────────
+            precision_ok = False
+            if i < len(bull_trigger_5m):
+                if bias == "bullish":
+                    precision_ok = bool(bull_trigger_5m[i])
+                elif bias == "bearish":
+                    precision_ok = bool(bear_trigger_5m[i])
+
+            # ── Alignment score ───────────────────────────────────
+            score = _compute_alignment_score(
+                bias, h1_ok, entry_zone, precision_ok, self.style_weight,
+            )
+
+            if score < self.alignment_threshold:
+                if not h1_ok:
+                    n_no_confirm += 1
+                elif entry_zone is None:
+                    n_no_zone += 1
+                elif not precision_ok:
+                    n_no_trigger += 1
+                else:
+                    n_low_score += 1
                 continue
 
             # ── Entry, SL, TP ─────────────────────────────────────
             entry_price = float(bar["close"])
             if entry_zone is not None:
-                # Place SL outside the entry zone
                 if bias == "bullish":
                     stop_loss = entry_zone["bottom"] * (1 - self.liq_range_pct)
                 else:
                     stop_loss = entry_zone["top"] * (1 + self.liq_range_pct)
             else:
-                # Fallback: use recent swing low/high
+                # Fallback: use recent swing low/high from 5m
                 if bias == "bullish":
-                    recent_lows = decision_df["low"].iloc[max(0, i - 20) : i + 1]
+                    recent_lows = decision_df["low"].iloc[max(0, i - 20): i + 1]
                     stop_loss = float(recent_lows.min()) * (1 - self.liq_range_pct)
                 else:
-                    recent_highs = decision_df["high"].iloc[max(0, i - 20) : i + 1]
+                    recent_highs = decision_df["high"].iloc[max(0, i - 20): i + 1]
                     stop_loss = float(recent_highs.max()) * (1 + self.liq_range_pct)
 
             sl_dist = abs(entry_price - stop_loss)
@@ -530,31 +655,34 @@ class SMCMultiStyleStrategy:
             if qty <= 0:
                 continue
 
+            n_emitted += 1
             signals.append(
                 TradeSignal(
                     timestamp=ts,
                     symbol=symbol,
                     direction=direction,
-                    style=best_style,
+                    style="day",
                     entry_price=entry_price,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
                     risk_reward=self.rr_ratio,
                     position_size=qty,
                     leverage=self.leverage,
-                    alignment_score=best_score,
+                    alignment_score=score,
                     meta={
                         "bias": bias,
-                        "h4_confirm": h4_ok,
+                        "h1_confirm": h1_ok,
                         "entry_zone": entry_zone,
+                        "precision_trigger": precision_ok,
                     },
                 )
             )
 
+        # ── Summary statistics ────────────────────────────────────
         logger.info(
-            "Generated %d signals for %s (styles: %s)",
-            len(signals),
-            symbol,
-            {s.style for s in signals} if signals else "–",
+            "[%s] Signal stats | total_bars=%d | neutral=%d | no_confirm=%d "
+            "| no_zone=%d | no_trigger=%d | low_score=%d | SIGNALS=%d | style=day",
+            symbol, total_bars, n_neutral, n_no_confirm,
+            n_no_zone, n_no_trigger, n_low_score, n_emitted,
         )
         return signals
