@@ -95,9 +95,9 @@ def _to_ohlc(df: pd.DataFrame) -> pd.DataFrame:
 def compute_smc_indicators(
     df: pd.DataFrame,
     swing_length: int = 10,
-    fvg_threshold: float = 0.001,
+    fvg_threshold: float = 0.0008,
     ob_lookback: int = 20,
-    liq_range_pct: float = 0.005,
+    liq_range_pct: float = 0.007,
 ) -> dict[str, Any]:
     """
     Compute all SMC indicators on a single-timeframe OHLCV DataFrame

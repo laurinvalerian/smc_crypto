@@ -31,7 +31,7 @@ styles:
   scalp:
     entry_tf: "1m"         # Entry timeframe
     confirm_tf: "5m"       # Confirmation timeframe
-    weight: 1.0            # Alignment-score weight (tunable)
+    weight: 1.2            # Alignment-score weight (tunable)
     max_hold_bars: 60      # Max hold time in entry-TF bars
   day:
     entry_tf: "15m"
@@ -41,15 +41,15 @@ styles:
   swing:
     entry_tf: "4h"
     confirm_tf: "1d"
-    weight: 1.0
+    weight: 0.8
     max_hold_bars: 120     # ~20 d in 4 h bars
 
 # ── SMC Indicator Settings ────────────────────────────────────────
 smc:
   swing_length: 10                # Swing detection lookback
-  fvg_threshold: 0.001            # Min FVG gap as fraction of price
+  fvg_threshold: 0.0008           # Min FVG gap as fraction of price
   order_block_lookback: 20        # Bars to look back for OB detection
-  liquidity_range_percent: 0.005  # ±0.5 % around swing highs/lows
+  liquidity_range_percent: 0.007  # ±0.7 % around swing highs/lows
   bos_choch_lookback: 50          # Bars for BOS/CHoCH detection
   session_ranges:                 # UTC times
     asian:  ["00:00", "06:00"]
@@ -62,7 +62,7 @@ top_down:
   structure_tf: "4h"       # 4 h structure confirmation
   entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
   precision_tfs: ["5m", "1m"]  # Fine-tuning entry
-  alignment_threshold: 0.6 # Min alignment score [0-1] to take a trade
+  alignment_threshold: 0.45 # Min alignment score [0-1] to take a trade
 
 # ── Data ──────────────────────────────────────────────────────────
 data:
