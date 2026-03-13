@@ -148,7 +148,7 @@ def simulate_trades(
         rng = np.random.RandomState(
             int(sig.timestamp.timestamp()) % (2**31)
         )
-        win_prob = sig.alignment_score * 0.55
+        win_prob = sig.alignment_score * 0.45
         outcome = "win" if rng.random() < win_prob else "loss"
 
         if outcome == "win":
@@ -326,11 +326,12 @@ def _build_objective(
                 index=False,
             )
 
-        # Multi-objective proxy: Profit Factor × (1 − |MaxDD|) × Sharpe
+        # Weighted additive score – favours stable, realistic parameter sets
         score = (
-            metrics["profit_factor"]
-            * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
-            * max(metrics["sharpe"], 0.01)
+            metrics["profit_factor"] * 0.4 +
+            max(metrics["sharpe"], 0) * 0.3 +
+            (1.0 + metrics["max_drawdown"]) * 0.2 +   # stärkerer Drawdown-Penalty
+            (metrics["total_trades"] / 5000) * 0.1     # Bonus für realistische Trade-Anzahl
         )
         # Store metrics as trial user attrs
         for k, v in metrics.items():
@@ -450,7 +451,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
 
     train_months = cfg["backtest"]["train_months"]
     test_months = cfg["backtest"]["test_months"]
-    n_trials = cfg["backtest"]["n_trials"]
+    n_trials = 300  # reduced for faster iteration / quick tests
     top_pct = cfg["backtest"]["top_percent"]
     study_name = cfg["backtest"]["study_name"]
     storage = cfg["backtest"]["storage"]
