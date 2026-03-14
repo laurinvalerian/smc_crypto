@@ -75,6 +75,15 @@ WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
 WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
 WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
 
+# Fallback coin list when dynamic volume ranking is unavailable
+DEFAULT_COINS: list[str] = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+    "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
+    "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
+    "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
+    "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
+]
+
 # ═══════════════════════════════════════════════════════════════════
 #  Logging helpers
 # ═══════════════════════════════════════════════════════════════════
@@ -675,9 +684,10 @@ def build_dashboard(
     ws_lines = [f"Global: {global_label}\n"]
 
     # Group status display
+    sorted_keys = sorted(ws_status.keys())
     groups: dict[int, list[str]] = {}
-    for sym in sorted(ws_status.keys()):
-        idx = sorted(ws_status.keys()).index(sym) // WS_GROUP_SIZE
+    for i, sym in enumerate(sorted_keys):
+        idx = i // WS_GROUP_SIZE
         groups.setdefault(idx, []).append(sym)
 
     for gid, syms in sorted(groups.items()):
@@ -1050,22 +1060,10 @@ def main() -> None:
     except Exception as exc:
         console.print(f"[yellow]⚠ Could not fetch volume ranking: {exc}[/yellow]")
         console.print("[yellow]  Falling back to default coin list.[/yellow]")
-        initial_symbols = [
-            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-            "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
-            "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-            "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
-            "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
-        ]
+        initial_symbols = list(DEFAULT_COINS)
 
     if not initial_symbols:
-        initial_symbols = [
-            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-            "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
-            "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-            "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
-            "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
-        ]
+        initial_symbols = list(DEFAULT_COINS)
 
     console.print(
         f"[bold green]✅ Loaded {len(initial_symbols)} symbols by volume.[/bold green]"
