@@ -1,8 +1,9 @@
 # ── SMC Crypto Trading Bot – Dependencies ──
 # Tested with Python 3.11+
 
-# Exchange connectivity
+# Exchange connectivity (includes ccxt.pro WebSocket support)
 ccxt>=4.4.0
+aiohttp>=3.13.3            # Required by ccxt.pro WebSocket
 
 # Data handling
 pandas>=2.2.0
