@@ -29,6 +29,9 @@ python-dotenv>=1.0.1
 # Progress bars
 tqdm>=4.66.0
 
+# Rich terminal UI (live dashboard)
+rich>=13.7.0
+
 # Utilities
 joblib>=1.4.0             # Parallel processing for walk-forward
 requests>=2.31.0

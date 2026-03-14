@@ -1,28 +1,31 @@
 """
 ═══════════════════════════════════════════════════════════════════
- live_multi_bot.py
- ─────────────────
- Phase 2 – Live Demo: Run the Top 30 best parameter-sets from
- walk-forward backtesting as parallel paper-trading bots on the
- Binance Futures Testnet.
+ live_multi_bot.py  –  Final Live Version with Rich Dashboard
+ ──────────────────────────────────────────────────────────────
+ Phase 2 – Run the Top 30 best parameter-sets from walk-forward
+ backtesting as parallel paper-trading bots on Binance Futures
+ Testnet, with a Rich live dashboard.
 
- Each bot:
-   • Gets its own parameter-set (loaded from CSV)
-   • Tracks its own virtual equity & PnL
-   • Writes an equity-curve CSV  (live_results/bot_001_equity.csv)
-   • Writes its own log file      (live_results/bot_001.log)
-
- A 5-minute summary prints a ranking to the console.
+ Features:
+   • Dynamic Top-100 volume ranking (refreshed every 30 min)
+   • WebSocket with stable auto-reconnect (max 5 retries)
+   • Rich Live Dashboard:
+       – Header: title + total equity + uptime
+       – TOP 20 / WORST 20 bots tables
+       – WebSocket status panel (global + per group)
+       – Green/Red colour coding for PnL
+   • Each bot: own equity CSV + log file
 
  Requirements:
-   pip install ccxt[pro] pandas numpy python-dotenv pyyaml tqdm
+   pip install 'ccxt[pro]' pandas numpy python-dotenv pyyaml rich
 
- Usage:
-   1. Copy .env.example → .env and fill in your testnet keys
-   2. Run the backtest first so that CSV files exist in backtest/results/
+ Quick Start:
+   1. Copy .env.example → .env and fill in your testnet keys:
+        BINANCE_API_KEY=your_testnet_api_key
+        BINANCE_SECRET=your_testnet_secret
+   2. Run the backtest so CSV files exist in backtest/results/
    3. python live_multi_bot.py [--top 30] [--config config/default_config.yaml]
-
- Ctrl+C → graceful shutdown, final summary.
+   4. Ctrl+C → graceful shutdown with final summary.
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -43,6 +46,12 @@ import numpy as np
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 # ── ccxt.pro for WebSocket ────────────────────────────────────────
 try:
@@ -58,16 +67,13 @@ except ImportError:
 
 RESULTS_DIR = Path("backtest/results")
 OUTPUT_DIR = Path("live_results")
-SUMMARY_INTERVAL_SEC = 300  # 5 minutes
 
-# Same 20 coins used throughout the project (CCXT futures format)
-COINS: list[str] = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
-    "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-    "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
-    "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
-]
+VOLUME_RANKING_LIMIT = 100         # Top-N symbols by 24 h volume
+VOLUME_REFRESH_SEC = 30 * 60       # Re-rank every 30 minutes
+DASHBOARD_REFRESH_SEC = 10         # Dashboard refresh interval
+WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
+WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
+WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
 
 # ═══════════════════════════════════════════════════════════════════
 #  Logging helpers
@@ -78,7 +84,7 @@ _console_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
 
 
 def _make_logger(name: str, log_path: Path) -> logging.Logger:
-    """Create a logger that writes to *log_path* and to stderr."""
+    """Create a logger that writes to *log_path* (file-only, no stderr)."""
     lgr = logging.getLogger(name)
     lgr.setLevel(logging.DEBUG)
 
@@ -90,19 +96,15 @@ def _make_logger(name: str, log_path: Path) -> logging.Logger:
     return lgr
 
 
-# Root logger → console only
+# Root logger → file only (Rich owns the console)
 root_logger = logging.getLogger("live_multi")
 root_logger.setLevel(logging.INFO)
-_ch = logging.StreamHandler()
-_ch.setFormatter(_console_fmt)
-root_logger.addHandler(_ch)
 logger = root_logger
 
 # ═══════════════════════════════════════════════════════════════════
 #  Parameter loading
 # ═══════════════════════════════════════════════════════════════════
 
-# Columns that are strategy parameters (not metrics)
 PARAM_COLS: list[str] = [
     "leverage", "risk_per_trade", "alignment_threshold",
     "swing_length", "fvg_threshold", "order_block_lookback",
@@ -118,7 +120,6 @@ def load_top_params(results_dir: Path, top_n: int = 30) -> pd.DataFrame:
     """
     frames: list[pd.DataFrame] = []
 
-    # 1. global_top_params.csv (primary source)
     global_path = results_dir / "global_top_params.csv"
     if global_path.exists():
         df = pd.read_csv(global_path)
@@ -126,7 +127,6 @@ def load_top_params(results_dir: Path, top_n: int = 30) -> pd.DataFrame:
         frames.append(df)
         logger.info("Loaded %d rows from %s", len(df), global_path.name)
 
-    # 2. Per-window top_params_wX.csv files
     for p in sorted(results_dir.glob("top_params_w*.csv")):
         df = pd.read_csv(p)
         df["_source"] = p.stem
@@ -141,12 +141,10 @@ def load_top_params(results_dir: Path, top_n: int = 30) -> pd.DataFrame:
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # Ensure required metric columns exist (fill 0 if missing)
     for col in ("total_pnl", "sharpe"):
         if col not in combined.columns:
             combined[col] = 0.0
 
-    # ── Composite ranking score ───────────────────────────────────
     pnl = combined["total_pnl"].astype(float)
     sharpe = combined["sharpe"].astype(float)
 
@@ -159,7 +157,6 @@ def load_top_params(results_dir: Path, top_n: int = 30) -> pd.DataFrame:
     combined["_rank_score"] = 0.7 * norm_pnl + 0.3 * norm_sharpe
     combined = combined.sort_values("_rank_score", ascending=False).reset_index(drop=True)
 
-    # De-duplicate (identical param vectors)
     param_cols_present = [c for c in PARAM_COLS if c in combined.columns]
     if param_cols_present:
         combined = combined.drop_duplicates(subset=param_cols_present, keep="first")
@@ -176,6 +173,41 @@ def params_from_row(row: pd.Series) -> dict[str, Any]:
         if col in row.index and pd.notna(row[col]):
             params[col] = row[col]
     return params
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Dynamic Volume Ranking
+# ═══════════════════════════════════════════════════════════════════
+
+async def get_top_volume_symbols(
+    exchange: Any,
+    limit: int = VOLUME_RANKING_LIMIT,
+) -> list[str]:
+    """
+    Fetch all USDT-M futures tickers, sort by 24 h quote volume
+    (descending) and return the top *limit* symbol names.
+    """
+    try:
+        tickers = await exchange.fetch_tickers()
+    except Exception as exc:
+        logger.error("fetch_tickers failed: %s", exc)
+        return []
+
+    usdt_tickers: list[tuple[str, float]] = []
+    for symbol, tick in tickers.items():
+        if not symbol.endswith(":USDT"):
+            continue
+        quote_vol = float(tick.get("quoteVolume") or 0)
+        usdt_tickers.append((symbol, quote_vol))
+
+    usdt_tickers.sort(key=lambda t: t[1], reverse=True)
+    top_symbols = [sym for sym, _ in usdt_tickers[:limit]]
+
+    logger.info(
+        "Volume ranking refreshed: %d USDT-M symbols, top %d selected",
+        len(usdt_tickers), len(top_symbols),
+    )
+    return top_symbols
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -229,9 +261,7 @@ class PaperBot:
         self.max_open: int = int(config.get("live", {}).get("max_open_trades", 5))
 
         # Candle history per symbol  {symbol: list[dict]}
-        self._candle_buf: dict[str, list[dict[str, Any]]] = {
-            s: [] for s in COINS
-        }
+        self._candle_buf: dict[str, list[dict[str, Any]]] = {}
 
         # Output
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -276,16 +306,15 @@ class PaperBot:
 
         candle keys: timestamp, open, high, low, close, volume
         """
+        if symbol not in self._candle_buf:
+            self._candle_buf[symbol] = []
         buf = self._candle_buf[symbol]
         buf.append(candle)
-        # Keep last 300 candles (~25 h of 5 m data)
         if len(buf) > 300:
             buf.pop(0)
 
-        # Check open positions for SL/TP hit
         self._check_exits(symbol, candle)
 
-        # Evaluate new entry only if we have enough history
         if len(buf) >= self.swing_length + 5:
             self._evaluate_entry(symbol, buf, candle)
 
@@ -308,11 +337,9 @@ class PaperBot:
         if len(closes) < 50:
             return 0.0, "neutral"
 
-        # EMA-20 and EMA-50
         ema20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
         ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().iloc[-1]
 
-        # Recent swing high/low
         recent_high = float(np.max(highs[-swing_len:]))
         recent_low = float(np.min(lows[-swing_len:]))
         prev_high = float(np.max(highs[-2 * swing_len: -swing_len])) if len(highs) >= 2 * swing_len else recent_high
@@ -320,14 +347,9 @@ class PaperBot:
 
         price = closes[-1]
 
-        # Trend component [0..1]
         trend_bull = 1.0 if ema20 > ema50 else 0.0
-
-        # Momentum: break of structure
         bos_bull = 1.0 if recent_high > prev_high else 0.0
         bos_bear = 1.0 if recent_low < prev_low else 0.0
-
-        # Position relative to EMAs
         ema_pos = 1.0 if price > ema20 else 0.0
 
         if trend_bull > 0.5:
@@ -347,7 +369,6 @@ class PaperBot:
         buf: list[dict[str, Any]],
         candle: dict[str, Any],
     ) -> None:
-        # Skip if already have position in this symbol or at max
         if symbol in self.open_positions:
             return
         if len(self.open_positions) >= self.max_open:
@@ -361,12 +382,11 @@ class PaperBot:
         if price <= 0:
             return
 
-        # ATR-based SL
         atr = self._simple_atr(buf, period=14)
         if atr <= 0:
             return
 
-        sl_dist = max(atr * 1.5, price * 0.0035)  # min 0.35 %
+        sl_dist = max(atr * 1.5, price * 0.0035)
         tp_dist = sl_dist * self.rr_ratio
 
         if direction == "long":
@@ -376,12 +396,10 @@ class PaperBot:
             sl = price + sl_dist
             tp = price - tp_dist
 
-        # Position sizing
         risk_amount = self.equity * self.risk_pct
         qty = (risk_amount / sl_dist) if sl_dist > 0 else 0.0
         notional = qty * price
 
-        # Sanity check
         if qty <= 0 or notional <= 0:
             return
 
@@ -419,7 +437,7 @@ class PaperBot:
                 hit_sl = True
             elif high >= pos["tp"]:
                 hit_tp = True
-        else:  # short
+        else:
             if high >= pos["sl"]:
                 hit_sl = True
             elif low <= pos["tp"]:
@@ -428,7 +446,6 @@ class PaperBot:
         if not hit_tp and not hit_sl:
             return
 
-        # Compute PnL
         if hit_tp:
             exit_price = pos["tp"]
             outcome = "WIN"
@@ -441,7 +458,6 @@ class PaperBot:
         else:
             raw_pnl = (pos["entry"] - exit_price) * pos["qty"]
 
-        # Commission (round-trip)
         commission = pos["qty"] * pos["entry"] * 0.0004 * 2
         net_pnl = raw_pnl - commission
 
@@ -529,141 +545,391 @@ def create_exchange(api_key: str, api_secret: str) -> Any:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Rich Dashboard Builder
+# ═══════════════════════════════════════════════════════════════════
+
+def _pnl_color(value: float) -> str:
+    """Return rich markup colour for a PnL value."""
+    if value > 0:
+        return "green"
+    elif value < 0:
+        return "red"
+    return "white"
+
+
+def _format_uptime(start: datetime) -> str:
+    """Human-readable uptime string."""
+    delta = datetime.now(timezone.utc) - start
+    total_sec = int(delta.total_seconds())
+    hours, remainder = divmod(total_sec, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
+
+
+def _build_bot_table(
+    title: str,
+    rows: list[dict[str, Any]],
+    style: str,
+) -> Table:
+    """Build a Rich Table for a set of bot summaries."""
+    table = Table(
+        title=title,
+        title_style=f"bold {style}",
+        border_style=style,
+        show_lines=False,
+        expand=True,
+    )
+    table.add_column("#", justify="right", style="dim", width=4)
+    table.add_column("Bot-ID", style="cyan", width=9)
+    table.add_column("Equity", justify="right", width=14)
+    table.add_column("PnL", justify="right", width=12)
+    table.add_column("Return%", justify="right", width=9)
+    table.add_column("Trades", justify="right", width=7)
+    table.add_column("Winrate", justify="right", width=8)
+    table.add_column("DD%", justify="right", width=7)
+    table.add_column("Open", justify="right", width=5)
+
+    for i, r in enumerate(rows, 1):
+        pnl_c = _pnl_color(r["pnl"])
+        ret_c = _pnl_color(r["return_pct"])
+        table.add_row(
+            str(i),
+            r["bot"],
+            f"{r['equity']:,.2f}",
+            f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
+            f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
+            str(r["trades"]),
+            f"{r['winrate']:.1f}%",
+            f"{r['drawdown_pct']:.2f}%",
+            str(r["open_pos"]),
+        )
+
+    return table
+
+
+def build_dashboard(
+    bots: list[PaperBot],
+    ws_status: dict[str, str],
+    start_time: datetime,
+    active_symbols: list[str],
+) -> Layout:
+    """
+    Build the complete Rich Layout for the live dashboard.
+
+    Returns a Layout containing:
+      - Header panel (title, total equity, uptime)
+      - Top 20 bots table
+      - Worst 20 bots table
+      - WebSocket status panel
+    """
+    all_summaries = sorted(
+        [b.summary_dict() for b in bots],
+        key=lambda r: r["pnl"],
+        reverse=True,
+    )
+
+    total_equity = sum(b.equity for b in bots)
+    total_pnl = sum(b.total_pnl for b in bots)
+    total_trades = sum(b.trades for b in bots)
+    uptime = _format_uptime(start_time)
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # ── Header ────────────────────────────────────────────────────
+    eq_color = _pnl_color(total_pnl)
+    header_text = Text.from_markup(
+        f"[bold cyan]📊 SMC CRYPTO LIVE MULTI-BOT DASHBOARD[/bold cyan]\n"
+        f"[dim]{now_str}[/dim]  ·  Uptime: [bold]{uptime}[/bold]  ·  "
+        f"Symbols: [bold]{len(active_symbols)}[/bold]  ·  "
+        f"Bots: [bold]{len(bots)}[/bold]\n"
+        f"Total Equity: [bold]{total_equity:,.2f}[/bold] USDT  ·  "
+        f"Total PnL: [bold {eq_color}]{total_pnl:+,.2f}[/bold {eq_color}] USDT  ·  "
+        f"Total Trades: [bold]{total_trades}[/bold]",
+    )
+    header_panel = Panel(
+        header_text,
+        title="[bold white]HEADER[/bold white]",
+        border_style="bright_blue",
+    )
+
+    # ── Bot tables ────────────────────────────────────────────────
+    top_20 = all_summaries[:20]
+    worst_20 = list(reversed(all_summaries[-20:])) if len(all_summaries) > 20 else list(reversed(all_summaries))
+
+    top_table = _build_bot_table("🏆  TOP 20 BOTS", top_20, "green")
+    worst_table = _build_bot_table("📉  WORST 20 BOTS", worst_20, "red")
+
+    # ── WebSocket Status ──────────────────────────────────────────
+    # Determine global status
+    statuses = list(ws_status.values())
+    n_connected = statuses.count("connected")
+    n_reconnecting = sum(1 for s in statuses if s.startswith("reconnecting"))
+    n_disconnected = statuses.count("disconnected")
+
+    if n_disconnected > 0:
+        global_label = f"[bold red]⛔ DISCONNECTED ({n_disconnected})[/bold red]"
+    elif n_reconnecting > 0:
+        global_label = f"[bold yellow]🔄 RECONNECTING ({n_reconnecting})[/bold yellow]"
+    else:
+        global_label = f"[bold green]✅ ALL CONNECTED ({n_connected})[/bold green]"
+
+    ws_lines = [f"Global: {global_label}\n"]
+
+    # Group status display
+    groups: dict[int, list[str]] = {}
+    for sym in sorted(ws_status.keys()):
+        idx = sorted(ws_status.keys()).index(sym) // WS_GROUP_SIZE
+        groups.setdefault(idx, []).append(sym)
+
+    for gid, syms in sorted(groups.items()):
+        group_statuses = [ws_status.get(s, "unknown") for s in syms]
+        gc = sum(1 for gs in group_statuses if gs == "connected")
+        gr = sum(1 for gs in group_statuses if gs.startswith("reconnecting"))
+        gd = sum(1 for gs in group_statuses if gs == "disconnected")
+
+        if gd > 0:
+            gs_label = f"[red]⛔ {gc}/{len(syms)} connected, {gd} disconnected[/red]"
+        elif gr > 0:
+            gs_label = f"[yellow]🔄 {gc}/{len(syms)} connected, {gr} reconnecting[/yellow]"
+        else:
+            gs_label = f"[green]✅ {gc}/{len(syms)} connected[/green]"
+
+        ws_lines.append(f"  Group {gid + 1} ({len(syms)} symbols): {gs_label}")
+
+    ws_panel = Panel(
+        Text.from_markup("\n".join(ws_lines)),
+        title="[bold white]WEBSOCKET STATUS[/bold white]",
+        border_style="bright_blue",
+    )
+
+    # ── Compose Layout ────────────────────────────────────────────
+    layout = Layout()
+    layout.split_column(
+        Layout(header_panel, name="header", size=6),
+        Layout(name="tables"),
+        Layout(ws_panel, name="status", size=3 + len(groups) + 2),
+    )
+    layout["tables"].split_row(
+        Layout(top_table, name="top"),
+        Layout(worst_table, name="worst"),
+    )
+
+    return layout
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main runner
 # ═══════════════════════════════════════════════════════════════════
 
 class LiveMultiBotRunner:
-    """Orchestrates multiple PaperBot instances with shared WebSocket data."""
+    """
+    Orchestrates multiple PaperBot instances with:
+      - Dynamic volume-based symbol ranking (refreshed every 30 min)
+      - WebSocket auto-reconnect per symbol
+      - Rich Live Dashboard
+    """
 
     def __init__(
         self,
         bots: list[PaperBot],
         exchange: Any,
-        symbols: list[str],
+        initial_symbols: list[str],
     ) -> None:
         self.bots = bots
         self.exchange = exchange
-        self.symbols = symbols
+        self.symbols: list[str] = list(initial_symbols)
         self._shutdown = asyncio.Event()
+        self._start_time = datetime.now(timezone.utc)
 
-    # ── Summary printing ──────────────────────────────────────────
+        # WebSocket status per symbol: connected | reconnecting_N | disconnected
+        self.ws_status: dict[str, str] = {
+            s: "connecting" for s in self.symbols
+        }
 
-    def print_summary(self) -> None:
-        """Print a ranked summary of all bots to the console."""
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        rows = sorted(
-            [b.summary_dict() for b in self.bots],
-            key=lambda r: r["pnl"],
-            reverse=True,
-        )
+        # Active watcher tasks keyed by symbol
+        self._watcher_tasks: dict[str, asyncio.Task[None]] = {}
 
-        header = (
-            f"\n{'═' * 90}\n"
-            f"  📊  LIVE MULTI-BOT RANKING  –  {now}\n"
-            f"{'═' * 90}"
-        )
-        col_hdr = (
-            f"  {'#':>3}  {'Bot':<8}  {'Equity':>12}  {'PnL':>10}  "
-            f"{'Return%':>8}  {'Trades':>6}  {'WR%':>5}  {'DD%':>6}  {'Open':>4}"
-        )
-        sep = f"  {'─' * 84}"
-
-        lines = [header, col_hdr, sep]
-        for i, r in enumerate(rows, 1):
-            lines.append(
-                f"  {i:>3}  {r['bot']:<8}  {r['equity']:>12,.2f}  "
-                f"{r['pnl']:>+10,.2f}  {r['return_pct']:>+7.2f}%  "
-                f"{r['trades']:>6}  {r['winrate']:>5.1f}  "
-                f"{r['drawdown_pct']:>5.2f}%  {r['open_pos']:>4}"
-            )
-        lines.append(f"{'═' * 90}\n")
-        print("\n".join(lines), flush=True)
-
-    # ── WebSocket OHLCV watcher ───────────────────────────────────
+    # ── WebSocket OHLCV watcher with auto-reconnect ───────────────
 
     async def _watch_symbol(self, symbol: str) -> None:
         """
         Subscribe to 5 m OHLCV candles for *symbol* and feed each bot.
-
-        ccxt.pro's watch_ohlcv returns the latest candle array every time
-        a new tick arrives; we detect new *closed* candles by timestamp.
+        Auto-reconnects up to WS_MAX_RECONNECT times with exponential backoff.
         """
         last_ts: int | None = None
+        reconnect_count = 0
 
         while not self._shutdown.is_set():
             try:
-                ohlcv_list = await self.exchange.watch_ohlcv(symbol, "5m")
+                self.ws_status[symbol] = "connected"
+                reconnect_count = 0  # reset on successful connection
+
+                while not self._shutdown.is_set():
+                    ohlcv_list = await self.exchange.watch_ohlcv(symbol, "5m")
+
+                    if not ohlcv_list:
+                        continue
+
+                    for row in ohlcv_list:
+                        ts = int(row[0])
+                        if last_ts is not None and ts <= last_ts:
+                            continue
+                        last_ts = ts
+
+                        candle = {
+                            "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
+                            "open": float(row[1]),
+                            "high": float(row[2]),
+                            "low": float(row[3]),
+                            "close": float(row[4]),
+                            "volume": float(row[5]),
+                        }
+
+                        for bot in self.bots:
+                            try:
+                                bot.on_candle(symbol, candle)
+                            except Exception as exc:
+                                bot.logger.error(
+                                    "Error processing candle for %s: %s", symbol, exc
+                                )
+
+            except asyncio.CancelledError:
+                self.ws_status[symbol] = "disconnected"
+                return
+
             except Exception as exc:
-                logger.warning("watch_ohlcv %s error: %s", symbol, exc)
-                await asyncio.sleep(5)
-                continue
+                reconnect_count += 1
+                if reconnect_count > WS_MAX_RECONNECT:
+                    self.ws_status[symbol] = "disconnected"
+                    logger.warning(
+                        "⚠ %s: max reconnect attempts (%d) exceeded: %s",
+                        symbol, WS_MAX_RECONNECT, exc,
+                    )
+                    return
 
-            if not ohlcv_list:
-                continue
+                delay = min(
+                    WS_RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
+                    60,
+                )
+                self.ws_status[symbol] = f"reconnecting_{reconnect_count}"
+                logger.warning(
+                    "🔄 %s: reconnect attempt %d/%d in %.0fs: %s",
+                    symbol, reconnect_count, WS_MAX_RECONNECT, delay, exc,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=delay
+                    )
+                    self.ws_status[symbol] = "disconnected"
+                    return  # shutdown during reconnect wait
+                except asyncio.TimeoutError:
+                    pass  # continue reconnect loop
 
-            # ohlcv_list is [[ts, o, h, l, c, v], ...]
-            for row in ohlcv_list:
-                ts = int(row[0])
-                if last_ts is not None and ts <= last_ts:
-                    continue
-                last_ts = ts
+    # ── Volume ranking refresh ────────────────────────────────────
 
-                candle = {
-                    "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]),
-                }
-
-                for bot in self.bots:
-                    try:
-                        bot.on_candle(symbol, candle)
-                    except Exception as exc:
-                        bot.logger.error(
-                            "Error processing candle for %s: %s", symbol, exc
-                        )
-
-    # ── Periodic summary ──────────────────────────────────────────
-
-    async def _summary_loop(self) -> None:
-        """Print a summary every SUMMARY_INTERVAL_SEC seconds."""
+    async def _volume_ranking_loop(self) -> None:
+        """
+        Periodically refresh the Top-100 volume ranking and update
+        watcher tasks for any new/removed symbols.
+        """
         while not self._shutdown.is_set():
             try:
                 await asyncio.wait_for(
-                    self._shutdown.wait(), timeout=SUMMARY_INTERVAL_SEC
+                    self._shutdown.wait(), timeout=VOLUME_REFRESH_SEC
                 )
-                break  # shutdown was set
+                return  # shutdown was set
             except asyncio.TimeoutError:
                 pass
-            self.print_summary()
+
+            new_symbols = await get_top_volume_symbols(
+                self.exchange, limit=VOLUME_RANKING_LIMIT
+            )
+            if not new_symbols:
+                continue
+
+            old_set = set(self.symbols)
+            new_set = set(new_symbols)
+
+            # Cancel watchers for removed symbols
+            for sym in old_set - new_set:
+                task = self._watcher_tasks.pop(sym, None)
+                if task is not None:
+                    task.cancel()
+                self.ws_status.pop(sym, None)
+
+            # Start watchers for added symbols
+            for sym in new_set - old_set:
+                self.ws_status[sym] = "connecting"
+                self._watcher_tasks[sym] = asyncio.create_task(
+                    self._watch_symbol(sym)
+                )
+
+            self.symbols = new_symbols
+            logger.info(
+                "Volume ranking updated: %d symbols (+%d / -%d)",
+                len(new_symbols),
+                len(new_set - old_set),
+                len(old_set - new_set),
+            )
+
+    # ── Rich Dashboard loop ───────────────────────────────────────
+
+    async def _dashboard_loop(self) -> None:
+        """Render the Rich Live Dashboard every DASHBOARD_REFRESH_SEC."""
+        console = Console()
+
+        with Live(console=console, refresh_per_second=1, screen=True) as live:
+            while not self._shutdown.is_set():
+                try:
+                    layout = build_dashboard(
+                        bots=self.bots,
+                        ws_status=self.ws_status,
+                        start_time=self._start_time,
+                        active_symbols=self.symbols,
+                    )
+                    live.update(layout)
+                except Exception as exc:
+                    logger.error("Dashboard render error: %s", exc)
+
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=DASHBOARD_REFRESH_SEC
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
 
     # ── Main loop ─────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Start all watchers + summary loop. Blocks until shutdown."""
+        """Start all watchers + dashboard + volume ranking. Blocks until shutdown."""
         logger.info(
             "Starting %d bots on %d symbols …", len(self.bots), len(self.symbols)
         )
-        self.print_summary()
 
-        tasks: list[asyncio.Task[None]] = []
-
-        # One watcher task per symbol
+        # Start one watcher task per symbol
         for sym in self.symbols:
-            tasks.append(asyncio.create_task(self._watch_symbol(sym)))
+            self._watcher_tasks[sym] = asyncio.create_task(
+                self._watch_symbol(sym)
+            )
 
-        # Summary printer
-        tasks.append(asyncio.create_task(self._summary_loop()))
+        # Volume ranking refresher
+        ranking_task = asyncio.create_task(self._volume_ranking_loop())
+
+        # Rich dashboard
+        dashboard_task = asyncio.create_task(self._dashboard_loop())
 
         # Wait until shutdown
         await self._shutdown.wait()
-        logger.info("Shutdown signal received – stopping watchers …")
+        logger.info("Shutdown signal received – stopping …")
 
-        for t in tasks:
+        # Cancel all tasks
+        dashboard_task.cancel()
+        ranking_task.cancel()
+        for t in self._watcher_tasks.values():
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_tasks = [dashboard_task, ranking_task] + list(self._watcher_tasks.values())
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
         # Close exchange WebSocket connections
         try:
@@ -671,9 +937,32 @@ class LiveMultiBotRunner:
         except Exception:
             pass
 
-        # Final summary
-        logger.info("Final summary:")
-        self.print_summary()
+        # Final summary to console
+        self._print_final_summary()
+
+    def _print_final_summary(self) -> None:
+        """Print a plain-text final summary after dashboard stops."""
+        console = Console()
+        rows = sorted(
+            [b.summary_dict() for b in self.bots],
+            key=lambda r: r["pnl"],
+            reverse=True,
+        )
+        total_equity = sum(b.equity for b in self.bots)
+        total_pnl = sum(b.total_pnl for b in self.bots)
+
+        console.print(f"\n[bold cyan]{'═' * 80}[/bold cyan]")
+        console.print("[bold cyan]  📊  FINAL SUMMARY[/bold cyan]")
+        console.print(f"[bold cyan]{'═' * 80}[/bold cyan]")
+        console.print(
+            f"  Total Equity: [bold]{total_equity:,.2f}[/bold] USDT  |  "
+            f"Total PnL: [bold {'green' if total_pnl >= 0 else 'red'}]"
+            f"{total_pnl:+,.2f}[/bold {'green' if total_pnl >= 0 else 'red'}] USDT"
+        )
+
+        table = _build_bot_table("ALL BOTS – Final Ranking", rows, "cyan")
+        console.print(table)
+        console.print(f"[bold cyan]{'═' * 80}[/bold cyan]\n")
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
@@ -685,7 +974,7 @@ class LiveMultiBotRunner:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 2 – Live Multi-Bot Demo (Binance Testnet)",
+        description="Live Multi-Bot with Rich Dashboard (Binance Testnet)",
     )
     parser.add_argument(
         "--top", type=int, default=30,
@@ -749,12 +1038,47 @@ def main() -> None:
     # ── Create exchange ───────────────────────────────────────────
     exchange = create_exchange(api_key, api_secret)
 
+    # ── Initial volume ranking ────────────────────────────────────
+    console = Console()
+    console.print("[bold cyan]Fetching initial volume ranking …[/bold cyan]")
+
+    loop = asyncio.new_event_loop()
+    try:
+        initial_symbols = loop.run_until_complete(
+            get_top_volume_symbols(exchange, limit=VOLUME_RANKING_LIMIT)
+        )
+    except Exception as exc:
+        console.print(f"[yellow]⚠ Could not fetch volume ranking: {exc}[/yellow]")
+        console.print("[yellow]  Falling back to default coin list.[/yellow]")
+        initial_symbols = [
+            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+            "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
+            "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
+            "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
+            "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
+        ]
+
+    if not initial_symbols:
+        initial_symbols = [
+            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+            "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
+            "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
+            "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
+            "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
+        ]
+
+    console.print(
+        f"[bold green]✅ Loaded {len(initial_symbols)} symbols by volume.[/bold green]"
+    )
+
     # ── Runner ────────────────────────────────────────────────────
-    runner = LiveMultiBotRunner(bots=bots, exchange=exchange, symbols=COINS)
+    runner = LiveMultiBotRunner(
+        bots=bots,
+        exchange=exchange,
+        initial_symbols=initial_symbols,
+    )
 
     # ── Graceful shutdown on Ctrl+C ───────────────────────────────
-    loop = asyncio.new_event_loop()
-
     def _signal_handler() -> None:
         logger.info("Ctrl+C detected – shutting down gracefully …")
         runner.request_shutdown()
