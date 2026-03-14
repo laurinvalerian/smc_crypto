@@ -44,5 +44,8 @@ Thumbs.db
 # Docker
 docker/.env
 
+# Live bot results (generated locally)
+live_results/
+
 # Logs
 *.log
