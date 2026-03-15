@@ -48,6 +48,7 @@ MINI_BATCH_SIZE = 32   # mini-batch size
 BUFFER_CAPACITY = 256  # transitions before PPO update
 VALUE_COEFF = 0.5      # value loss weight
 ENTROPY_COEFF = 0.01   # entropy bonus weight
+GRAD_CLIP_MAX = 0.5    # max gradient norm for clipping
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -330,7 +331,7 @@ class RLBrain:
 
                 self._optimiser.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self._net.parameters(), 0.5)
+                nn.utils.clip_grad_norm_(self._net.parameters(), GRAD_CLIP_MAX)
                 self._optimiser.step()
 
         self._total_updates += 1
@@ -373,7 +374,7 @@ class RLBrain:
         if not self._model_path.exists():
             return
         try:
-            ckpt = torch.load(self._model_path, weights_only=False)
+            ckpt = torch.load(self._model_path, weights_only=True)
             self._net.load_state_dict(ckpt["net"])
             self._optimiser.load_state_dict(ckpt["optimiser"])
             self._total_updates = ckpt.get("updates", 0)
