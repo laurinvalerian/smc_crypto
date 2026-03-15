@@ -358,13 +358,13 @@ class PaperBot:
     def _load_history(self) -> None:
         """Load last 60 days OHLCV for 5 timeframes via ccxt (sync)."""
         ex = _get_history_exchange()
-        # limits: 60 days → 1d=60, 4h=360, 1h=1440, 15m/5m capped at 1500
+        # limits for 60 days: Binance max per request is 1500 candles
         tf_limits = {
-            "1d": 60,
-            "4h": 360,
-            "1h": 1440,
-            "15m": 1500,
-            "5m": 1500,
+            "1d": 60,      # 60 days
+            "4h": 360,     # 60 × 6
+            "1h": 1440,    # 60 × 24
+            "15m": 1500,   # 60 × 96 = 5760 → capped at API max
+            "5m": 1500,    # 60 × 288 = 17280 → capped at API max
         }
         for tf, limit in tf_limits.items():
             try:
@@ -418,8 +418,8 @@ class PaperBot:
                 )
                 running_bias = _precompute_running_bias(ind_1d, self.buffer_1d)
                 daily_bias = _bias_from_running(running_bias, len(self.buffer_1d))
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("1D bias computation failed: %s", exc)
 
         # 2. 4H Bias confirmation ─────────────────────────────────
         if daily_bias != "neutral" and len(self.buffer_4h) >= swing_len * 2:
@@ -431,8 +431,8 @@ class PaperBot:
                 h4_confirms = _structure_confirms_from_running(
                     running_4h, daily_bias, len(self.buffer_4h),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("4H structure computation failed: %s", exc)
 
         # 3. 1H Structure confirmation ────────────────────────────
         if daily_bias != "neutral" and len(self.buffer_1h) >= swing_len * 2:
@@ -444,8 +444,8 @@ class PaperBot:
                 h1_confirms = _structure_confirms_from_running(
                     running_1h, daily_bias, len(self.buffer_1h),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("1H structure computation failed: %s", exc)
 
         # 4. 15m Entry zone (FVG / OB) ────────────────────────────
         if daily_bias != "neutral" and len(self.buffer_15m) >= swing_len * 2:
@@ -457,8 +457,8 @@ class PaperBot:
                     ind_15m, self.buffer_15m, daily_bias,
                     fvg_thresh, len(self.buffer_15m),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("15m entry zone computation failed: %s", exc)
 
         # 5. 5m Precision trigger (BOS/CHoCH) ─────────────────────
         if daily_bias != "neutral" and len(self.buffer_5m) >= swing_len * 2:
@@ -472,8 +472,8 @@ class PaperBot:
                         precision_trigger = bool(bull_mask[-1])
                     elif daily_bias == "bearish":
                         precision_trigger = bool(bear_mask[-1])
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.debug("5m trigger computation failed: %s", exc)
 
         # ── Combine into score (5 × 0.20 = 1.0 max) ─────────────
         score = _compute_alignment_score(
@@ -526,17 +526,15 @@ class PaperBot:
 
         # Keep multi-TF 5m buffer up to date
         if not self.buffer_5m.empty:
-            new_row = pd.DataFrame([{
+            idx = len(self.buffer_5m)
+            self.buffer_5m.loc[idx] = {
                 "timestamp": candle["timestamp"],
                 "open": candle["open"],
                 "high": candle["high"],
                 "low": candle["low"],
                 "close": candle["close"],
                 "volume": candle["volume"],
-            }])
-            self.buffer_5m = pd.concat(
-                [self.buffer_5m, new_row], ignore_index=True,
-            )
+            }
             if len(self.buffer_5m) > 1500:
                 self.buffer_5m = self.buffer_5m.iloc[-1500:].reset_index(drop=True)
 
