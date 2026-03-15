@@ -58,6 +58,19 @@ from rich.table import Table
 from rich.text import Text
 
 from rl_brain import RLBrain, extract_features
+from strategies.smc_multi_style import (
+    compute_smc_indicators,
+    _precompute_running_bias,
+    _precompute_running_structure,
+    _bias_from_running,
+    _structure_confirms_from_running,
+    _find_entry_zone_at,
+    _precompute_5m_trigger_mask,
+    _compute_alignment_score,
+)
+
+# ── ccxt (sync) for history loading ───────────────────────────────
+import ccxt as ccxt_sync
 
 # ── ccxt.pro for WebSocket ────────────────────────────────────────
 try:
@@ -208,6 +221,18 @@ FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
 
+# ── Shared sync exchange for history fetching (public endpoints) ──
+_history_exchange: Any = None
+
+
+def _get_history_exchange() -> Any:
+    """Return a shared synchronous ccxt exchange for OHLCV history."""
+    global _history_exchange
+    if _history_exchange is None:
+        _history_exchange = ccxt_sync.binanceusdm({"enableRateLimit": True})
+    return _history_exchange
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Logging helpers
 # ═══════════════════════════════════════════════════════════════════
@@ -320,6 +345,148 @@ class PaperBot:
             self.tag, symbol, self.equity, json.dumps(FIXED_SMC_PARAMS, default=str),
         )
 
+        # Multi-TF OHLCV buffers (last 60 days, loaded from exchange)
+        self.buffer_1d: pd.DataFrame = pd.DataFrame()
+        self.buffer_4h: pd.DataFrame = pd.DataFrame()
+        self.buffer_1h: pd.DataFrame = pd.DataFrame()
+        self.buffer_15m: pd.DataFrame = pd.DataFrame()
+        self.buffer_5m: pd.DataFrame = pd.DataFrame()
+        self._load_history()
+
+    # ── History loading (multi-TF buffers) ───────────────────────────
+
+    def _load_history(self) -> None:
+        """Load last 60 days OHLCV for 5 timeframes via ccxt (sync)."""
+        ex = _get_history_exchange()
+        # limits: 60 days → 1d=60, 4h=360, 1h=1440, 15m/5m capped at 1500
+        tf_limits = {
+            "1d": 60,
+            "4h": 360,
+            "1h": 1440,
+            "15m": 1500,
+            "5m": 1500,
+        }
+        for tf, limit in tf_limits.items():
+            try:
+                raw = ex.fetch_ohlcv(self.symbol, tf, limit=limit)
+                if raw:
+                    df = pd.DataFrame(
+                        raw,
+                        columns=["timestamp", "open", "high", "low", "close", "volume"],
+                    )
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                    setattr(self, f"buffer_{tf}", df)
+                    self.logger.info(
+                        "Loaded %d %s candles for %s", len(df), tf, self.symbol,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "History load failed %s/%s: %s", self.symbol, tf, exc,
+                )
+
+    # ── Multi-TF alignment score ──────────────────────────────────
+
+    def _multi_tf_alignment_score(
+        self, current_candle: dict[str, Any],
+    ) -> tuple[float, str]:
+        """
+        Multi-timeframe SMC alignment score.
+
+        Flow:
+          1D + 4H → Bias   (BOS/CHoCH + EMA200 fallback)
+          1H + 15m → Structure
+          5m → Entry trigger  (FVG + Liquidity + Alignment)
+
+        Returns (score 0–1, direction "long" | "short").
+        """
+        swing_len = self.swing_length
+        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
+        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
+        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+
+        daily_bias = "neutral"
+        h4_confirms = False
+        h1_confirms = False
+        entry_zone = None
+        precision_trigger = False
+
+        # 1. Daily Bias from 1D (BOS/CHoCH + EMA200 fallback) ─────
+        if len(self.buffer_1d) >= swing_len * 2:
+            try:
+                ind_1d = compute_smc_indicators(
+                    self.buffer_1d, swing_len, fvg_thresh, ob_lookback, liq_range,
+                )
+                running_bias = _precompute_running_bias(ind_1d, self.buffer_1d)
+                daily_bias = _bias_from_running(running_bias, len(self.buffer_1d))
+            except Exception:
+                pass
+
+        # 2. 4H Bias confirmation ─────────────────────────────────
+        if daily_bias != "neutral" and len(self.buffer_4h) >= swing_len * 2:
+            try:
+                ind_4h = compute_smc_indicators(
+                    self.buffer_4h, swing_len, fvg_thresh, ob_lookback, liq_range,
+                )
+                running_4h = _precompute_running_structure(ind_4h)
+                h4_confirms = _structure_confirms_from_running(
+                    running_4h, daily_bias, len(self.buffer_4h),
+                )
+            except Exception:
+                pass
+
+        # 3. 1H Structure confirmation ────────────────────────────
+        if daily_bias != "neutral" and len(self.buffer_1h) >= swing_len * 2:
+            try:
+                ind_1h = compute_smc_indicators(
+                    self.buffer_1h, swing_len, fvg_thresh, ob_lookback, liq_range,
+                )
+                running_1h = _precompute_running_structure(ind_1h)
+                h1_confirms = _structure_confirms_from_running(
+                    running_1h, daily_bias, len(self.buffer_1h),
+                )
+            except Exception:
+                pass
+
+        # 4. 15m Entry zone (FVG / OB) ────────────────────────────
+        if daily_bias != "neutral" and len(self.buffer_15m) >= swing_len * 2:
+            try:
+                ind_15m = compute_smc_indicators(
+                    self.buffer_15m, swing_len, fvg_thresh, ob_lookback, liq_range,
+                )
+                entry_zone = _find_entry_zone_at(
+                    ind_15m, self.buffer_15m, daily_bias,
+                    fvg_thresh, len(self.buffer_15m),
+                )
+            except Exception:
+                pass
+
+        # 5. 5m Precision trigger (BOS/CHoCH) ─────────────────────
+        if daily_bias != "neutral" and len(self.buffer_5m) >= swing_len * 2:
+            try:
+                ind_5m = compute_smc_indicators(
+                    self.buffer_5m, swing_len, fvg_thresh, ob_lookback, liq_range,
+                )
+                bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m)
+                if len(bull_mask) > 0:
+                    if daily_bias == "bullish":
+                        precision_trigger = bool(bull_mask[-1])
+                    elif daily_bias == "bearish":
+                        precision_trigger = bool(bear_mask[-1])
+            except Exception:
+                pass
+
+        # ── Combine into score (5 × 0.20 = 1.0 max) ─────────────
+        score = _compute_alignment_score(
+            daily_bias,
+            h4_confirms and h1_confirms,
+            entry_zone,
+            precision_trigger,
+            style_weight=FIXED_SMC_PARAMS.get("weight_day", 1.0),
+        )
+
+        direction = "long" if daily_bias == "bullish" else "short"
+        return float(np.clip(score, 0.0, 1.0)), direction
+
     # ── Equity CSV ────────────────────────────────────────────────
 
     def _init_equity_csv(self) -> None:
@@ -356,6 +523,22 @@ class PaperBot:
         buf.append(candle)
         if len(buf) > 300:
             buf.pop(0)
+
+        # Keep multi-TF 5m buffer up to date
+        if not self.buffer_5m.empty:
+            new_row = pd.DataFrame([{
+                "timestamp": candle["timestamp"],
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+                "volume": candle["volume"],
+            }])
+            self.buffer_5m = pd.concat(
+                [self.buffer_5m, new_row], ignore_index=True,
+            )
+            if len(self.buffer_5m) > 1500:
+                self.buffer_5m = self.buffer_5m.iloc[-1500:].reset_index(drop=True)
 
         self._check_exits(symbol, candle)
 
@@ -424,7 +607,7 @@ class PaperBot:
         if avg_vol > 0 and candle["volume"] < FIXED_MIN_VOL_MULT * avg_vol:
             return
 
-        score, direction = self._alignment_score(buf, self.swing_length)
+        score, direction = self._multi_tf_alignment_score(candle)
         if score < self.alignment_threshold:
             return
 
@@ -436,13 +619,16 @@ class PaperBot:
         if atr <= 0:
             return
 
-        # ── RL Brain gate ─────────────────────────────────────────
+        # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
         obs = extract_features(buf, score, direction)
-        take_trade = self.brain.should_trade(obs)
-        if not take_trade:
-            # Skipped → reward 0 for brain
-            self.brain.record_outcome(reward=0.0, done=True)
-            return
+        if self.trades < 100:
+            take_trade = True
+        else:
+            take_trade = self.brain.should_trade(obs)
+            if not take_trade:
+                # Skipped → reward 0 for brain
+                self.brain.record_outcome(reward=0.0, done=True)
+                return
 
         self._pending_obs = obs
 
