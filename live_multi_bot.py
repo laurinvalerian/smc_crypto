@@ -67,6 +67,14 @@ except ImportError:
         "ccxt.pro is required.  Install with:  pip install 'ccxt[pro]'"
     )
 
+# ── PyTorch (hard requirement for RL brain) ──────────────────────
+try:
+    import torch  # noqa: F401 – ensure torch is importable
+except ImportError:
+    sys.exit(
+        "PyTorch is required.  Install with:  pip install torch"
+    )
+
 # ═══════════════════════════════════════════════════════════════════
 #  Constants
 # ═══════════════════════════════════════════════════════════════════
@@ -103,10 +111,10 @@ TOP_100_COINS: list[str] = [
     "APT/USDT:USDT",
     "ARB/USDT:USDT",
     "OP/USDT:USDT",
-    "MATIC/USDT:USDT",
+    "POL/USDT:USDT",
     "FIL/USDT:USDT",
     "INJ/USDT:USDT",
-    "RNDR/USDT:USDT",
+    "RENDER/USDT:USDT",
     "TIA/USDT:USDT",
     "SEI/USDT:USDT",
     "WLD/USDT:USDT",
@@ -153,7 +161,6 @@ TOP_100_COINS: list[str] = [
     "COMP/USDT:USDT",
     "SNX/USDT:USDT",
     "YFI/USDT:USDT",
-    "BONK/USDT:USDT",
     "1000BONK/USDT:USDT",
     "JUP/USDT:USDT",
     "PYTH/USDT:USDT",
@@ -163,7 +170,6 @@ TOP_100_COINS: list[str] = [
     "KAVA/USDT:USDT",
     "CELO/USDT:USDT",
     "ROSE/USDT:USDT",
-    "LUNC/USDT:USDT",
     "1000LUNC/USDT:USDT",
     "PENDLE/USDT:USDT",
     "NOT/USDT:USDT",
@@ -173,7 +179,6 @@ TOP_100_COINS: list[str] = [
     "GIGA/USDT:USDT",
     "TURBO/USDT:USDT",
     "MOG/USDT:USDT",
-    "FLOKI/USDT:USDT",
     "1000FLOKI/USDT:USDT",
     "WIF/USDT:USDT",
     "BOME/USDT:USDT",
@@ -227,6 +232,18 @@ def _make_logger(name: str, log_path: Path) -> logging.Logger:
 # Root logger → file only (Rich owns the console)
 root_logger = logging.getLogger("live_multi")
 root_logger.setLevel(logging.INFO)
+
+# ── Centralised log file for all INFO/WARNING/ERROR messages ─────
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+_central_fh = logging.FileHandler(
+    OUTPUT_DIR / "live_multi.log", mode="a", encoding="utf-8"
+)
+_central_fh.setLevel(logging.INFO)
+_central_fh.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+)
+root_logger.addHandler(_central_fh)
+
 logger = root_logger
 
 # ═══════════════════════════════════════════════════════════════════
