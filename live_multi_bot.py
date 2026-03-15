@@ -752,17 +752,16 @@ class PaperBot:
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
 
-        # Enforce minimum SL distance (0.35 % of price)
-        sl_dist = max(sl_dist, price * 0.0035)
-        if direction == "long":
-            sl = price - sl_dist
-        else:
-            sl = price + sl_dist
+        # Enforce minimum SL distance (0.35% of price); keep SMC level when wider
+        min_sl_dist = price * 0.0035
+        if sl_dist < min_sl_dist:
+            sl_dist = min_sl_dist
+            sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
 
-        if sl_dist <= 0 or tp_dist <= 0:
+        if tp_dist <= 0:
             return
 
-        # Dynamic RR – never trade below 1:2
+        # Dynamic RR – never trade below FIXED_RR_MIN (1:2)
         rr = tp_dist / sl_dist
         if rr < FIXED_RR_MIN:
             return
