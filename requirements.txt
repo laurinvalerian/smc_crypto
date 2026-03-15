@@ -35,3 +35,6 @@ rich>=13.7.0
 # Utilities
 joblib>=1.4.0             # Parallel processing for walk-forward
 requests>=2.31.0
+
+# RL Brain (per-bot PPO)
+torch>=2.2.0
