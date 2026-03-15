@@ -179,6 +179,7 @@ TOP_100_COINS: list[str] = [
     "BOME/USDT:USDT",
     "PIXEL/USDT:USDT",
     "ONDO/USDT:USDT",
+    "TAO/USDT:USDT",
 ]
 
 NUM_BOTS = len(TOP_100_COINS)  # exactly 100 (or as many coins as listed)
