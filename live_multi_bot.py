@@ -586,6 +586,136 @@ class PaperBot:
 
         return float(np.clip(score, 0.0, 1.0)), direction
 
+    # ── SMC-based SL/TP ──────────────────────────────────────────
+
+    def _find_smc_sl_tp(
+        self, price: float, direction: str,
+    ) -> tuple[float, float] | None:
+        """
+        Compute dynamic SL and TP from SMC levels.
+
+        SL: Under last Bullish OB (long) / over last Bearish OB (short),
+            fallback to nearest Liquidity level.
+        TP: Nearest opposite Liquidity Zone, fallback to opposite FVG.
+
+        Returns ``(sl, tp)`` or ``None`` when valid levels cannot be found.
+        """
+        swing_len = self.swing_length
+        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
+        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
+        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+
+        if len(self.buffer_5m) < swing_len * 2:
+            return None
+
+        try:
+            ind = compute_smc_indicators(
+                self.buffer_5m, swing_len, fvg_thresh, ob_lookback, liq_range,
+            )
+        except Exception:
+            return None
+
+        ob_data = ind.get("order_blocks")
+        liq_data = ind.get("liquidity")
+        fvg_data = ind.get("fvg")
+
+        sl: float | None = None
+        tp: float | None = None
+
+        # ── SL: Order Block (primary) → Liquidity (fallback) ─────
+        if direction == "long":
+            # Last Bullish OB bottom below price
+            if ob_data is not None and not ob_data.empty:
+                for i in range(len(ob_data) - 1, -1, -1):
+                    row = ob_data.iloc[i]
+                    d = row.get("OB", np.nan)
+                    bot = row.get("Bottom", np.nan)
+                    if pd.notna(d) and d > 0 and pd.notna(bot) and bot < price:
+                        sl = float(bot)
+                        break
+            # Fallback: nearest Liquidity level below price
+            if sl is None and liq_data is not None and not liq_data.empty:
+                best: float | None = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl < price:
+                        if best is None or lvl > best:
+                            best = lvl
+                if best is not None:
+                    sl = float(best)
+        else:  # short
+            # Last Bearish OB top above price
+            if ob_data is not None and not ob_data.empty:
+                for i in range(len(ob_data) - 1, -1, -1):
+                    row = ob_data.iloc[i]
+                    d = row.get("OB", np.nan)
+                    top = row.get("Top", np.nan)
+                    if pd.notna(d) and d < 0 and pd.notna(top) and top > price:
+                        sl = float(top)
+                        break
+            # Fallback: nearest Liquidity level above price
+            if sl is None and liq_data is not None and not liq_data.empty:
+                best = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl > price:
+                        if best is None or lvl < best:
+                            best = lvl
+                if best is not None:
+                    sl = float(best)
+
+        # ── TP: opposite Liquidity (primary) → opposite FVG (fallback)
+        if direction == "long":
+            # Nearest Liquidity level above price
+            if liq_data is not None and not liq_data.empty:
+                best = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl > price:
+                        if best is None or lvl < best:
+                            best = lvl
+                if best is not None:
+                    tp = float(best)
+            # Fallback: nearest Bearish FVG bottom above price
+            if tp is None and fvg_data is not None and not fvg_data.empty:
+                best = None
+                for i in range(len(fvg_data)):
+                    row = fvg_data.iloc[i]
+                    d = row.get("FVG", np.nan)
+                    bot = row.get("Bottom", np.nan)
+                    if pd.notna(d) and d < 0 and pd.notna(bot) and bot > price:
+                        if best is None or bot < best:
+                            best = bot
+                if best is not None:
+                    tp = float(best)
+        else:  # short
+            # Nearest Liquidity level below price
+            if liq_data is not None and not liq_data.empty:
+                best = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl < price:
+                        if best is None or lvl > best:
+                            best = lvl
+                if best is not None:
+                    tp = float(best)
+            # Fallback: nearest Bullish FVG top below price
+            if tp is None and fvg_data is not None and not fvg_data.empty:
+                best = None
+                for i in range(len(fvg_data)):
+                    row = fvg_data.iloc[i]
+                    d = row.get("FVG", np.nan)
+                    top_val = row.get("Top", np.nan)
+                    if pd.notna(d) and d > 0 and pd.notna(top_val) and top_val < price:
+                        if best is None or top_val > best:
+                            best = top_val
+                if best is not None:
+                    tp = float(best)
+
+        if sl is None or tp is None:
+            return None
+        return (sl, tp)
+
     # ── Entry evaluation ──────────────────────────────────────────
 
     def _evaluate_entry(
@@ -613,8 +743,27 @@ class PaperBot:
         if price <= 0:
             return
 
-        atr = self._simple_atr(buf, period=FIXED_ATR_PERIOD)
-        if atr <= 0:
+        # ── Dynamic SMC SL/TP (Order Blocks + Liquidity + FVG) ────
+        sl_tp = self._find_smc_sl_tp(price, direction)
+        if sl_tp is None:
+            return
+        sl, tp = sl_tp
+
+        sl_dist = abs(price - sl)
+        tp_dist = abs(tp - price)
+
+        # Enforce minimum SL distance (0.35% of price); keep SMC level when wider
+        min_sl_dist = price * 0.0035
+        if sl_dist < min_sl_dist:
+            sl_dist = min_sl_dist
+            sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
+
+        if tp_dist <= 0:
+            return
+
+        # Dynamic RR – never trade below FIXED_RR_MIN (1:2)
+        rr = tp_dist / sl_dist
+        if rr < FIXED_RR_MIN:
             return
 
         # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
@@ -629,16 +778,6 @@ class PaperBot:
                 return
 
         self._pending_obs = obs
-
-        sl_dist = max(atr * 1.5, price * 0.0035)
-        tp_dist = sl_dist * self.rr_ratio
-
-        if direction == "long":
-            sl = price - sl_dist
-            tp = price + tp_dist
-        else:
-            sl = price + sl_dist
-            tp = price - tp_dist
 
         risk_amount = self.equity * self.risk_pct
         qty = (risk_amount / sl_dist) if sl_dist > 0 else 0.0
