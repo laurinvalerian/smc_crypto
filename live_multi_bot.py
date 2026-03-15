@@ -1,13 +1,18 @@
 """
 ═══════════════════════════════════════════════════════════════════
- live_multi_bot.py  –  Final Live Version with Rich Dashboard
+ live_multi_bot.py  –  Final Coin-Specialised 100-Bot Version
  ──────────────────────────────────────────────────────────────
- Phase 2 – Run the Top 30 best parameter-sets from walk-forward
- backtesting as parallel paper-trading bots on Binance Futures
- Testnet, with a Rich live dashboard.
+ Exactly 100 bots, each permanently assigned to one coin from
+ the Top 100 Evergreen list.  All bots share identical fixed
+ SMC parameters and money-management rules.  Each bot has its
+ own PPO RL brain that learns a yes/no trade filter.
 
  Features:
-   • Dynamic Top-100 volume ranking (refreshed every 30 min)
+   • Fixed 100 bots (no --num-bots parameter)
+   • 1 bot = 1 coin (1:1 mapping, no dynamic volume ranking)
+   • Fixed SMC params & money management for all bots
+   • Per-bot PPO RL brain (rl_brain.py)
+   • Reward = pure PnL change in % (no shaping)
    • WebSocket with stable auto-reconnect (max 5 retries)
    • Rich Live Dashboard:
        – Header: title + total equity + uptime
@@ -17,15 +22,14 @@
    • Each bot: own equity CSV + log file
 
  Requirements:
-   pip install 'ccxt[pro]' pandas numpy python-dotenv pyyaml rich
+   pip install 'ccxt[pro]' pandas numpy python-dotenv pyyaml rich torch
 
  Quick Start:
    1. Copy .env.example → .env and fill in your testnet keys:
         BINANCE_API_KEY=your_testnet_api_key
         BINANCE_SECRET=your_testnet_secret
-   2. Run the backtest so CSV files exist in backtest/results/
-   3. python live_multi_bot.py [--top 30] [--config config/default_config.yaml]
-   4. Ctrl+C → graceful shutdown with final summary.
+   2. python live_multi_bot.py [--config config/default_config.yaml]
+   3. Ctrl+C → graceful shutdown with final summary.
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -53,6 +57,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from rl_brain import RLBrain, extract_features
+
 # ── ccxt.pro for WebSocket ────────────────────────────────────────
 try:
     import ccxt.pro as ccxtpro
@@ -65,24 +71,136 @@ except ImportError:
 #  Constants
 # ═══════════════════════════════════════════════════════════════════
 
-RESULTS_DIR = Path("backtest/results")
 OUTPUT_DIR = Path("live_results")
 
-VOLUME_RANKING_LIMIT = 100         # Top-N symbols by 24 h volume
-VOLUME_REFRESH_SEC = 30 * 60       # Re-rank every 30 minutes
 DASHBOARD_REFRESH_SEC = 10         # Dashboard refresh interval
 WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
 WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
 WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
 
-# Fallback coin list when dynamic volume ranking is unavailable
-DEFAULT_COINS: list[str] = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "DOGE/USDT:USDT", "TON/USDT:USDT", "ADA/USDT:USDT",
-    "AVAX/USDT:USDT", "SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
-    "TRX/USDT:USDT", "BCH/USDT:USDT", "NEAR/USDT:USDT", "LTC/USDT:USDT",
-    "PEPE/USDT:USDT", "SUI/USDT:USDT", "UNI/USDT:USDT", "HBAR/USDT:USDT",
+# ── Fixed Top 100 Evergreen Coins (1 bot = 1 coin) ───────────────
+TOP_100_COINS: list[str] = [
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+    "XRP/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "TON/USDT:USDT",
+    "ADA/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "1000SHIB/USDT:USDT",
+    "LINK/USDT:USDT",
+    "DOT/USDT:USDT",
+    "TRX/USDT:USDT",
+    "BCH/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "LTC/USDT:USDT",
+    "1000PEPE/USDT:USDT",
+    "SUI/USDT:USDT",
+    "UNI/USDT:USDT",
+    "HBAR/USDT:USDT",
+    "APT/USDT:USDT",
+    "ARB/USDT:USDT",
+    "OP/USDT:USDT",
+    "MATIC/USDT:USDT",
+    "FIL/USDT:USDT",
+    "INJ/USDT:USDT",
+    "RNDR/USDT:USDT",
+    "TIA/USDT:USDT",
+    "SEI/USDT:USDT",
+    "WLD/USDT:USDT",
+    "FET/USDT:USDT",
+    "SAND/USDT:USDT",
+    "MANA/USDT:USDT",
+    "GALA/USDT:USDT",
+    "AXS/USDT:USDT",
+    "EGLD/USDT:USDT",
+    "KAS/USDT:USDT",
+    "XLM/USDT:USDT",
+    "VET/USDT:USDT",
+    "ICP/USDT:USDT",
+    "ATOM/USDT:USDT",
+    "FTM/USDT:USDT",
+    "EOS/USDT:USDT",
+    "THETA/USDT:USDT",
+    "AAVE/USDT:USDT",
+    "MKR/USDT:USDT",
+    "LDO/USDT:USDT",
+    "RUNE/USDT:USDT",
+    "GRT/USDT:USDT",
+    "QNT/USDT:USDT",
+    "STX/USDT:USDT",
+    "ALGO/USDT:USDT",
+    "XMR/USDT:USDT",
+    "ZEC/USDT:USDT",
+    "ETC/USDT:USDT",
+    "NEO/USDT:USDT",
+    "IOTA/USDT:USDT",
+    "ONT/USDT:USDT",
+    "WAVES/USDT:USDT",
+    "ZIL/USDT:USDT",
+    "KLAY/USDT:USDT",
+    "FLOW/USDT:USDT",
+    "CRV/USDT:USDT",
+    "DYDX/USDT:USDT",
+    "GMX/USDT:USDT",
+    "APE/USDT:USDT",
+    "CHZ/USDT:USDT",
+    "ENJ/USDT:USDT",
+    "1INCH/USDT:USDT",
+    "SUSHI/USDT:USDT",
+    "COMP/USDT:USDT",
+    "SNX/USDT:USDT",
+    "YFI/USDT:USDT",
+    "BONK/USDT:USDT",
+    "1000BONK/USDT:USDT",
+    "JUP/USDT:USDT",
+    "PYTH/USDT:USDT",
+    "ORDI/USDT:USDT",
+    "STRK/USDT:USDT",
+    "IMX/USDT:USDT",
+    "KAVA/USDT:USDT",
+    "CELO/USDT:USDT",
+    "ROSE/USDT:USDT",
+    "LUNC/USDT:USDT",
+    "1000LUNC/USDT:USDT",
+    "PENDLE/USDT:USDT",
+    "NOT/USDT:USDT",
+    "BRETT/USDT:USDT",
+    "POPCAT/USDT:USDT",
+    "MEW/USDT:USDT",
+    "GIGA/USDT:USDT",
+    "TURBO/USDT:USDT",
+    "MOG/USDT:USDT",
+    "FLOKI/USDT:USDT",
+    "1000FLOKI/USDT:USDT",
+    "WIF/USDT:USDT",
+    "BOME/USDT:USDT",
+    "PIXEL/USDT:USDT",
+    "ONDO/USDT:USDT",
 ]
+
+NUM_BOTS = len(TOP_100_COINS)  # exactly 100 (or as many coins as listed)
+
+# ── Fixed SMC Parameters (identical for all 100 bots) ────────────
+FIXED_SMC_PARAMS: dict[str, Any] = {
+    "swing_length": 10,
+    "fvg_threshold": 0.00045,
+    "order_block_lookback": 28,
+    "liquidity_range_percent": 0.0075,
+    "alignment_threshold": 0.52,
+    "weight_day": 1.25,
+    "bos_choch_filter": "medium",
+}
+
+# ── Fixed Money Management ────────────────────────────────────────
+FIXED_RISK_PCT = 0.01       # 1 % risk per trade
+FIXED_RR_MIN = 2.0          # minimum 1:2 reward-to-risk
+FIXED_ATR_PERIOD = 14
+FIXED_EMA_FAST = 20
+FIXED_EMA_SLOW = 50
+FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
 
 # ═══════════════════════════════════════════════════════════════════
 #  Logging helpers
@@ -111,151 +229,42 @@ root_logger.setLevel(logging.INFO)
 logger = root_logger
 
 # ═══════════════════════════════════════════════════════════════════
-#  Parameter loading
-# ═══════════════════════════════════════════════════════════════════
-
-PARAM_COLS: list[str] = [
-    "leverage", "risk_per_trade", "alignment_threshold",
-    "swing_length", "fvg_threshold", "order_block_lookback",
-    "liquidity_range_percent", "risk_reward", "weight_day",
-]
-
-
-def load_top_params(results_dir: Path, top_n: int = 30) -> pd.DataFrame:
-    """
-    Load parameter-sets from backtest CSV files and return the top *top_n*
-    ranked by a composite score  (0.7 × normalised total_pnl
-                                 + 0.3 × normalised sharpe).
-    """
-    frames: list[pd.DataFrame] = []
-
-    global_path = results_dir / "global_top_params.csv"
-    if global_path.exists():
-        df = pd.read_csv(global_path)
-        df["_source"] = "global"
-        frames.append(df)
-        logger.info("Loaded %d rows from %s", len(df), global_path.name)
-
-    for p in sorted(results_dir.glob("top_params_w*.csv")):
-        df = pd.read_csv(p)
-        df["_source"] = p.stem
-        frames.append(df)
-        logger.info("Loaded %d rows from %s", len(df), p.name)
-
-    if not frames:
-        raise FileNotFoundError(
-            f"No parameter CSV files found in {results_dir}. "
-            "Run the backtest first (python -m backtest.optuna_backtester)."
-        )
-
-    combined = pd.concat(frames, ignore_index=True)
-
-    for col in ("total_pnl", "sharpe"):
-        if col not in combined.columns:
-            combined[col] = 0.0
-
-    pnl = combined["total_pnl"].astype(float)
-    sharpe = combined["sharpe"].astype(float)
-
-    pnl_range = pnl.max() - pnl.min()
-    sharpe_range = sharpe.max() - sharpe.min()
-
-    norm_pnl = (pnl - pnl.min()) / pnl_range if pnl_range > 0 else 0.0
-    norm_sharpe = (sharpe - sharpe.min()) / sharpe_range if sharpe_range > 0 else 0.0
-
-    combined["_rank_score"] = 0.7 * norm_pnl + 0.3 * norm_sharpe
-    combined = combined.sort_values("_rank_score", ascending=False).reset_index(drop=True)
-
-    param_cols_present = [c for c in PARAM_COLS if c in combined.columns]
-    if param_cols_present:
-        combined = combined.drop_duplicates(subset=param_cols_present, keep="first")
-
-    top = combined.head(top_n).copy()
-    logger.info("Selected top %d parameter sets (of %d total)", len(top), len(combined))
-    return top
-
-
-def params_from_row(row: pd.Series) -> dict[str, Any]:
-    """Extract a clean parameter dict from a DataFrame row."""
-    params: dict[str, Any] = {}
-    for col in PARAM_COLS:
-        if col in row.index and pd.notna(row[col]):
-            params[col] = row[col]
-    return params
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Dynamic Volume Ranking
-# ═══════════════════════════════════════════════════════════════════
-
-async def get_top_volume_symbols(
-    exchange: Any,
-    limit: int = VOLUME_RANKING_LIMIT,
-) -> list[str]:
-    """
-    Fetch all USDT-M futures tickers, sort by 24 h quote volume
-    (descending) and return the top *limit* symbol names.
-    """
-    try:
-        tickers = await exchange.fetch_tickers()
-    except Exception as exc:
-        logger.error("fetch_tickers failed: %s", exc)
-        return []
-
-    usdt_tickers: list[tuple[str, float]] = []
-    for symbol, tick in tickers.items():
-        if not symbol.endswith(":USDT"):
-            continue
-        quote_vol = float(tick.get("quoteVolume") or 0)
-        usdt_tickers.append((symbol, quote_vol))
-
-    usdt_tickers.sort(key=lambda t: t[1], reverse=True)
-    top_symbols = [sym for sym, _ in usdt_tickers[:limit]]
-
-    logger.info(
-        "Volume ranking refreshed: %d USDT-M symbols, top %d selected",
-        len(usdt_tickers), len(top_symbols),
-    )
-    return top_symbols
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Paper-Trading Bot
+#  Paper-Trading Bot  (coin-specialised, fixed params, RL brain)
 # ═══════════════════════════════════════════════════════════════════
 
 class PaperBot:
     """
-    A single paper-trading bot that evaluates a specific parameter set
-    against live market prices.
+    A single paper-trading bot specialised on one coin.
 
-    Simplified strategy logic:
-      – Uses alignment_threshold, risk_per_trade, leverage, risk_reward
-      – Monitors 5 m candles; enters when alignment score (simple
-        momentum + volatility proxy) exceeds threshold
-      – Simulates fill at close, SL/TP based on ATR
-      – Tracks equity over time
+    Uses fixed SMC parameters and money management.  An RL brain
+    (PPO) gates each potential entry (yes / no).  Reward for the
+    brain = pure PnL change in % (no shaping, no R:R bonus).
+
+    Strategy logic:
+      – Monitors 5 m candles for its assigned coin
+      – Computes alignment score (EMA-20/50 trend + BOS momentum)
+      – If score ≥ threshold AND RL brain says "trade" → enter
+      – Full SL or full TP (no partial exits)
+      – Volume filter: skip bar if volume < 1.0× average(20)
     """
 
     def __init__(
         self,
         bot_id: int,
-        params: dict[str, Any],
+        symbol: str,
         config: dict[str, Any],
         output_dir: Path,
     ) -> None:
         self.bot_id = bot_id
         self.tag = f"bot_{bot_id:03d}"
-        self.params = params
-        self.cfg = config
+        self.symbol = symbol
 
-        # Strategy parameters
-        self.leverage: int = int(params.get("leverage", 10))
-        self.risk_pct: float = float(params.get("risk_per_trade", 0.01))
-        self.rr_ratio: float = float(params.get("risk_reward", 3.0))
-        self.alignment_threshold: float = float(
-            params.get("alignment_threshold", 0.55)
-        )
-        self.swing_length: int = int(params.get("swing_length", 8))
+        # Fixed strategy parameters
+        self.swing_length: int = FIXED_SMC_PARAMS["swing_length"]
+        self.alignment_threshold: float = FIXED_SMC_PARAMS["alignment_threshold"]
+        self.risk_pct: float = FIXED_RISK_PCT
+        self.rr_ratio: float = FIXED_RR_MIN
+        self.leverage: int = 10  # default leverage
 
         # Virtual account
         self.start_equity: float = float(config["account"]["size"])
@@ -267,10 +276,18 @@ class PaperBot:
         self.trades: int = 0
         self.wins: int = 0
         self.open_positions: dict[str, dict[str, Any]] = {}
-        self.max_open: int = int(config.get("live", {}).get("max_open_trades", 5))
+        self.max_open: int = 1  # 1 bot = 1 coin = max 1 position
 
-        # Candle history per symbol  {symbol: list[dict]}
+        # Candle history  {symbol: list[dict]}
         self._candle_buf: dict[str, list[dict[str, Any]]] = {}
+
+        # RL Brain (per-bot PPO)
+        self.brain = RLBrain(
+            bot_tag=self.tag,
+            model_dir=output_dir / "rl_models",
+        )
+        # Store last obs so we can record reward when trade closes
+        self._pending_obs: np.ndarray | None = None
 
         # Output
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -281,8 +298,8 @@ class PaperBot:
             output_dir / f"{self.tag}.log",
         )
         self.logger.info(
-            "Initialised %s | params=%s | equity=%.2f",
-            self.tag, json.dumps(params, default=str), self.equity,
+            "Initialised %s | symbol=%s | equity=%.2f | params=%s",
+            self.tag, symbol, self.equity, json.dumps(FIXED_SMC_PARAMS, default=str),
         )
 
     # ── Equity CSV ────────────────────────────────────────────────
@@ -383,6 +400,12 @@ class PaperBot:
         if len(self.open_positions) >= self.max_open:
             return
 
+        # Volume filter: skip if current volume < 1.0× avg(20)
+        volumes = [c["volume"] for c in buf[-20:]]
+        avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
+        if avg_vol > 0 and candle["volume"] < FIXED_MIN_VOL_MULT * avg_vol:
+            return
+
         score, direction = self._alignment_score(buf, self.swing_length)
         if score < self.alignment_threshold:
             return
@@ -391,9 +414,19 @@ class PaperBot:
         if price <= 0:
             return
 
-        atr = self._simple_atr(buf, period=14)
+        atr = self._simple_atr(buf, period=FIXED_ATR_PERIOD)
         if atr <= 0:
             return
+
+        # ── RL Brain gate ─────────────────────────────────────────
+        obs = extract_features(buf, score, direction)
+        take_trade = self.brain.should_trade(obs)
+        if not take_trade:
+            # Skipped → reward 0 for brain
+            self.brain.record_outcome(reward=0.0, done=True)
+            return
+
+        self._pending_obs = obs
 
         sl_dist = max(atr * 1.5, price * 0.0035)
         tp_dist = sl_dist * self.rr_ratio
@@ -470,6 +503,9 @@ class PaperBot:
         commission = pos["qty"] * pos["entry"] * 0.0004 * 2
         net_pnl = raw_pnl - commission
 
+        # Reward = pure PnL change in % (relative to equity before trade)
+        pnl_pct = (net_pnl / self.equity * 100) if self.equity > 0 else 0.0
+
         self.equity += net_pnl
         self.total_pnl += net_pnl
         self.trades += 1
@@ -479,6 +515,9 @@ class PaperBot:
             self.peak_equity = self.equity
 
         self._append_equity()
+
+        # Feed reward to RL brain
+        self.brain.record_outcome(reward=pnl_pct, done=True)
 
         self.logger.info(
             "CLOSE %s %s %s @ %.6f → %.6f | pnl=%.2f equity=%.2f",
@@ -524,6 +563,7 @@ class PaperBot:
     def summary_dict(self) -> dict[str, Any]:
         return {
             "bot": self.tag,
+            "symbol": self.symbol,
             "equity": round(self.equity, 2),
             "pnl": round(self.total_pnl, 2),
             "return_pct": round(self.return_pct, 2),
@@ -590,6 +630,7 @@ def _build_bot_table(
     )
     table.add_column("#", justify="right", style="dim", width=4)
     table.add_column("Bot-ID", style="cyan", width=9)
+    table.add_column("Coin", style="bright_yellow", width=18)
     table.add_column("Equity", justify="right", width=14)
     table.add_column("PnL", justify="right", width=12)
     table.add_column("Return%", justify="right", width=9)
@@ -604,6 +645,7 @@ def _build_bot_table(
         table.add_row(
             str(i),
             r["bot"],
+            r.get("symbol", ""),
             f"{r['equity']:,.2f}",
             f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
             f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
@@ -732,21 +774,27 @@ def build_dashboard(
 
 class LiveMultiBotRunner:
     """
-    Orchestrates multiple PaperBot instances with:
-      - Dynamic volume-based symbol ranking (refreshed every 30 min)
+    Orchestrates 100 coin-specialised PaperBot instances with:
+      - Fixed symbol list (no dynamic volume ranking)
       - WebSocket auto-reconnect per symbol
       - Rich Live Dashboard
+      - Per-bot RL brain
+
+    Each bot trades only its assigned coin.
     """
 
     def __init__(
         self,
         bots: list[PaperBot],
         exchange: Any,
-        initial_symbols: list[str],
     ) -> None:
         self.bots = bots
         self.exchange = exchange
-        self.symbols: list[str] = list(initial_symbols)
+        # Build a lookup: symbol → bot
+        self._symbol_to_bot: dict[str, PaperBot] = {
+            b.symbol: b for b in bots
+        }
+        self.symbols: list[str] = [b.symbol for b in bots]
         self._shutdown = asyncio.Event()
         self._start_time = datetime.now(timezone.utc)
 
@@ -762,9 +810,14 @@ class LiveMultiBotRunner:
 
     async def _watch_symbol(self, symbol: str) -> None:
         """
-        Subscribe to 5 m OHLCV candles for *symbol* and feed each bot.
+        Subscribe to 5 m OHLCV candles for *symbol* and feed the
+        assigned bot only.
         Auto-reconnects up to WS_MAX_RECONNECT times with exponential backoff.
         """
+        bot = self._symbol_to_bot.get(symbol)
+        if bot is None:
+            return
+
         last_ts: int | None = None
         reconnect_count = 0
 
@@ -794,13 +847,12 @@ class LiveMultiBotRunner:
                             "volume": float(row[5]),
                         }
 
-                        for bot in self.bots:
-                            try:
-                                bot.on_candle(symbol, candle)
-                            except Exception as exc:
-                                bot.logger.error(
-                                    "Error processing candle for %s: %s", symbol, exc
-                                )
+                        try:
+                            bot.on_candle(symbol, candle)
+                        except Exception as exc:
+                            bot.logger.error(
+                                "Error processing candle for %s: %s", symbol, exc
+                            )
 
             except asyncio.CancelledError:
                 self.ws_status[symbol] = "disconnected"
@@ -834,53 +886,6 @@ class LiveMultiBotRunner:
                 except asyncio.TimeoutError:
                     pass  # continue reconnect loop
 
-    # ── Volume ranking refresh ────────────────────────────────────
-
-    async def _volume_ranking_loop(self) -> None:
-        """
-        Periodically refresh the Top-100 volume ranking and update
-        watcher tasks for any new/removed symbols.
-        """
-        while not self._shutdown.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._shutdown.wait(), timeout=VOLUME_REFRESH_SEC
-                )
-                return  # shutdown was set
-            except asyncio.TimeoutError:
-                pass
-
-            new_symbols = await get_top_volume_symbols(
-                self.exchange, limit=VOLUME_RANKING_LIMIT
-            )
-            if not new_symbols:
-                continue
-
-            old_set = set(self.symbols)
-            new_set = set(new_symbols)
-
-            # Cancel watchers for removed symbols
-            for sym in old_set - new_set:
-                task = self._watcher_tasks.pop(sym, None)
-                if task is not None:
-                    task.cancel()
-                self.ws_status.pop(sym, None)
-
-            # Start watchers for added symbols
-            for sym in new_set - old_set:
-                self.ws_status[sym] = "connecting"
-                self._watcher_tasks[sym] = asyncio.create_task(
-                    self._watch_symbol(sym)
-                )
-
-            self.symbols = new_symbols
-            logger.info(
-                "Volume ranking updated: %d symbols (+%d / -%d)",
-                len(new_symbols),
-                len(new_set - old_set),
-                len(old_set - new_set),
-            )
-
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _dashboard_loop(self) -> None:
@@ -911,19 +916,16 @@ class LiveMultiBotRunner:
     # ── Main loop ─────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Start all watchers + dashboard + volume ranking. Blocks until shutdown."""
+        """Start all watchers + dashboard. Blocks until shutdown."""
         logger.info(
             "Starting %d bots on %d symbols …", len(self.bots), len(self.symbols)
         )
 
-        # Start one watcher task per symbol
+        # Start one watcher task per symbol (= per bot)
         for sym in self.symbols:
             self._watcher_tasks[sym] = asyncio.create_task(
                 self._watch_symbol(sym)
             )
-
-        # Volume ranking refresher
-        ranking_task = asyncio.create_task(self._volume_ranking_loop())
 
         # Rich dashboard
         dashboard_task = asyncio.create_task(self._dashboard_loop())
@@ -934,12 +936,18 @@ class LiveMultiBotRunner:
 
         # Cancel all tasks
         dashboard_task.cancel()
-        ranking_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
 
-        all_tasks = [dashboard_task, ranking_task] + list(self._watcher_tasks.values())
+        all_tasks = [dashboard_task] + list(self._watcher_tasks.values())
         await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        # Flush RL brains (save remaining buffer)
+        for bot in self.bots:
+            try:
+                bot.brain.flush()
+            except Exception:
+                pass
 
         # Close exchange WebSocket connections
         try:
@@ -984,23 +992,15 @@ class LiveMultiBotRunner:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Live Multi-Bot with Rich Dashboard (Binance Testnet)",
-    )
-    parser.add_argument(
-        "--top", type=int, default=30,
-        help="Number of top parameter-sets to run (default: 30)",
+        description="Live 100-Bot Coin-Specialised System with RL Brain (Binance Testnet)",
     )
     parser.add_argument(
         "--config", default="config/default_config.yaml",
         help="Path to YAML config file",
     )
     parser.add_argument(
-        "--results-dir", default=str(RESULTS_DIR),
-        help="Directory containing backtest CSV results",
-    )
-    parser.add_argument(
         "--output-dir", default=str(OUTPUT_DIR),
-        help="Directory for live bot outputs (equity CSVs, logs)",
+        help="Directory for live bot outputs (equity CSVs, logs, RL models)",
     )
     args = parser.parse_args()
 
@@ -1022,61 +1022,43 @@ def main() -> None:
         config = yaml.safe_load(f)
     logger.info("Config loaded from %s", cfg_path)
 
-    # ── Load parameters ───────────────────────────────────────────
-    results_dir = Path(args.results_dir)
-    top_params_df = load_top_params(results_dir, top_n=args.top)
-    if top_params_df.empty:
-        sys.exit("No parameter sets found. Run the backtest first.")
-
-    # ── Create bots ───────────────────────────────────────────────
+    # ── Create 100 bots (1 bot = 1 coin) ─────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    console = Console()
+    console.print(
+        f"[bold cyan]Creating {NUM_BOTS} coin-specialised bots …[/bold cyan]"
+    )
+
     bots: list[PaperBot] = []
-    for idx, row in top_params_df.iterrows():
-        params = params_from_row(row)
+    for idx, coin in enumerate(TOP_100_COINS):
         bot = PaperBot(
-            bot_id=int(idx) + 1,
-            params=params,
+            bot_id=idx + 1,
+            symbol=coin,
             config=config,
             output_dir=output_dir,
         )
         bots.append(bot)
 
-    logger.info("Created %d paper-trading bots", len(bots))
+    logger.info("Created %d coin-specialised bots", len(bots))
+    console.print(
+        f"[bold green]✅ {len(bots)} bots created – "
+        f"each assigned to a unique coin.[/bold green]"
+    )
 
     # ── Create exchange ───────────────────────────────────────────
     exchange = create_exchange(api_key, api_secret)
-
-    # ── Initial volume ranking ────────────────────────────────────
-    console = Console()
-    console.print("[bold cyan]Fetching initial volume ranking …[/bold cyan]")
-
-    loop = asyncio.new_event_loop()
-    try:
-        initial_symbols = loop.run_until_complete(
-            get_top_volume_symbols(exchange, limit=VOLUME_RANKING_LIMIT)
-        )
-    except Exception as exc:
-        console.print(f"[yellow]⚠ Could not fetch volume ranking: {exc}[/yellow]")
-        console.print("[yellow]  Falling back to default coin list.[/yellow]")
-        initial_symbols = list(DEFAULT_COINS)
-
-    if not initial_symbols:
-        initial_symbols = list(DEFAULT_COINS)
-
-    console.print(
-        f"[bold green]✅ Loaded {len(initial_symbols)} symbols by volume.[/bold green]"
-    )
 
     # ── Runner ────────────────────────────────────────────────────
     runner = LiveMultiBotRunner(
         bots=bots,
         exchange=exchange,
-        initial_symbols=initial_symbols,
     )
 
     # ── Graceful shutdown on Ctrl+C ───────────────────────────────
+    loop = asyncio.new_event_loop()
+
     def _signal_handler() -> None:
         logger.info("Ctrl+C detected – shutting down gracefully …")
         runner.request_shutdown()

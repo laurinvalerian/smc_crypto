@@ -47,5 +47,9 @@ docker/.env
 # Live bot results (generated locally)
 live_results/
 
+# RL model checkpoints (generated per bot)
+rl_models/
+*.pt
+
 # Logs
 *.log
