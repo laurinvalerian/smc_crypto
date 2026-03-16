@@ -873,6 +873,10 @@ class PaperBot:
         # ── Fetch real balance (1 % risk) ─────────────────────────
         balance = await self._fetch_balance()
         if balance is None or balance <= 0:
+            self.logger.warning(
+                "fetch_balance returned %s – falling back to virtual equity (%.2f)",
+                balance, self.equity,
+            )
             balance = self.equity  # fallback to virtual equity
 
         sl_dist = abs(price - sl)
@@ -891,8 +895,17 @@ class PaperBot:
             symbol, direction, price, sl, tp, qty,
         )
 
-        # Consume the pending signal regardless of order success
+        # Consume the pending signal
         self._pending_signal = None
+
+        # If the real order failed, do not open a virtual position
+        if order_id is None and self.exchange is not None:
+            self.logger.warning(
+                "Bracket order failed for %s %s – skipping virtual position",
+                direction.upper(), symbol,
+            )
+            return
+
         self._pending_obs = obs
 
         # ── Virtual position tracking (dashboard + RL brain) ──────
