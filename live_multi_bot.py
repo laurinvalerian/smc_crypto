@@ -1430,99 +1430,112 @@ class LiveMultiBotRunner:
             try:
                 positions = await self.exchange.fetch_positions()
 
-                # Build map: symbol → position (non-zero contracts only)
-                pos_map: dict[str, Any] = {}
-                for p in positions:
-                    sym = p.get("symbol")
-                    contracts = abs(float(p.get("contracts", 0) or 0))
-                    if sym and contracts > 0:
-                        pos_map[sym] = p
+                # Binance USDT-M one-way mode: one position per symbol.
+                # Build map: symbol → position (non-zero contracts only).
+                # Skip poll cycle if exchange returned nothing (API glitch).
+                if positions:
+                    pos_map: dict[str, Any] = {}
+                    for p in positions:
+                        sym = p.get("symbol")
+                        contracts = abs(float(p.get("contracts", 0) or 0))
+                        if sym and contracts > 0:
+                            pos_map[sym] = p
 
-                for bot in self.bots:
-                    trade = bot._active_trade
-                    if trade is None:
-                        continue
+                    for bot in self.bots:
+                        trade = bot._active_trade
+                        if trade is None:
+                            continue
 
-                    # Position still open on exchange → nothing to do
-                    if bot.symbol in pos_map:
-                        continue
+                        # Position still open on exchange → nothing to do
+                        if bot.symbol in pos_map:
+                            continue
 
-                    # ── Position closed (TP or SL filled) ─────────
-                    entry_price = trade["entry"]
-                    sl = trade["sl"]
-                    tp = trade["tp"]
-                    qty = trade["qty"]
-                    direction = trade["direction"]
+                        # ── Position closed (TP or SL filled) ─────
+                        entry_price = trade["entry"]
+                        sl = trade["sl"]
+                        tp = trade["tp"]
+                        qty = trade["qty"]
+                        direction = trade["direction"]
 
-                    # Try to get exit price from recent exchange trades
-                    exit_price: float | None = None
-                    try:
-                        since_ms = int(
-                            trade["entry_time"].timestamp() * 1000
+                        # Determine exit price from recent exchange
+                        # trades.  Filter to exit-side trades (sell for
+                        # long, buy for short) that occurred after entry.
+                        exit_price: float | None = None
+                        exit_side = "sell" if direction == "long" else "buy"
+                        try:
+                            since_ms = int(
+                                trade["entry_time"].timestamp() * 1000
+                            )
+                            recent = await self.exchange.fetch_my_trades(
+                                bot.symbol, since=since_ms, limit=20,
+                            )
+                            # Find the last trade on the exit side
+                            for t in reversed(recent or []):
+                                if t.get("side") == exit_side:
+                                    exit_price = float(t["price"])
+                                    break
+                        except Exception as exc:
+                            bot.logger.warning(
+                                "fetch_my_trades failed: %s", exc,
+                            )
+
+                        # Fallback: assume SL (conservative)
+                        if exit_price is None:
+                            exit_price = sl
+                            bot.logger.warning(
+                                "Could not determine exit price for %s "
+                                "– assuming SL hit",
+                                bot.symbol,
+                            )
+
+                        # ── PnL calculation ───────────────────────
+                        if direction == "long":
+                            raw_pnl = (exit_price - entry_price) * qty
+                        else:
+                            raw_pnl = (entry_price - exit_price) * qty
+
+                        commission = qty * entry_price * 0.0004 * 2
+                        net_pnl = raw_pnl - commission
+
+                        pnl_pct = (
+                            (net_pnl / bot.equity * 100)
+                            if bot.equity > 0
+                            else 0.0
                         )
-                        recent = await self.exchange.fetch_my_trades(
-                            bot.symbol, since=since_ms, limit=20,
-                        )
-                        if recent:
-                            exit_price = float(recent[-1]["price"])
-                    except Exception as exc:
-                        bot.logger.warning(
-                            "fetch_my_trades failed: %s", exc,
+
+                        bot.equity += net_pnl
+                        bot.total_pnl += net_pnl
+                        bot.trades += 1
+                        if net_pnl > 0:
+                            bot.wins += 1
+                        if bot.equity > bot.peak_equity:
+                            bot.peak_equity = bot.equity
+
+                        bot._append_equity()
+
+                        # Feed reward to RL brain
+                        bot.brain.record_outcome(
+                            reward=pnl_pct, done=True,
                         )
 
-                    # Fallback: assume SL (conservative)
-                    if exit_price is None:
-                        exit_price = sl
-                        bot.logger.warning(
-                            "Could not determine exit price for %s "
-                            "– assuming SL hit",
+                        outcome = "WIN" if net_pnl > 0 else "LOSS"
+                        bot.logger.info(
+                            "CLOSE %s %s %s @ %.6f → %.6f | "
+                            "pnl=%.2f equity=%.2f",
+                            outcome,
+                            direction.upper(),
                             bot.symbol,
+                            entry_price,
+                            exit_price,
+                            net_pnl,
+                            bot.equity,
                         )
 
-                    # ── PnL calculation ───────────────────────────
-                    if direction == "long":
-                        raw_pnl = (exit_price - entry_price) * qty
-                    else:
-                        raw_pnl = (entry_price - exit_price) * qty
-
-                    commission = qty * entry_price * 0.0004 * 2
-                    net_pnl = raw_pnl - commission
-
-                    pnl_pct = (
-                        (net_pnl / bot.equity * 100)
-                        if bot.equity > 0
-                        else 0.0
+                        bot._active_trade = None
+                else:
+                    logger.debug(
+                        "fetch_positions returned empty – skipping poll cycle"
                     )
-
-                    bot.equity += net_pnl
-                    bot.total_pnl += net_pnl
-                    bot.trades += 1
-                    if net_pnl > 0:
-                        bot.wins += 1
-                    if bot.equity > bot.peak_equity:
-                        bot.peak_equity = bot.equity
-
-                    bot._append_equity()
-
-                    # Feed reward to RL brain
-                    bot.brain.record_outcome(
-                        reward=pnl_pct, done=True,
-                    )
-
-                    outcome = "WIN" if net_pnl > 0 else "LOSS"
-                    bot.logger.info(
-                        "CLOSE %s %s %s @ %.6f → %.6f | "
-                        "pnl=%.2f equity=%.2f",
-                        outcome,
-                        direction.upper(),
-                        bot.symbol,
-                        entry_price,
-                        exit_price,
-                        net_pnl,
-                        bot.equity,
-                    )
-
-                    bot._active_trade = None
 
             except asyncio.CancelledError:
                 return
