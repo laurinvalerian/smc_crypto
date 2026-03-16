@@ -13,6 +13,11 @@
    • Fixed SMC params & money management for all bots
    • Per-bot PPO RL brain (rl_brain.py)
    • Reward = pure PnL change in % (no shaping)
+   • Real Binance Testnet bracket orders (market + SL + TP)
+   • Real-time entry via watch_ticker (no waiting for closed 5m candle)
+   • Risk = 1 % of real account balance (fetch_balance per trade)
+   • Dynamic SL/TP from SMC (OB + Liquidity + FVG), RR ≥ 2.5
+   • Warm-up: first 100 trades per bot always accepted
    • WebSocket with stable auto-reconnect (max 5 retries)
    • Rich Live Dashboard:
        – Header: title + total equity + uptime
@@ -215,7 +220,7 @@ FIXED_SMC_PARAMS: dict[str, Any] = {
 
 # ── Fixed Money Management ────────────────────────────────────────
 FIXED_RISK_PCT = 0.01       # 1 % risk per trade
-FIXED_RR_MIN = 2.0          # minimum 1:2 reward-to-risk
+FIXED_RR_MIN = 2.5          # minimum 1:2.5 reward-to-risk
 FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
@@ -277,16 +282,20 @@ logger = root_logger
 
 class PaperBot:
     """
-    A single paper-trading bot specialised on one coin.
+    A single trading bot specialised on one coin.
 
     Uses fixed SMC parameters and money management.  An RL brain
     (PPO) gates each potential entry (yes / no).  Reward for the
     brain = pure PnL change in % (no shaping, no R:R bonus).
 
     Strategy logic:
-      – Monitors 5 m candles for its assigned coin
-      – Computes alignment score (EMA-20/50 trend + BOS momentum)
-      – If score ≥ threshold AND RL brain says "trade" → enter
+      – Monitors 5 m candles for analysis (multi-TF alignment)
+      – Real-time entry via ``watch_ticker``: when 5 m signal + zone
+        are valid and the live price touches the entry zone, enter
+        immediately (no waiting for a closed candle).
+      – Places real bracket orders on Binance Testnet with SL + TP.
+      – Risk per trade = 1 % of the *real* account balance
+        (``fetch_balance`` before every trade).
       – Full SL or full TP (no partial exits)
       – Volume filter: skip bar if volume < 1.0× average(20)
     """
@@ -297,10 +306,12 @@ class PaperBot:
         symbol: str,
         config: dict[str, Any],
         output_dir: Path,
+        exchange: Any = None,
     ) -> None:
         self.bot_id = bot_id
         self.tag = f"bot_{bot_id:03d}"
         self.symbol = symbol
+        self.exchange = exchange  # ccxt.pro async exchange for real orders
 
         # Fixed strategy parameters
         self.swing_length: int = FIXED_SMC_PARAMS["swing_length"]
@@ -309,7 +320,7 @@ class PaperBot:
         self.rr_ratio: float = FIXED_RR_MIN
         self.leverage: int = 10  # default leverage
 
-        # Virtual account
+        # Virtual account (parallel tracking for dashboard / RL brain)
         self.start_equity: float = float(config["account"]["size"])
         self.equity: float = self.start_equity
         self.peak_equity: float = self.start_equity
@@ -323,6 +334,12 @@ class PaperBot:
 
         # Candle history  {symbol: list[dict]}
         self._candle_buf: dict[str, list[dict[str, Any]]] = {}
+
+        # Pending signal for real-time entry (set by on_candle, consumed by on_tick)
+        self._pending_signal: dict[str, Any] | None = None
+
+        # Active exchange order ID (for bracket order tracking)
+        self._active_order_id: str | None = None
 
         # RL Brain (per-bot PPO)
         self.brain = RLBrain(
@@ -515,6 +532,10 @@ class PaperBot:
         """
         Called whenever a new 5 m OHLCV candle arrives for *symbol*.
 
+        Analysis runs here (multi-TF alignment, SMC SL/TP).
+        If valid, a pending signal is stored.  Actual entry happens in
+        ``on_tick`` when the live price touches the entry zone.
+
         candle keys: timestamp, open, high, low, close, volume
         """
         if symbol not in self._candle_buf:
@@ -541,7 +562,7 @@ class PaperBot:
         self._check_exits(symbol, candle)
 
         if len(buf) >= self.swing_length + 5:
-            self._evaluate_entry(symbol, buf, candle)
+            self._prepare_signal(symbol, buf, candle)
 
     # ── Simple alignment score ────────────────────────────────────
 
@@ -716,36 +737,49 @@ class PaperBot:
             return None
         return (sl, tp)
 
-    # ── Entry evaluation ──────────────────────────────────────────
+    # ── Signal preparation (called from on_candle) ──────────────────
 
-    def _evaluate_entry(
+    def _prepare_signal(
         self,
         symbol: str,
         buf: list[dict[str, Any]],
         candle: dict[str, Any],
     ) -> None:
+        """
+        Evaluate multi-TF alignment + SMC SL/TP on the latest 5 m candle.
+
+        If all filters pass (alignment, RR ≥ 2.5, RL brain), store a
+        *pending signal* that ``on_tick`` will consume for real-time
+        entry once the live price touches the entry zone.
+        """
         if symbol in self.open_positions:
+            self._pending_signal = None
             return
         if len(self.open_positions) >= self.max_open:
+            self._pending_signal = None
             return
 
         # Volume filter: skip if current volume < 1.0× avg(20)
         volumes = [c["volume"] for c in buf[-20:]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
         if avg_vol > 0 and candle["volume"] < FIXED_MIN_VOL_MULT * avg_vol:
+            self._pending_signal = None
             return
 
         score, direction = self._multi_tf_alignment_score(candle)
         if score < self.alignment_threshold:
+            self._pending_signal = None
             return
 
         price = candle["close"]
         if price <= 0:
+            self._pending_signal = None
             return
 
         # ── Dynamic SMC SL/TP (Order Blocks + Liquidity + FVG) ────
         sl_tp = self._find_smc_sl_tp(price, direction)
         if sl_tp is None:
+            self._pending_signal = None
             return
         sl, tp = sl_tp
 
@@ -759,11 +793,13 @@ class PaperBot:
             sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
 
         if tp_dist <= 0:
+            self._pending_signal = None
             return
 
-        # Dynamic RR – never trade below FIXED_RR_MIN (1:2)
+        # Dynamic RR – never trade below FIXED_RR_MIN (1:2.5)
         rr = tp_dist / sl_dist
         if rr < FIXED_RR_MIN:
+            self._pending_signal = None
             return
 
         # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
@@ -775,17 +811,91 @@ class PaperBot:
             if not take_trade:
                 # Skipped → reward 0 for brain
                 self.brain.record_outcome(reward=0.0, done=True)
+                self._pending_signal = None
                 return
 
-        self._pending_obs = obs
+        # ── Compute entry zone from 15 m analysis ─────────────────
+        # Zone boundaries: for long, enter when price reaches SL side
+        # (pullback into zone); for short, enter when price rallies into zone.
+        if direction == "long":
+            zone_low = sl
+            zone_high = price  # enter between SL and current close
+        else:
+            zone_low = price
+            zone_high = sl
 
-        risk_amount = self.equity * self.risk_pct
-        qty = (risk_amount / sl_dist) if sl_dist > 0 else 0.0
+        # Store pending signal – on_tick will trigger the actual entry
+        self._pending_signal = {
+            "symbol": symbol,
+            "direction": direction,
+            "sl": sl,
+            "tp": tp,
+            "score": score,
+            "obs": obs,
+            "zone_low": zone_low,
+            "zone_high": zone_high,
+            "ref_price": price,
+        }
+        self.logger.debug(
+            "PENDING %s %s | zone=[%.6f, %.6f] SL=%.6f TP=%.6f score=%.2f",
+            direction.upper(), symbol, zone_low, zone_high, sl, tp, score,
+        )
+
+    # ── Real-time tick handler (called from watch_ticker) ─────────
+
+    async def on_tick(self, symbol: str, price: float) -> None:
+        """
+        Called on every live ticker update.
+
+        If a pending signal exists and the live price is inside the
+        entry zone, place a real bracket order on the testnet and
+        open a virtual position for tracking.
+        """
+        sig = self._pending_signal
+        if sig is None:
+            return
+        if sig["symbol"] != symbol:
+            return
+        if symbol in self.open_positions:
+            self._pending_signal = None
+            return
+
+        # Check if price is inside the entry zone
+        if not (sig["zone_low"] <= price <= sig["zone_high"]):
+            return
+
+        direction = sig["direction"]
+        sl = sig["sl"]
+        tp = sig["tp"]
+        score = sig["score"]
+        obs = sig["obs"]
+
+        # ── Fetch real balance (1 % risk) ─────────────────────────
+        balance = await self._fetch_balance()
+        if balance is None or balance <= 0:
+            balance = self.equity  # fallback to virtual equity
+
+        sl_dist = abs(price - sl)
+        if sl_dist <= 0:
+            return
+
+        risk_amount = balance * self.risk_pct
+        qty = risk_amount / sl_dist
         notional = qty * price
 
         if qty <= 0 or notional <= 0:
             return
 
+        # ── Place real bracket order on testnet ───────────────────
+        order_id = await self._place_bracket_order(
+            symbol, direction, price, sl, tp, qty,
+        )
+
+        # Consume the pending signal regardless of order success
+        self._pending_signal = None
+        self._pending_obs = obs
+
+        # ── Virtual position tracking (dashboard + RL brain) ──────
         self.open_positions[symbol] = {
             "direction": direction,
             "entry": price,
@@ -793,13 +903,81 @@ class PaperBot:
             "tp": tp,
             "qty": qty,
             "leverage": self.leverage,
-            "entry_time": candle["timestamp"],
+            "entry_time": datetime.now(timezone.utc),
             "score": score,
+            "order_id": order_id,
         }
         self.logger.info(
-            "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f lev=%dx score=%.2f",
-            direction.upper(), symbol, price, sl, tp, qty, self.leverage, score,
+            "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f "
+            "lev=%dx score=%.2f bal=%.2f order=%s",
+            direction.upper(), symbol, price, sl, tp, qty,
+            self.leverage, score, balance, order_id or "virtual",
         )
+
+    # ── Real testnet bracket order ────────────────────────────────
+
+    async def _place_bracket_order(
+        self,
+        symbol: str,
+        direction: str,
+        price: float,
+        sl: float,
+        tp: float,
+        qty: float,
+    ) -> str | None:
+        """
+        Place a market order with attached stopLoss + takeProfit on the
+        Binance Testnet via ``create_order``.
+
+        Returns the order ID on success, ``None`` on failure.
+        """
+        if self.exchange is None:
+            return None
+
+        side = "buy" if direction == "long" else "sell"
+        try:
+            order = await self.exchange.create_order(
+                symbol,
+                "market",
+                side,
+                qty,
+                params={
+                    "stopLoss": {
+                        "triggerPrice": sl,
+                        "type": "market",
+                    },
+                    "takeProfit": {
+                        "triggerPrice": tp,
+                        "type": "market",
+                    },
+                },
+            )
+            order_id = order.get("id")
+            self.logger.info(
+                "BRACKET ORDER %s %s qty=%.6f | SL=%.6f TP=%.6f | id=%s",
+                side.upper(), symbol, qty, sl, tp, order_id,
+            )
+            return order_id
+        except Exception as exc:
+            self.logger.error(
+                "Bracket order FAILED %s %s: %s", side.upper(), symbol, exc,
+            )
+            return None
+
+    # ── Fetch real testnet balance ────────────────────────────────
+
+    async def _fetch_balance(self) -> float | None:
+        """Return the free USDT balance from the Binance Testnet account."""
+        if self.exchange is None:
+            return None
+        try:
+            bal = await self.exchange.fetch_balance()
+            usdt = bal.get("USDT", {})
+            free = usdt.get("free", 0.0)
+            return float(free)
+        except Exception as exc:
+            self.logger.warning("fetch_balance failed: %s", exc)
+            return None
 
     # ── Exit checking ─────────────────────────────────────────────
 
@@ -1117,7 +1295,8 @@ class LiveMultiBotRunner:
     """
     Orchestrates 100 coin-specialised PaperBot instances with:
       - Fixed symbol list (no dynamic volume ranking)
-      - WebSocket auto-reconnect per symbol
+      - WebSocket auto-reconnect per symbol (OHLCV + ticker)
+      - Real bracket orders on Binance Testnet
       - Rich Live Dashboard
       - Per-bot RL brain
 
@@ -1146,6 +1325,7 @@ class LiveMultiBotRunner:
 
         # Active watcher tasks keyed by symbol
         self._watcher_tasks: dict[str, asyncio.Task[None]] = {}
+        self._ticker_tasks: dict[str, asyncio.Task[None]] = {}
 
     # ── WebSocket OHLCV watcher with auto-reconnect ───────────────
 
@@ -1227,6 +1407,66 @@ class LiveMultiBotRunner:
                 except asyncio.TimeoutError:
                     pass  # continue reconnect loop
 
+    # ── WebSocket ticker watcher for real-time entry ──────────────
+
+    async def _watch_ticker(self, symbol: str) -> None:
+        """
+        Subscribe to live ticker updates for *symbol* and feed the
+        assigned bot's ``on_tick`` for real-time entry decisions.
+
+        Uses the same reconnect logic as ``_watch_symbol``.
+        """
+        bot = self._symbol_to_bot.get(symbol)
+        if bot is None:
+            return
+
+        reconnect_count = 0
+
+        while not self._shutdown.is_set():
+            try:
+                reconnect_count = 0
+                while not self._shutdown.is_set():
+                    ticker = await self.exchange.watch_ticker(symbol)
+                    if ticker is None:
+                        continue
+                    last_price = ticker.get("last")
+                    if last_price is None:
+                        continue
+                    try:
+                        await bot.on_tick(symbol, float(last_price))
+                    except Exception as exc:
+                        bot.logger.error(
+                            "Error processing tick for %s: %s", symbol, exc,
+                        )
+
+            except asyncio.CancelledError:
+                return
+
+            except Exception as exc:
+                reconnect_count += 1
+                if reconnect_count > WS_MAX_RECONNECT:
+                    logger.warning(
+                        "⚠ Ticker %s: max reconnect (%d) exceeded: %s",
+                        symbol, WS_MAX_RECONNECT, exc,
+                    )
+                    return
+
+                delay = min(
+                    WS_RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
+                    60,
+                )
+                logger.warning(
+                    "🔄 Ticker %s: reconnect %d/%d in %.0fs: %s",
+                    symbol, reconnect_count, WS_MAX_RECONNECT, delay, exc,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=delay,
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
+
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _dashboard_loop(self) -> None:
@@ -1257,15 +1497,21 @@ class LiveMultiBotRunner:
     # ── Main loop ─────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Start all watchers + dashboard. Blocks until shutdown."""
+        """Start all watchers (OHLCV + ticker) + dashboard. Blocks until shutdown."""
         logger.info(
             "Starting %d bots on %d symbols …", len(self.bots), len(self.symbols)
         )
 
-        # Start one watcher task per symbol (= per bot)
+        # Start one OHLCV watcher task per symbol (5 m candle analysis)
         for sym in self.symbols:
             self._watcher_tasks[sym] = asyncio.create_task(
                 self._watch_symbol(sym)
+            )
+
+        # Start one ticker watcher task per symbol (real-time entry)
+        for sym in self.symbols:
+            self._ticker_tasks[sym] = asyncio.create_task(
+                self._watch_ticker(sym)
             )
 
         # Rich dashboard
@@ -1279,8 +1525,14 @@ class LiveMultiBotRunner:
         dashboard_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
+        for t in self._ticker_tasks.values():
+            t.cancel()
 
-        all_tasks = [dashboard_task] + list(self._watcher_tasks.values())
+        all_tasks = (
+            [dashboard_task]
+            + list(self._watcher_tasks.values())
+            + list(self._ticker_tasks.values())
+        )
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
         # Flush RL brains (save remaining buffer)
@@ -1363,6 +1615,9 @@ def main() -> None:
         config = yaml.safe_load(f)
     logger.info("Config loaded from %s", cfg_path)
 
+    # ── Create exchange ───────────────────────────────────────────
+    exchange = create_exchange(api_key, api_secret)
+
     # ── Create 100 bots (1 bot = 1 coin) ─────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1379,6 +1634,7 @@ def main() -> None:
             symbol=coin,
             config=config,
             output_dir=output_dir,
+            exchange=exchange,
         )
         bots.append(bot)
 
@@ -1387,9 +1643,6 @@ def main() -> None:
         f"[bold green]✅ {len(bots)} bots created – "
         f"each assigned to a unique coin.[/bold green]"
     )
-
-    # ── Create exchange ───────────────────────────────────────────
-    exchange = create_exchange(api_key, api_secret)
 
     # ── Runner ────────────────────────────────────────────────────
     runner = LiveMultiBotRunner(
