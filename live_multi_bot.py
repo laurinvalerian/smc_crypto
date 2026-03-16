@@ -1052,8 +1052,8 @@ def create_exchange(api_key: str, api_secret: str) -> Any:
             "defaultType": "future",
         },
     })
-    exchange.set_sandbox_mode(True)
-    logger.info("Exchange created: %s (sandbox/testnet)", exchange.id)
+    exchange.enable_demo_trading(True)
+    logger.info("Exchange created: %s (demo trading)", exchange.id)
     return exchange
 
 
@@ -1540,6 +1540,10 @@ class LiveMultiBotRunner:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
+                err_msg = str(exc).lower()
+                if "demo trading" in err_msg or "sandbox" in err_msg:
+                    logger.warning("Position poll: %s – skipping cycle", exc)
+                    continue
                 logger.error("Position poll error: %s", exc)
 
             # Sleep until next poll (or shutdown)
