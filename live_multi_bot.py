@@ -146,7 +146,7 @@ TOP_100_COINS: list[str] = [
     "KAS/USDT:USDT",
     "XLM/USDT:USDT",
     "VET/USDT:USDT",
-    "ICP/USDT:USDT",
+    "1000CAT/USDT:USDT",
     "ATOM/USDT:USDT",
     "FTM/USDT:USDT",
     "EOS/USDT:USDT",
@@ -195,15 +195,18 @@ TOP_100_COINS: list[str] = [
     "BRETT/USDT:USDT",
     "POPCAT/USDT:USDT",
     "MEW/USDT:USDT",
-    "GIGA/USDT:USDT",
+    "GIGGLE/USDT:USDT",
     "TURBO/USDT:USDT",
-    "MOG/USDT:USDT",
+    "1000000MOG/USDT:USDT",
     "1000FLOKI/USDT:USDT",
     "WIF/USDT:USDT",
     "BOME/USDT:USDT",
     "PIXEL/USDT:USDT",
     "ONDO/USDT:USDT",
     "TAO/USDT:USDT",
+    "XAI/USDT:USDT",
+    "PEOPLE/USDT:USDT",
+    "BIGTIME/USDT:USDT"
 ]
 
 NUM_BOTS = len(TOP_100_COINS)  # exactly 100 (or as many coins as listed)
