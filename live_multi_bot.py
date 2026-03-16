@@ -323,7 +323,7 @@ class PaperBot:
         self.leverage: int = 10  # default leverage
 
         # Account tracking (for dashboard / RL brain)
-        self.equity: float = 0.0  # wird später vom Runner mit real balance gesetzt
+        self.equity: float = 0.0  # set later by Runner with real balance
         self.peak_equity: float = 0.0  # managed by Runner
         self._account_equity: float = 0.0  # real account equity, set by Runner
 
