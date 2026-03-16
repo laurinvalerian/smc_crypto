@@ -323,9 +323,9 @@ class PaperBot:
         self.leverage: int = 10  # default leverage
 
         # Account tracking (for dashboard / RL brain)
-        self.start_equity: float = float(config["account"]["size"])
-        self.equity: float = self.start_equity
-        self.peak_equity: float = self.start_equity
+        self.equity: float = 0.0  # wird später vom Runner mit real balance gesetzt
+        self.peak_equity: float = 0.0  # managed by Runner
+        self._account_equity: float = 0.0  # real account equity, set by Runner
 
         # Tracking
         self.total_pnl: float = 0.0
@@ -1020,15 +1020,15 @@ class PaperBot:
 
     @property
     def return_pct(self) -> float:
-        if self.start_equity <= 0:
+        if self._account_equity <= 0:
             return 0.0
-        return (self.equity - self.start_equity) / self.start_equity * 100
+        return self.total_pnl / self._account_equity * 100
 
     def summary_dict(self) -> dict[str, Any]:
         return {
             "bot": self.tag,
             "symbol": self.symbol,
-            "equity": round(self.equity, 2),
+            "equity": 0,
             "pnl": round(self.total_pnl, 2),
             "return_pct": round(self.return_pct, 2),
             "trades": self.trades,
@@ -1127,6 +1127,7 @@ def build_dashboard(
     ws_status: dict[str, str],
     start_time: datetime,
     active_symbols: list[str],
+    total_equity: float = 0.0,
 ) -> Layout:
     """
     Build the complete Rich Layout for the live dashboard.
@@ -1143,7 +1144,6 @@ def build_dashboard(
         reverse=True,
     )
 
-    total_equity = sum(b.equity for b in bots)
     total_pnl = sum(b.total_pnl for b in bots)
     total_trades = sum(b.trades for b in bots)
     uptime = _format_uptime(start_time)
@@ -1558,6 +1558,17 @@ class LiveMultiBotRunner:
 
     # ── Rich Dashboard loop ───────────────────────────────────────
 
+    async def _fetch_real_total_equity(self) -> float:
+        """Fetch real USDT free balance from Binance demo account."""
+        try:
+            bal = await self.exchange.fetch_balance()
+            usdt = bal.get("USDT", {})
+            free = float(usdt.get("free", 0.0))
+            return free
+        except Exception as exc:
+            logger.warning("_fetch_real_total_equity failed: %s", exc)
+            return 0.0
+
     async def _dashboard_loop(self) -> None:
         """Render the Rich Live Dashboard every DASHBOARD_REFRESH_SEC."""
         console = Console()
@@ -1565,11 +1576,15 @@ class LiveMultiBotRunner:
         with Live(console=console, refresh_per_second=1, screen=True) as live:
             while not self._shutdown.is_set():
                 try:
+                    total_equity = await self._fetch_real_total_equity()
+                    for b in self.bots:
+                        b._account_equity = total_equity
                     layout = build_dashboard(
                         bots=self.bots,
                         ws_status=self.ws_status,
                         start_time=self._start_time,
                         active_symbols=self.symbols,
+                        total_equity=total_equity,
                     )
                     live.update(layout)
                 except Exception as exc:
@@ -1635,6 +1650,11 @@ class LiveMultiBotRunner:
             except Exception:
                 pass
 
+        # Fetch final equity before closing exchange
+        final_equity = await self._fetch_real_total_equity()
+        for b in self.bots:
+            b._account_equity = final_equity
+
         # Close exchange WebSocket connections
         try:
             await self.exchange.close()
@@ -1642,9 +1662,9 @@ class LiveMultiBotRunner:
             pass
 
         # Final summary to console
-        self._print_final_summary()
+        self._print_final_summary(final_equity)
 
-    def _print_final_summary(self) -> None:
+    def _print_final_summary(self, total_equity: float = 0.0) -> None:
         """Print a plain-text final summary after dashboard stops."""
         console = Console()
         rows = sorted(
@@ -1652,7 +1672,6 @@ class LiveMultiBotRunner:
             key=lambda r: r["pnl"],
             reverse=True,
         )
-        total_equity = sum(b.equity for b in self.bots)
         total_pnl = sum(b.total_pnl for b in self.bots)
 
         console.print(f"\n[bold cyan]{'═' * 80}[/bold cyan]")
