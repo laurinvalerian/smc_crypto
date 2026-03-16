@@ -100,6 +100,7 @@ except ImportError:
 OUTPUT_DIR = Path("live_results")
 
 DASHBOARD_REFRESH_SEC = 10         # Dashboard refresh interval
+POSITION_POLL_SEC = 5             # Interval (seconds) for polling exchange positions
 WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
 WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
 WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
@@ -298,6 +299,7 @@ class PaperBot:
         (``fetch_balance`` before every trade).
       – Full SL or full TP (no partial exits)
       – Volume filter: skip bar if volume < 1.0× average(20)
+      – Exit detection via exchange position polling (no candle-based exits)
     """
 
     def __init__(
@@ -320,7 +322,7 @@ class PaperBot:
         self.rr_ratio: float = FIXED_RR_MIN
         self.leverage: int = 10  # default leverage
 
-        # Virtual account (parallel tracking for dashboard / RL brain)
+        # Account tracking (for dashboard / RL brain)
         self.start_equity: float = float(config["account"]["size"])
         self.equity: float = self.start_equity
         self.peak_equity: float = self.start_equity
@@ -329,8 +331,9 @@ class PaperBot:
         self.total_pnl: float = 0.0
         self.trades: int = 0
         self.wins: int = 0
-        self.open_positions: dict[str, dict[str, Any]] = {}
-        self.max_open: int = 1  # 1 bot = 1 coin = max 1 position
+
+        # Active trade on exchange (set on entry, cleared by position poller)
+        self._active_trade: dict[str, Any] | None = None
 
         # Candle history  {symbol: list[dict]}
         self._candle_buf: dict[str, list[dict[str, Any]]] = {}
@@ -559,8 +562,6 @@ class PaperBot:
             if len(self.buffer_5m) > 1500:
                 self.buffer_5m = self.buffer_5m.iloc[-1500:].reset_index(drop=True)
 
-        self._check_exits(symbol, candle)
-
         if len(buf) >= self.swing_length + 5:
             self._prepare_signal(symbol, buf, candle)
 
@@ -752,10 +753,7 @@ class PaperBot:
         *pending signal* that ``on_tick`` will consume for real-time
         entry once the live price touches the entry zone.
         """
-        if symbol in self.open_positions:
-            self._pending_signal = None
-            return
-        if len(self.open_positions) >= self.max_open:
+        if self._active_trade is not None:
             self._pending_signal = None
             return
 
@@ -848,15 +846,14 @@ class PaperBot:
         Called on every live ticker update.
 
         If a pending signal exists and the live price is inside the
-        entry zone, place a real bracket order on the testnet and
-        open a virtual position for tracking.
+        entry zone, place a real bracket order on the testnet.
         """
         sig = self._pending_signal
         if sig is None:
             return
         if sig["symbol"] != symbol:
             return
-        if symbol in self.open_positions:
+        if self._active_trade is not None:
             self._pending_signal = None
             return
 
@@ -874,10 +871,10 @@ class PaperBot:
         balance = await self._fetch_balance()
         if balance is None or balance <= 0:
             self.logger.warning(
-                "fetch_balance returned %s – falling back to virtual equity (%.2f)",
+                "fetch_balance returned %s – falling back to tracked equity (%.2f)",
                 balance, self.equity,
             )
-            balance = self.equity  # fallback to virtual equity
+            balance = self.equity  # fallback to tracked equity
 
         sl_dist = abs(price - sl)
         if sl_dist <= 0:
@@ -898,18 +895,19 @@ class PaperBot:
         # Consume the pending signal
         self._pending_signal = None
 
-        # If the real order failed, do not open a virtual position
+        # If the real order failed, do not track as active trade
         if order_id is None and self.exchange is not None:
             self.logger.warning(
-                "Bracket order failed for %s %s – skipping virtual position",
+                "Bracket order failed for %s %s – skipping",
                 direction.upper(), symbol,
             )
             return
 
         self._pending_obs = obs
 
-        # ── Virtual position tracking (dashboard + RL brain) ──────
-        self.open_positions[symbol] = {
+        # ── Track active trade (cleared by position poller on fill) ──
+        self._active_trade = {
+            "symbol": symbol,
             "direction": direction,
             "entry": price,
             "sl": sl,
@@ -924,7 +922,7 @@ class PaperBot:
             "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f "
             "lev=%dx score=%.2f bal=%.2f order=%s",
             direction.upper(), symbol, price, sl, tp, qty,
-            self.leverage, score, balance, order_id or "virtual",
+            self.leverage, score, balance, order_id or "no-exchange",
         )
 
     # ── Real testnet bracket order ────────────────────────────────
@@ -992,72 +990,6 @@ class PaperBot:
             self.logger.warning("fetch_balance failed: %s", exc)
             return None
 
-    # ── Exit checking ─────────────────────────────────────────────
-
-    def _check_exits(self, symbol: str, candle: dict[str, Any]) -> None:
-        pos = self.open_positions.get(symbol)
-        if pos is None:
-            return
-
-        high = candle["high"]
-        low = candle["low"]
-        direction = pos["direction"]
-
-        hit_tp = False
-        hit_sl = False
-
-        if direction == "long":
-            if low <= pos["sl"]:
-                hit_sl = True
-            elif high >= pos["tp"]:
-                hit_tp = True
-        else:
-            if high >= pos["sl"]:
-                hit_sl = True
-            elif low <= pos["tp"]:
-                hit_tp = True
-
-        if not hit_tp and not hit_sl:
-            return
-
-        if hit_tp:
-            exit_price = pos["tp"]
-            outcome = "WIN"
-        else:
-            exit_price = pos["sl"]
-            outcome = "LOSS"
-
-        if direction == "long":
-            raw_pnl = (exit_price - pos["entry"]) * pos["qty"]
-        else:
-            raw_pnl = (pos["entry"] - exit_price) * pos["qty"]
-
-        commission = pos["qty"] * pos["entry"] * 0.0004 * 2
-        net_pnl = raw_pnl - commission
-
-        # Reward = pure PnL change in % (relative to equity before trade)
-        pnl_pct = (net_pnl / self.equity * 100) if self.equity > 0 else 0.0
-
-        self.equity += net_pnl
-        self.total_pnl += net_pnl
-        self.trades += 1
-        if net_pnl > 0:
-            self.wins += 1
-        if self.equity > self.peak_equity:
-            self.peak_equity = self.equity
-
-        self._append_equity()
-
-        # Feed reward to RL brain
-        self.brain.record_outcome(reward=pnl_pct, done=True)
-
-        self.logger.info(
-            "CLOSE %s %s %s @ %.6f → %.6f | pnl=%.2f equity=%.2f",
-            outcome, direction.upper(), symbol,
-            pos["entry"], exit_price, net_pnl, self.equity,
-        )
-        del self.open_positions[symbol]
-
     # ── ATR helper ────────────────────────────────────────────────
 
     @staticmethod
@@ -1102,7 +1034,7 @@ class PaperBot:
             "trades": self.trades,
             "winrate": round(self.winrate * 100, 1),
             "drawdown_pct": round(self.drawdown_pct, 2),
-            "open_pos": len(self.open_positions),
+            "open_pos": 1 if self._active_trade is not None else 0,
         }
 
 
@@ -1310,6 +1242,7 @@ class LiveMultiBotRunner:
       - Fixed symbol list (no dynamic volume ranking)
       - WebSocket auto-reconnect per symbol (OHLCV + ticker)
       - Real bracket orders on Binance Testnet
+      - Position polling every 5 s (detects TP/SL fills on exchange)
       - Rich Live Dashboard
       - Per-bot RL brain
 
@@ -1480,6 +1413,132 @@ class LiveMultiBotRunner:
                 except asyncio.TimeoutError:
                     pass
 
+    # ── Exchange position polling (replaces candle-based exit check) ─
+
+    async def _poll_positions(self) -> None:
+        """
+        Poll exchange positions every POSITION_POLL_SEC seconds.
+
+        Detects when a bracket order's SL or TP has been filled, then:
+          - determines exit price via ``fetch_my_trades``
+          - calculates PnL and commission
+          - feeds reward to the bot's RL brain
+          - updates equity / dashboard counters
+          - clears the bot's ``_active_trade``
+        """
+        while not self._shutdown.is_set():
+            try:
+                positions = await self.exchange.fetch_positions()
+
+                # Build map: symbol → position (non-zero contracts only)
+                pos_map: dict[str, Any] = {}
+                for p in positions:
+                    sym = p.get("symbol")
+                    contracts = abs(float(p.get("contracts", 0) or 0))
+                    if sym and contracts > 0:
+                        pos_map[sym] = p
+
+                for bot in self.bots:
+                    trade = bot._active_trade
+                    if trade is None:
+                        continue
+
+                    # Position still open on exchange → nothing to do
+                    if bot.symbol in pos_map:
+                        continue
+
+                    # ── Position closed (TP or SL filled) ─────────
+                    entry_price = trade["entry"]
+                    sl = trade["sl"]
+                    tp = trade["tp"]
+                    qty = trade["qty"]
+                    direction = trade["direction"]
+
+                    # Try to get exit price from recent exchange trades
+                    exit_price: float | None = None
+                    try:
+                        since_ms = int(
+                            trade["entry_time"].timestamp() * 1000
+                        )
+                        recent = await self.exchange.fetch_my_trades(
+                            bot.symbol, since=since_ms, limit=20,
+                        )
+                        if recent:
+                            exit_price = float(recent[-1]["price"])
+                    except Exception as exc:
+                        bot.logger.warning(
+                            "fetch_my_trades failed: %s", exc,
+                        )
+
+                    # Fallback: assume SL (conservative)
+                    if exit_price is None:
+                        exit_price = sl
+                        bot.logger.warning(
+                            "Could not determine exit price for %s "
+                            "– assuming SL hit",
+                            bot.symbol,
+                        )
+
+                    # ── PnL calculation ───────────────────────────
+                    if direction == "long":
+                        raw_pnl = (exit_price - entry_price) * qty
+                    else:
+                        raw_pnl = (entry_price - exit_price) * qty
+
+                    commission = qty * entry_price * 0.0004 * 2
+                    net_pnl = raw_pnl - commission
+
+                    pnl_pct = (
+                        (net_pnl / bot.equity * 100)
+                        if bot.equity > 0
+                        else 0.0
+                    )
+
+                    bot.equity += net_pnl
+                    bot.total_pnl += net_pnl
+                    bot.trades += 1
+                    if net_pnl > 0:
+                        bot.wins += 1
+                    if bot.equity > bot.peak_equity:
+                        bot.peak_equity = bot.equity
+
+                    bot._append_equity()
+
+                    # Feed reward to RL brain
+                    bot.brain.record_outcome(
+                        reward=pnl_pct, done=True,
+                    )
+
+                    outcome = "WIN" if net_pnl > 0 else "LOSS"
+                    bot.logger.info(
+                        "CLOSE %s %s %s @ %.6f → %.6f | "
+                        "pnl=%.2f equity=%.2f",
+                        outcome,
+                        direction.upper(),
+                        bot.symbol,
+                        entry_price,
+                        exit_price,
+                        net_pnl,
+                        bot.equity,
+                    )
+
+                    bot._active_trade = None
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error("Position poll error: %s", exc)
+
+            # Sleep until next poll (or shutdown)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown.wait(),
+                    timeout=POSITION_POLL_SEC,
+                )
+                return  # shutdown requested
+            except asyncio.TimeoutError:
+                pass
+
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _dashboard_loop(self) -> None:
@@ -1510,7 +1569,7 @@ class LiveMultiBotRunner:
     # ── Main loop ─────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Start all watchers (OHLCV + ticker) + dashboard. Blocks until shutdown."""
+        """Start all watchers (OHLCV + ticker) + position poller + dashboard. Blocks until shutdown."""
         logger.info(
             "Starting %d bots on %d symbols …", len(self.bots), len(self.symbols)
         )
@@ -1527,6 +1586,9 @@ class LiveMultiBotRunner:
                 self._watch_ticker(sym)
             )
 
+        # Position poller (detects TP/SL fills on exchange)
+        poll_task = asyncio.create_task(self._poll_positions())
+
         # Rich dashboard
         dashboard_task = asyncio.create_task(self._dashboard_loop())
 
@@ -1536,13 +1598,14 @@ class LiveMultiBotRunner:
 
         # Cancel all tasks
         dashboard_task.cancel()
+        poll_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
         for t in self._ticker_tasks.values():
             t.cancel()
 
         all_tasks = (
-            [dashboard_task]
+            [dashboard_task, poll_task]
             + list(self._watcher_tasks.values())
             + list(self._ticker_tasks.values())
         )
