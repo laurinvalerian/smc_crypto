@@ -234,6 +234,7 @@ EXIT_QTY_MATCH_TOLERANCE = 0.05
 # Commission assumptions (Binance USDT-M taker, both sides)
 COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
+MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
@@ -941,7 +942,7 @@ class PaperBot:
                 return True
             # margin-based rough cap
             if notional_val > balance * self.leverage:
-                # Simplified check; exchange tiered margin rules may differ
+                # Simplified check; ignores tiered/maintenance margin so exchange may still reject
                 return True
             return False
 
@@ -953,7 +954,7 @@ class PaperBot:
             adjusted = False
             # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
             current_step = max(1, int(round(self.risk_pct * 1000)))
-            start_step = min(9, max(1, current_step - 1))
+            start_step = min(MAX_RISK_REDUCTION_STEP, max(1, current_step - 1))
             for step in range(start_step, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
@@ -1668,6 +1669,7 @@ class LiveMultiBotRunner:
                                 continue
                             # Match exit to trade size to avoid mixing fills
                             diff_ratio = abs(t_amount - trade["qty"]) / max(t_amount, trade["qty"])
+                            # Normalised by larger qty to tolerate either side being slightly off and avoid div/0
                             if diff_ratio > EXIT_QTY_MATCH_TOLERANCE:
                                 continue
                             if t_ts and t_ts >= entry_ms:
@@ -1692,9 +1694,13 @@ class LiveMultiBotRunner:
                                 except Exception:
                                     fallback_price = None
                             exit_price = fallback_price or trade["sl"]
+                            fallback_label = (
+                                "last trade price" if fallback_price is not None else "SL price"
+                            )
                             bot.logger.error(
-                                "Could not match exit trade for %s – using fallback %.6f",
+                                "Could not match exit trade for %s – using fallback (%s) %.6f",
                                 bot.symbol,
+                                fallback_label,
                                 exit_price,
                             )
                             await _record_close(bot, trade, exit_price)
