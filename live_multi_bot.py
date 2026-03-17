@@ -229,6 +229,7 @@ FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
+MAX_LEVERAGE_FALLBACK = 50
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
@@ -814,7 +815,6 @@ class PaperBot:
             if not take_trade:
                 # Skipped → reward 0 for brain
                 self.brain.record_outcome(reward=0.0, done=True)
-                self.cumulative_reward += 0.0
                 self._pending_signal = None
                 return
 
@@ -887,7 +887,7 @@ class PaperBot:
             return
 
         # ── Determine leverage limits and max qty/notional ─────────
-        max_leverage = 50
+        max_leverage = MAX_LEVERAGE_FALLBACK
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
         try:
@@ -908,10 +908,15 @@ class PaperBot:
 
         # Try to bump leverage to the maximum first
         target_leverage = max(1, max_leverage)
+        target_risk_pct = self.risk_pct * 100
         try:
             await self.exchange.set_leverage(target_leverage, symbol)
             self.leverage = target_leverage
-            self.logger.info("Leverage bumped to %dx for 1%% risk", target_leverage)
+            self.logger.info(
+                "Leverage bumped to %dx for %.1f%% risk target",
+                target_leverage,
+                target_risk_pct,
+            )
         except Exception as exc:
             self.logger.warning(
                 "set_leverage failed for %s: %s (keeping %dx)",
@@ -941,6 +946,7 @@ class PaperBot:
         if _too_big(qty, notional):
             # reduce risk in 0.1% steps down to 0.1%
             adjusted = False
+            # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
             for step in range(9, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
@@ -948,13 +954,13 @@ class PaperBot:
                     risk_pct = candidate_pct
                     adjusted = True
                     self.logger.warning(
-                        "Risk reduced to %.1f%% (min 0.1%%) because leverage maxed",
+                        "Risk reduced to %.1f% (min 0.1%) because leverage maxed",
                         risk_pct * 100,
                     )
                     break
             if not adjusted:
                 self.logger.warning(
-                    "Skipping trade – even 0.1%% risk too big (qty=%.6f notional=%.2f)",
+                    "Skipping trade – even 0.1% risk too big (qty=%.6f notional=%.2f)",
                     qty,
                     notional,
                 )
@@ -994,9 +1000,6 @@ class PaperBot:
             "order_id": order_id,
         }
         self._active_trades.append(trade_info)
-        if len(self._active_trades) > 3:
-            # Keep only most recent 3 to enforce cap
-            self._active_trades = self._active_trades[-3:]
         self.logger.info(
             "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f "
             "lev=%dx score=%.2f bal=%.2f order=%s",
@@ -1026,6 +1029,25 @@ class PaperBot:
 
         side = "buy" if direction == "long" else "sell"
         exit_side = "sell" if direction == "long" else "buy"
+
+        async def _close_position(reason: str) -> None:
+            try:
+                close = await self.exchange.create_order(
+                    symbol,
+                    "market",
+                    exit_side,
+                    qty,
+                    params={"reduceOnly": True},
+                )
+                self.logger.warning(
+                    "Flattened position after %s | close_order=%s",
+                    reason,
+                    close.get("id"),
+                )
+            except Exception as close_exc:
+                self.logger.error(
+                    "Failed to flatten position after %s: %s", reason, close_exc,
+                )
         try:
             entry = await self.exchange.create_order(symbol, "market", side, qty)
             entry_id = entry.get("id")
@@ -1038,6 +1060,7 @@ class PaperBot:
             return None
 
         # Place SL (STOP_MARKET reduceOnly)
+        sl_order_id: str | None = None
         try:
             sl_order = await self.exchange.create_order(
                 symbol,
@@ -1049,14 +1072,16 @@ class PaperBot:
                     "reduceOnly": True,
                 },
             )
+            sl_order_id = sl_order.get("id")
             self.logger.info(
                 "SL %s %s qty=%.6f @ %.6f | id=%s",
-                exit_side.upper(), symbol, qty, sl, sl_order.get("id"),
+                exit_side.upper(), symbol, qty, sl, sl_order_id,
             )
         except Exception as exc:
             self.logger.error(
                 "SL order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
             )
+            await _close_position("SL placement failure")
             return None
 
         # Place TP (TAKE_PROFIT_MARKET reduceOnly)
@@ -1079,6 +1104,17 @@ class PaperBot:
             self.logger.error(
                 "TP order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
             )
+            # Cancel SL to avoid dangling reduceOnly without TP
+            if sl_order_id:
+                try:
+                    await self.exchange.cancel_order(sl_order_id, symbol)
+                except Exception as cancel_exc:
+                    self.logger.warning(
+                        "Failed to cancel SL %s after TP failure: %s",
+                        sl_order_id,
+                        cancel_exc,
+                    )
+            await _close_position("TP placement failure")
             return None
 
         return entry_id
@@ -1214,11 +1250,12 @@ def _build_bot_table(
     for i, r in enumerate(rows, 1):
         pnl_c = _pnl_color(r["pnl"])
         ret_c = _pnl_color(r["return_pct"])
+        reward_c = _pnl_color(r["cum_reward"])
         table.add_row(
             str(i),
             r["bot"],
             r.get("symbol", ""),
-            f"[{_pnl_color(r['cum_reward'])}]{r['cum_reward']:+.2f}%[/{_pnl_color(r['cum_reward'])}]",
+            f"[{reward_c}]{r['cum_reward']:+.2f}[/{reward_c}]",
             f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
             f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
             str(r["trades"]),
@@ -1568,7 +1605,7 @@ class LiveMultiBotRunner:
                 direction.upper(),
                 bot.symbol,
                 entry_price,
-                exit_price if exit_price is not None else sl,
+                exit_price,
                 net_pnl,
                 bot.equity,
             )
@@ -1618,6 +1655,12 @@ class LiveMultiBotRunner:
                             if t.get("side") != exit_side:
                                 continue
                             t_ts = t.get("timestamp") or 0
+                            t_amount = abs(float(t.get("amount", 0) or 0))
+                            if t_amount <= 0:
+                                continue
+                            # Match exit to trade size to avoid mixing fills
+                            if abs(t_amount - trade["qty"]) > trade["qty"] * 0.05:
+                                continue
                             if t_ts and t_ts >= entry_ms:
                                 exit_price = float(t["price"])
                                 exit_id = tid or None
