@@ -229,7 +229,6 @@ FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
-MAX_LEVERAGE_FALLBACK = 50
 EXIT_QTY_MATCH_TOLERANCE = 0.05
 # Commission assumptions (Binance USDT-M taker, both sides)
 COMMISSION_RATE = 0.0004
@@ -892,16 +891,17 @@ class PaperBot:
             return
 
         # ── Determine leverage limits and max qty/notional ─────────
-        max_leverage = MAX_LEVERAGE_FALLBACK
+        max_leverage = 20
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
         try:
-            if not getattr(self.exchange, "markets", None):
-                await self.exchange.load_markets()
+            await self.exchange.load_markets()
             market = self.exchange.market(symbol)
             limits = market.get("limits", {}) if market else {}
             lev_limit = limits.get("leverage", {}) if isinstance(limits, dict) else {}
-            max_leverage = int(lev_limit.get("max") or max_leverage)
+            lev_max = lev_limit.get("max")
+            if lev_max:
+                max_leverage = int(lev_max)
             amt_limits = limits.get("amount", {}) if isinstance(limits, dict) else {}
             cost_limits = limits.get("cost", {}) if isinstance(limits, dict) else {}
             max_qty_limit = float(amt_limits.get("max")) if amt_limits.get("max") else None
@@ -910,6 +910,11 @@ class PaperBot:
             )
         except Exception as exc:
             self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
+        self.logger.info(
+            "Using coin-specific max leverage: %sx for %s",
+            max_leverage,
+            symbol,
+        )
 
         def _calc_qty(risk_pct: float) -> tuple[float, float]:
             ra = balance * risk_pct
