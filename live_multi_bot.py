@@ -4,19 +4,19 @@
  ──────────────────────────────────────────────────────────────
  Exactly 100 bots, each permanently assigned to one coin from
  the Top 100 Evergreen list.  All bots share identical fixed
- SMC parameters and money-management rules.  Each bot has its
- own PPO RL brain that learns a yes/no trade filter.
+ SMC parameters and money-management rules.  A single central
+ PPO brain gates trades for every coin.
 
  Features:
    • Fixed 100 bots (no --num-bots parameter)
    • 1 bot = 1 coin (1:1 mapping, no dynamic volume ranking)
    • Fixed SMC params & money management for all bots
-   • Per-bot PPO RL brain (rl_brain.py)
+   • Central PPO RL brain (rl_brain.py) shared by all coins
    • Reward = pure PnL change in % (no shaping)
    • Real Binance Testnet bracket orders (market + SL + TP)
    • Real-time entry via watch_ticker (no waiting for closed 5m candle)
    • Risk = 1 % of real account balance (fetch_balance per trade)
-   • Dynamic SL/TP from SMC (OB + Liquidity + FVG), RR ≥ 2.5
+   • Dynamic SL/TP from SMC (OB + Liquidity + FVG), RR ≥ 3.0
    • Warm-up: first 100 trades per bot always accepted
    • WebSocket with stable auto-reconnect (max 5 retries)
    • Rich Live Dashboard:
@@ -62,7 +62,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from rl_brain import RLBrain, extract_features
+from rl_brain import CentralRLBrain, extract_features
 from strategies.smc_multi_style import (
     compute_smc_indicators,
     _precompute_running_bias,
@@ -217,19 +217,21 @@ FIXED_SMC_PARAMS: dict[str, Any] = {
     "fvg_threshold": 0.00045,
     "order_block_lookback": 28,
     "liquidity_range_percent": 0.0075,
-    "alignment_threshold": 0.52,
+    "alignment_threshold": 0.35,
     "weight_day": 1.25,
     "bos_choch_filter": "medium",
 }
 
 # ── Fixed Money Management ────────────────────────────────────────
 FIXED_RISK_PCT = 0.01       # 1 % risk per trade
-FIXED_RR_MIN = 2.5          # minimum 1:2.5 reward-to-risk
+FIXED_RR_MIN = 3.0          # minimum 1:3 reward-to-risk
 FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
 EXIT_QTY_MATCH_TOLERANCE = 0.05
+# Warm-up: trades executed without RL gating before learning starts
+WARMUP_TRADES = 100
 # Commission assumptions (Binance USDT-M taker, both sides)
 COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
@@ -317,6 +319,7 @@ class PaperBot:
         config: dict[str, Any],
         output_dir: Path,
         exchange: Any = None,
+        central_brain: CentralRLBrain | None = None,
     ) -> None:
         self.bot_id = bot_id
         self.tag = f"bot_{bot_id:03d}"
@@ -339,7 +342,6 @@ class PaperBot:
         self.total_pnl: float = 0.0
         self.trades: int = 0
         self.wins: int = 0
-        self.cumulative_reward: float = 0.0
 
         # Active trades on exchange (max 3, cleared by position poller)
         self._active_trades: list[dict[str, Any]] = []
@@ -354,11 +356,10 @@ class PaperBot:
         # Active exchange order ID (for bracket order tracking)
         self._active_order_id: str | None = None
 
-        # RL Brain (per-bot PPO)
-        self.brain = RLBrain(
-            bot_tag=self.tag,
-            model_dir=output_dir / "rl_models",
-        )
+        # Shared RL Brain (central PPO)
+        if central_brain is None:
+            raise ValueError("central_brain must be provided")
+        self.brain = central_brain
         # Store last obs so we can record reward when trade closes
         self._pending_obs: np.ndarray | None = None
 
@@ -759,9 +760,10 @@ class PaperBot:
         """
         Evaluate multi-TF alignment + SMC SL/TP on the latest 5 m candle.
 
-        If all filters pass (alignment, RR ≥ 2.5, RL brain), store a
-        *pending signal* that ``on_tick`` will consume for real-time
-        entry once the live price touches the entry zone.
+        If all filters pass (alignment, RR ≥ 3.0), store a *pending
+        signal* that ``on_tick`` will consume for real-time entry once
+        the live price touches the entry zone. The RL gate runs in
+        ``on_tick`` just before placing the order.
         """
         if len(self._active_trades) >= 3:
             self._pending_signal = None
@@ -804,23 +806,11 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # Dynamic RR – never trade below FIXED_RR_MIN (1:2.5)
+        # Dynamic RR – never trade below FIXED_RR_MIN (1:3.0)
         rr = tp_dist / sl_dist
         if rr < FIXED_RR_MIN:
             self._pending_signal = None
             return
-
-        # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
-        obs = extract_features(buf, score, direction)
-        if self.trades < 100:
-            take_trade = True
-        else:
-            take_trade = self.brain.should_trade(obs)
-            if not take_trade:
-                # Skipped → reward 0 for brain
-                self.brain.record_outcome(reward=0.0, done=True)
-                self._pending_signal = None
-                return
 
         # ── Compute entry zone from 15 m analysis ─────────────────
         # Zone boundaries: for long, enter when price reaches SL side
@@ -839,7 +829,7 @@ class PaperBot:
             "sl": sl,
             "tp": tp,
             "score": score,
-            "obs": obs,
+            "obs": extract_features(buf, score, direction),
             "zone_low": zone_low,
             "zone_high": zone_high,
             "ref_price": price,
@@ -876,6 +866,19 @@ class PaperBot:
         tp = sig["tp"]
         score = sig["score"]
         obs = sig["obs"]
+
+        # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
+        use_brain = self.trades >= WARMUP_TRADES
+        rl_tracked = False
+        take_trade = True
+        if use_brain:
+            rl_decision = self.brain.should_trade(obs, coin_id=self.symbol)
+            rl_tracked = True
+            take_trade = rl_decision
+            if not take_trade:
+                self.brain.record_outcome(reward=0.0, coin_id=self.symbol, done=True)
+                self._pending_signal = None
+                return
 
         # ── Fetch real balance (1 % risk) ─────────────────────────
         balance = await self._fetch_balance()
@@ -1007,6 +1010,7 @@ class PaperBot:
             "entry_time": datetime.now(timezone.utc),
             "score": score,
             "order_id": order_id,
+            "rl_tracked": rl_tracked,
         }
         self._active_trades.append(trade_info)
         self.logger.info(
@@ -1181,7 +1185,6 @@ class PaperBot:
         return {
             "bot": self.tag,
             "symbol": self.symbol,
-            "cumulative_reward": round(self.cumulative_reward, 2),
             "pnl": round(self.total_pnl, 2),
             "return_pct": round(self.return_pct, 2),
             "trades": self.trades,
@@ -1248,23 +1251,20 @@ def _build_bot_table(
     table.add_column("#", justify="right", style="dim", width=4)
     table.add_column("Bot-ID", style="cyan", width=9)
     table.add_column("Coin", style="bright_yellow", width=18)
-    table.add_column("Cum. Reward", justify="right", width=14)
-    table.add_column("PnL", justify="right", width=12)
-    table.add_column("Return%", justify="right", width=9)
-    table.add_column("Trades", justify="right", width=7)
-    table.add_column("Winrate", justify="right", width=8)
-    table.add_column("DD%", justify="right", width=7)
-    table.add_column("Open", justify="right", width=5)
+    table.add_column("PnL", justify="right", width=14)
+    table.add_column("Return%", justify="right", width=10)
+    table.add_column("Trades", justify="right", width=10)
+    table.add_column("Winrate", justify="right", width=10)
+    table.add_column("DD%", justify="right", width=9)
+    table.add_column("Open", justify="right", width=7)
 
     for i, r in enumerate(rows, 1):
         pnl_c = _pnl_color(r["pnl"])
         ret_c = _pnl_color(r["return_pct"])
-        reward_c = _pnl_color(r["cumulative_reward"])
         table.add_row(
             str(i),
             r["bot"],
             r.get("symbol", ""),
-            f"[{reward_c}]{r['cumulative_reward']:+.2f}[/{reward_c}]",
             f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
             f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
             str(r["trades"]),
@@ -1398,7 +1398,7 @@ class LiveMultiBotRunner:
       - Real bracket orders on Binance Testnet
       - Position polling every 5 s (detects TP/SL fills on exchange)
       - Rich Live Dashboard
-      - Per-bot RL brain
+      - Central shared RL brain
 
     Each bot trades only its assigned coin.
     """
@@ -1410,6 +1410,9 @@ class LiveMultiBotRunner:
     ) -> None:
         self.bots = bots
         self.exchange = exchange
+        self.brain: CentralRLBrain | None = None
+        if bots:
+            self.brain = bots[0].brain
         # Build a lookup: symbol → bot
         self._symbol_to_bot: dict[str, PaperBot] = {
             b.symbol: b for b in bots
@@ -1603,9 +1606,9 @@ class LiveMultiBotRunner:
 
             bot._append_equity()
 
-            # Feed reward to RL brain + cumulative reward tracker
-            bot.brain.record_outcome(reward=pnl_pct, done=True)
-            bot.cumulative_reward += pnl_pct
+            # Feed reward to central RL brain when the decision was tracked
+            if trade.get("rl_tracked"):
+                bot.brain.record_outcome(reward=pnl_pct, coin_id=bot.symbol, done=True)
 
             outcome = "WIN" if net_pnl > 0 else "LOSS"
             bot.logger.info(
@@ -1822,10 +1825,10 @@ class LiveMultiBotRunner:
         )
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-        # Flush RL brains (save remaining buffer)
-        for bot in self.bots:
+        # Flush central RL brain (save remaining buffer)
+        if self.brain is not None:
             try:
-                bot.brain.flush()
+                self.brain.flush()
             except Exception:
                 pass
 
@@ -1918,6 +1921,11 @@ def main() -> None:
         f"[bold cyan]Creating {NUM_BOTS} coin-specialised bots …[/bold cyan]"
     )
 
+    central_brain = CentralRLBrain(
+        model_dir=output_dir / "rl_models",
+        coin_ids=TOP_100_COINS,
+    )
+
     bots: list[PaperBot] = []
     for idx, coin in enumerate(TOP_100_COINS):
         bot = PaperBot(
@@ -1926,6 +1934,7 @@ def main() -> None:
             config=config,
             output_dir=output_dir,
             exchange=exchange,
+            central_brain=central_brain,
         )
         bots.append(bot)
 
