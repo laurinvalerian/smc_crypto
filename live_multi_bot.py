@@ -230,6 +230,9 @@ FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
 MAX_LEVERAGE_FALLBACK = 50
+EXIT_QTY_MATCH_TOLERANCE = 0.05
+COMMISSION_RATE = 0.0004
+COMMISSION_MULTIPLIER = 2
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
@@ -947,7 +950,8 @@ class PaperBot:
             # reduce risk in 0.1% steps down to 0.1%
             adjusted = False
             # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
-            for step in range(9, 0, -1):
+            start_step = min(9, max(1, int(round(self.risk_pct * 1000)) - 1))
+            for step in range(start_step, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
                 if not _too_big(qty, notional):
@@ -1172,7 +1176,7 @@ class PaperBot:
         return {
             "bot": self.tag,
             "symbol": self.symbol,
-            "cum_reward": round(self.cumulative_reward, 2),
+            "cumulative_reward": round(self.cumulative_reward, 2),
             "pnl": round(self.total_pnl, 2),
             "return_pct": round(self.return_pct, 2),
             "trades": self.trades,
@@ -1250,12 +1254,12 @@ def _build_bot_table(
     for i, r in enumerate(rows, 1):
         pnl_c = _pnl_color(r["pnl"])
         ret_c = _pnl_color(r["return_pct"])
-        reward_c = _pnl_color(r["cum_reward"])
+        reward_c = _pnl_color(r["cumulative_reward"])
         table.add_row(
             str(i),
             r["bot"],
             r.get("symbol", ""),
-            f"[{reward_c}]{r['cum_reward']:+.2f}[/{reward_c}]",
+            f"[{reward_c}]{r['cumulative_reward']:+.2f}[/{reward_c}]",
             f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
             f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
             str(r["trades"]),
@@ -1579,7 +1583,7 @@ class LiveMultiBotRunner:
             else:
                 raw_pnl = (entry_price - exit_price) * qty
 
-            commission = qty * entry_price * 0.0004 * 2
+            commission = qty * entry_price * COMMISSION_RATE * COMMISSION_MULTIPLIER
             net_pnl = raw_pnl - commission
 
             pnl_pct = (net_pnl / bot.equity * 100) if bot.equity > 0 else 0.0
@@ -1659,7 +1663,7 @@ class LiveMultiBotRunner:
                             if t_amount <= 0:
                                 continue
                             # Match exit to trade size to avoid mixing fills
-                            if abs(t_amount - trade["qty"]) > trade["qty"] * 0.05:
+                            if abs(t_amount - trade["qty"]) > trade["qty"] * EXIT_QTY_MATCH_TOLERANCE:
                                 continue
                             if t_ts and t_ts >= entry_ms:
                                 exit_price = float(t["price"])
