@@ -942,7 +942,7 @@ class PaperBot:
             # reduce risk in 0.1% steps down to 0.1%
             adjusted = False
             for step in range(9, 0, -1):
-                candidate_pct = round(step / 100.0, 4)
+                candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
                 if not _too_big(qty, notional):
                     risk_pct = candidate_pct
