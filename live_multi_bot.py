@@ -213,10 +213,10 @@ NUM_BOTS = len(TOP_100_COINS)  # exactly 100 (or as many coins as listed)
 
 # ── Fixed SMC Parameters (identical for all 100 bots) ────────────
 FIXED_SMC_PARAMS: dict[str, Any] = {
-    "swing_length": 10,
-    "fvg_threshold": 0.00045,
-    "order_block_lookback": 28,
-    "liquidity_range_percent": 0.0075,
+    "swing_length": 8,
+    "fvg_threshold": 0.0006,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.01,
     "alignment_threshold": 0.35,
     "weight_day": 1.25,
     "bos_choch_filter": "medium",
