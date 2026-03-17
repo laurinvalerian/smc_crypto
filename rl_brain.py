@@ -1,23 +1,23 @@
 """
 ═══════════════════════════════════════════════════════════════════
- rl_brain.py  –  Per-Bot PPO Brain (Reinforcement Learning)
+ rl_brain.py  –  Central PPO Brain (shared across all coins)
  ──────────────────────────────────────────────────────────────
- Each of the 100 bots has its own lightweight PPO agent that
- learns a yes/no trade filter based on market features.
+ A single PPO agent learns a yes/no trade filter across all 100
+ coins. Each decision includes the coin identifier as an extra
+ feature so the shared model can specialise per asset.
 
- • Observation  : 12-dim vector (alignment, ATR-norm, EMAs, vol, …)
+ • Observation  : 12-dim market features + 1 coin-id feature
  • Action       : Binary  –  0 = skip, 1 = take the trade
  • Reward       : Pure PnL change in %  (no shaping, no R:R bonus)
  • Update       : Mini-batch PPO with clipped surrogate objective
 
  The brain is called only when the rule-based SMC strategy already
- signals a potential entry.  It acts as a gating filter.
+ signals a potential entry. It acts as a gating filter.
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
 import logging
-import math
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 #  Constants
 # ═══════════════════════════════════════════════════════════════════
 
-OBS_DIM = 12           # observation vector length
+BASE_OBS_DIM = 12      # market feature length (from extract_features)
+OBS_DIM = BASE_OBS_DIM + 1  # +1 coin-id feature
+DEFAULT_COIN_FEATURE_DENOM = 100  # expected number of coins for normalisation
 HIDDEN_DIM = 64        # hidden layer size
 GAMMA = 0.99           # discount factor
 CLIP_EPS = 0.2         # PPO clipping epsilon
@@ -80,7 +82,7 @@ def extract_features(
     """
     n = len(candles)
     if n < 50:
-        return np.zeros(OBS_DIM, dtype=np.float32)
+        return np.zeros(BASE_OBS_DIM, dtype=np.float32)
 
     closes = np.array([c["close"] for c in candles], dtype=np.float64)
     highs = np.array([c["high"] for c in candles], dtype=np.float64)
@@ -89,7 +91,7 @@ def extract_features(
 
     price = closes[-1]
     if price <= 0:
-        return np.zeros(OBS_DIM, dtype=np.float32)
+        return np.zeros(BASE_OBS_DIM, dtype=np.float32)
 
     # ATR(14)
     trs: list[float] = []
@@ -186,35 +188,45 @@ if TORCH_AVAILABLE:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  RLBrain – per-bot PPO agent
+#  CentralRLBrain – shared PPO agent
 # ═══════════════════════════════════════════════════════════════════
 
-class RLBrain:
+class CentralRLBrain:
     """
-    Lightweight PPO agent that gates trade entries.
+    Shared PPO agent that gates trade entries across all coins.
 
     Usage
     -----
-    1. Call ``should_trade(obs)`` before each potential entry.
+    1. Call ``should_trade(obs, coin_id)`` before each potential entry.
        Returns True/False.
 
-    2. Call ``record_outcome(reward)`` when a trade (or skip) resolves.
-       *reward* = PnL change in % (positive or negative).
+    2. Call ``record_outcome(reward, coin_id)`` when a trade (or skip)
+       resolves. *reward* = PnL change in % (positive or negative).
 
     3. The brain auto-updates its policy every BUFFER_CAPACITY steps.
     """
 
-    def __init__(self, bot_tag: str, model_dir: Path | None = None) -> None:
-        self.bot_tag = bot_tag
+    def __init__(
+        self,
+        model_dir: Path | None = None,
+        coin_ids: list[str] | None = None,
+    ) -> None:
         self._model_dir = model_dir or Path("rl_models")
         self._model_dir.mkdir(parents=True, exist_ok=True)
-        self._model_path = self._model_dir / f"{bot_tag}_ppo.pt"
+        self._model_path = self._model_dir / "central_rl.pt"
+
+        # Stable mapping coin_id -> index (persisted with the model)
+        self._coin_to_idx: dict[str, int] = {}
+        if coin_ids:
+            self._coin_to_idx = {cid: i for i, cid in enumerate(coin_ids)}
+        self._next_coin_idx: int = len(self._coin_to_idx)
+        coin_count_or_default = len(self._coin_to_idx) if self._coin_to_idx else DEFAULT_COIN_FEATURE_DENOM
+        self._feature_denom: float = float(max(1, coin_count_or_default))
 
         self._enabled = TORCH_AVAILABLE
         if not self._enabled:
             logger.warning(
-                "%s: PyTorch not available – RL brain disabled (random pass-through)",
-                bot_tag,
+                "CentralRLBrain: PyTorch not available – RL brain disabled (pass-through)",
             )
             return
 
@@ -234,7 +246,7 @@ class RLBrain:
 
     # ── Public API ────────────────────────────────────────────────
 
-    def should_trade(self, obs: np.ndarray) -> bool:
+    def should_trade(self, obs: np.ndarray, coin_id: Any) -> bool:
         """
         Given an observation vector, sample an action from the policy.
         Returns True (take trade) or False (skip).
@@ -243,8 +255,10 @@ class RLBrain:
         if not self._enabled:
             return True  # pass-through if no PyTorch
 
+        obs_with_coin = self._augment_obs(obs, coin_id)
+
         with torch.no_grad():
-            obs_t = torch.from_numpy(obs).float().unsqueeze(0)
+            obs_t = torch.from_numpy(obs_with_coin).float().unsqueeze(0)
             logits, value = self._net(obs_t)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs)
@@ -252,14 +266,19 @@ class RLBrain:
             log_prob = dist.log_prob(action)
 
         act = int(action.item())
-        self._obs_buf.append(obs.copy())
+        self._obs_buf.append(obs_with_coin.copy())
         self._act_buf.append(act)
         self._logp_buf.append(float(log_prob.item()))
         self._val_buf.append(float(value.item()))
 
         return act == 1  # 1 = trade, 0 = skip
 
-    def record_outcome(self, reward: float, done: bool = True) -> None:
+    def record_outcome(
+        self,
+        reward: float,
+        coin_id: Any | None = None,
+        done: bool = True,
+    ) -> None:
         """
         Record the reward for the most recent decision.
         *reward* should be pure PnL change in % (e.g. +1.5 or -0.8).
@@ -267,6 +286,9 @@ class RLBrain:
         """
         if not self._enabled:
             return
+
+        if coin_id is not None:
+            self._encode_coin_id(coin_id)
 
         self._rew_buf.append(reward)
         self._done_buf.append(done)
@@ -336,8 +358,8 @@ class RLBrain:
 
         self._total_updates += 1
         logger.debug(
-            "%s: PPO update #%d (buffer=%d)",
-            self.bot_tag, self._total_updates, n,
+            "CentralRLBrain: PPO update #%d (buffer=%d)",
+            self._total_updates, n,
         )
 
         # Clear buffer
@@ -362,11 +384,12 @@ class RLBrain:
                     "net": self._net.state_dict(),
                     "optimiser": self._optimiser.state_dict(),
                     "updates": self._total_updates,
+                    "coin_to_idx": self._coin_to_idx,
                 },
                 self._model_path,
             )
         except Exception as exc:
-            logger.warning("%s: model save failed: %s", self.bot_tag, exc)
+            logger.warning("CentralRLBrain: model save failed: %s", exc)
 
     def _load_model(self) -> None:
         if not self._enabled:
@@ -378,12 +401,22 @@ class RLBrain:
             self._net.load_state_dict(ckpt["net"])
             self._optimiser.load_state_dict(ckpt["optimiser"])
             self._total_updates = ckpt.get("updates", 0)
+            if isinstance(ckpt.get("coin_to_idx"), dict):
+                self._coin_to_idx = {}
+                for k, v in ckpt["coin_to_idx"].items():
+                    idx_val = int(v)
+                    str_key = str(k)
+                    self._coin_to_idx[str_key] = idx_val
+                self._next_coin_idx = len(self._coin_to_idx)
+                if self._coin_to_idx:
+                    self._feature_denom = float(max(1, len(self._coin_to_idx)))
             logger.info(
-                "%s: loaded model (%d prior updates)",
-                self.bot_tag, self._total_updates,
+                "CentralRLBrain: loaded model (%d prior updates, %d coins)",
+                self._total_updates,
+                len(self._coin_to_idx),
             )
         except Exception as exc:
-            logger.warning("%s: model load failed, starting fresh: %s", self.bot_tag, exc)
+            logger.warning("CentralRLBrain: model load failed, starting fresh: %s", exc)
 
     # ── Flush remaining buffer on shutdown ────────────────────────
 
@@ -391,3 +424,40 @@ class RLBrain:
         """Run a final PPO update with whatever remains in the buffer."""
         if self._enabled and len(self._rew_buf) > 0:
             self._ppo_update()
+
+    # ── Coin handling ─────────────────────────────────────────────
+
+    def _encode_coin_id(self, coin_id: Any) -> int:
+        """
+        Map *coin_id* (str/int) to a stable integer index.
+        Keys are normalised to strings for checkpoint stability.
+        Unknown coins are appended to the mapping.
+        """
+        if isinstance(coin_id, int) and coin_id < 0:
+            raise ValueError("coin_id must be non-negative")
+        key = str(coin_id)
+        if key not in self._coin_to_idx:
+            self._coin_to_idx[key] = self._next_coin_idx
+            self._next_coin_idx += 1
+            self._feature_denom = max(self._feature_denom, float(self._next_coin_idx))
+        return self._coin_to_idx[key]
+
+    def _coin_feature(self, coin_id: Any) -> float:
+        """Normalise coin index to [0, 1]."""
+        idx = self._encode_coin_id(coin_id)
+        feature = float(idx) / self._feature_denom
+        return min(feature, 1.0)
+
+    def _augment_obs(self, obs: np.ndarray, coin_id: Any) -> np.ndarray:
+        """Append coin-id feature to the observation vector."""
+        obs_arr = np.asarray(obs, dtype=np.float32)
+        if obs_arr.shape[0] != BASE_OBS_DIM:
+            raise ValueError(
+                f"Expected obs of length {BASE_OBS_DIM}, got {obs_arr.shape[0]}"
+            )
+        coin_feat = self._coin_feature(coin_id)
+        return np.append(obs_arr, np.float32(coin_feat))
+
+
+# Backwards compatibility alias
+RLBrain = CentralRLBrain
