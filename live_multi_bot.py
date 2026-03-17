@@ -946,8 +946,10 @@ class PaperBot:
 
         if _too_big(qty, notional):
             adjusted = False
-            # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
-            for step in range(MAX_RISK_REDUCTION_STEP, 0, -1):
+            # iterate risk from current_pct - 0.1 down to 0.1% (decimal 0.001)
+            current_step = max(1, int(round(self.risk_pct * 1000)))
+            start_step = min(MAX_RISK_REDUCTION_STEP, max(1, current_step - 1))
+            for step in range(start_step, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
                 if not _too_big(qty, notional):
@@ -962,7 +964,7 @@ class PaperBot:
                     break
             if not adjusted:
                 self.logger.warning(
-                    "Skipping – even 0.1% too big (qty=%.6f notional=%.2f)",
+                    "Skipping - even 0.1% too big (qty=%.6f notional=%.2f)",
                     qty,
                     notional,
                 )
