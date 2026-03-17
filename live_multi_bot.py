@@ -911,23 +911,6 @@ class PaperBot:
         except Exception as exc:
             self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
 
-        # Try to bump leverage to the maximum first
-        target_leverage = max(1, max_leverage)
-        target_risk_pct = self.risk_pct * 100
-        try:
-            await self.exchange.set_leverage(target_leverage, symbol)
-            self.leverage = target_leverage
-            self.logger.info(
-                "Leverage bumped to %dx for %.1f%% risk target",
-                target_leverage,
-                target_risk_pct,
-            )
-        except Exception as exc:
-            self.logger.warning(
-                "set_leverage failed for %s: %s (keeping %dx)",
-                symbol, exc, self.leverage,
-            )
-
         def _calc_qty(risk_pct: float) -> tuple[float, float]:
             ra = balance * risk_pct
             q = ra / sl_dist
@@ -946,29 +929,40 @@ class PaperBot:
                 return True
             return False
 
+        # Always bump leverage to the coin-specific maximum before sizing
+        target_leverage = max(1, max_leverage)
+        try:
+            await self.exchange.set_leverage(target_leverage, symbol)
+            self.leverage = target_leverage
+            self.logger.info("Leverage bumped to %dx", target_leverage)
+        except Exception as exc:
+            self.logger.warning(
+                "set_leverage failed for %s: %s (keeping %dx)",
+                symbol, exc, self.leverage,
+            )
+
         risk_pct = self.risk_pct
         qty, notional = _calc_qty(risk_pct)
 
         if _too_big(qty, notional):
-            # reduce risk in 0.1% steps down to 0.1%
             adjusted = False
             # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
-            current_step = max(1, int(round(self.risk_pct * 1000)))
-            start_step = min(MAX_RISK_REDUCTION_STEP, max(1, current_step - 1))
-            for step in range(start_step, 0, -1):
+            for step in range(MAX_RISK_REDUCTION_STEP, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
                 if not _too_big(qty, notional):
                     risk_pct = candidate_pct
                     adjusted = True
                     self.logger.warning(
-                        "Risk reduced to %.1f% (min 0.1%) because leverage maxed",
+                        "Risk reduced to %.1f%% (qty=%.6f notional=%.2f)",
                         risk_pct * 100,
+                        qty,
+                        notional,
                     )
                     break
             if not adjusted:
                 self.logger.warning(
-                    "Skipping trade – even 0.1% risk too big (qty=%.6f notional=%.2f)",
+                    "Skipping – even 0.1% too big (qty=%.6f notional=%.2f)",
                     qty,
                     notional,
                 )
