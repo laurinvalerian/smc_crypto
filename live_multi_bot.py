@@ -231,6 +231,7 @@ FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
 MAX_LEVERAGE_FALLBACK = 50
 EXIT_QTY_MATCH_TOLERANCE = 0.05
+# Commission assumptions (Binance USDT-M taker, both sides)
 COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
 
@@ -940,6 +941,7 @@ class PaperBot:
                 return True
             # margin-based rough cap
             if notional_val > balance * self.leverage:
+                # Simplified check; exchange tiered margin rules may differ
                 return True
             return False
 
@@ -950,7 +952,8 @@ class PaperBot:
             # reduce risk in 0.1% steps down to 0.1%
             adjusted = False
             # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
-            start_step = min(9, max(1, int(round(self.risk_pct * 1000)) - 1))
+            current_step = max(1, int(round(self.risk_pct * 1000)))
+            start_step = min(9, max(1, current_step - 1))
             for step in range(start_step, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 qty, notional = _calc_qty(candidate_pct)
@@ -1653,6 +1656,7 @@ class LiveMultiBotRunner:
                         exit_id: str | None = None
 
                         for t in reversed(recent or []):
+                            # Binance trade id lives in "id"; fallback to "order" for safety
                             tid = str(t.get("id") or t.get("order") or "")
                             if tid and tid in bot._processed_exit_ids:
                                 continue
@@ -1663,7 +1667,8 @@ class LiveMultiBotRunner:
                             if t_amount <= 0:
                                 continue
                             # Match exit to trade size to avoid mixing fills
-                            if abs(t_amount - trade["qty"]) > trade["qty"] * EXIT_QTY_MATCH_TOLERANCE:
+                            diff_ratio = abs(t_amount - trade["qty"]) / max(t_amount, trade["qty"])
+                            if diff_ratio > EXIT_QTY_MATCH_TOLERANCE:
                                 continue
                             if t_ts and t_ts >= entry_ms:
                                 exit_price = float(t["price"])
@@ -1676,9 +1681,23 @@ class LiveMultiBotRunner:
                             await _record_close(bot, trade, exit_price)
                             continue
 
-                        # No exit trade found but position flat → assume SL
+                        # No exit trade found but position flat → use last known trade price or SL as fallback
                         if bot.symbol not in pos_map:
-                            await _record_close(bot, trade, trade["sl"])
+                            fallback_price = None
+                            if recent:
+                                try:
+                                    last_price_val = float(recent[-1].get("price", 0) or 0)
+                                    if last_price_val > 0:
+                                        fallback_price = last_price_val
+                                except Exception:
+                                    fallback_price = None
+                            exit_price = fallback_price or trade["sl"]
+                            bot.logger.error(
+                                "Could not match exit trade for %s – using fallback %.6f",
+                                bot.symbol,
+                                exit_price,
+                            )
+                            await _record_close(bot, trade, exit_price)
                             continue
 
                         remaining.append(trade)
