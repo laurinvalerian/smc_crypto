@@ -229,6 +229,12 @@ FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
 FIXED_MIN_VOL_MULT = 1.0    # min volume = 1.0× average
+MAX_LEVERAGE_FALLBACK = 50
+EXIT_QTY_MATCH_TOLERANCE = 0.05
+# Commission assumptions (Binance USDT-M taker, both sides)
+COMMISSION_RATE = 0.0004
+COMMISSION_MULTIPLIER = 2
+MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
@@ -334,9 +340,11 @@ class PaperBot:
         self.total_pnl: float = 0.0
         self.trades: int = 0
         self.wins: int = 0
+        self.cumulative_reward: float = 0.0
 
-        # Active trade on exchange (set on entry, cleared by position poller)
-        self._active_trade: dict[str, Any] | None = None
+        # Active trades on exchange (max 3, cleared by position poller)
+        self._active_trades: list[dict[str, Any]] = []
+        self._processed_exit_ids: set[str] = set()
 
         # Candle history  {symbol: list[dict]}
         self._candle_buf: dict[str, list[dict[str, Any]]] = {}
@@ -756,7 +764,7 @@ class PaperBot:
         *pending signal* that ``on_tick`` will consume for real-time
         entry once the live price touches the entry zone.
         """
-        if self._active_trade is not None:
+        if len(self._active_trades) >= 3:
             self._pending_signal = None
             return
 
@@ -856,7 +864,7 @@ class PaperBot:
             return
         if sig["symbol"] != symbol:
             return
-        if self._active_trade is not None:
+        if len(self._active_trades) >= 3:
             self._pending_signal = None
             return
 
@@ -883,12 +891,89 @@ class PaperBot:
         if sl_dist <= 0:
             return
 
-        risk_amount = balance * self.risk_pct
-        qty = risk_amount / sl_dist
-        notional = qty * price
+        # ── Determine leverage limits and max qty/notional ─────────
+        max_leverage = MAX_LEVERAGE_FALLBACK
+        max_qty_limit: float | None = None
+        max_notional_limit: float | None = None
+        try:
+            if not getattr(self.exchange, "markets", None):
+                await self.exchange.load_markets()
+            market = self.exchange.market(symbol)
+            limits = market.get("limits", {}) if market else {}
+            lev_limit = limits.get("leverage", {}) if isinstance(limits, dict) else {}
+            max_leverage = int(lev_limit.get("max") or max_leverage)
+            amt_limits = limits.get("amount", {}) if isinstance(limits, dict) else {}
+            cost_limits = limits.get("cost", {}) if isinstance(limits, dict) else {}
+            max_qty_limit = float(amt_limits.get("max")) if amt_limits.get("max") else None
+            max_notional_limit = (
+                float(cost_limits.get("max")) if cost_limits.get("max") else None
+            )
+        except Exception as exc:
+            self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
 
-        if qty <= 0 or notional <= 0:
-            return
+        # Try to bump leverage to the maximum first
+        target_leverage = max(1, max_leverage)
+        target_risk_pct = self.risk_pct * 100
+        try:
+            await self.exchange.set_leverage(target_leverage, symbol)
+            self.leverage = target_leverage
+            self.logger.info(
+                "Leverage bumped to %dx for %.1f%% risk target",
+                target_leverage,
+                target_risk_pct,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "set_leverage failed for %s: %s (keeping %dx)",
+                symbol, exc, self.leverage,
+            )
+
+        def _calc_qty(risk_pct: float) -> tuple[float, float]:
+            ra = balance * risk_pct
+            q = ra / sl_dist
+            return q, q * price
+
+        def _too_big(qty_val: float, notional_val: float) -> bool:
+            if qty_val <= 0 or notional_val <= 0:
+                return True
+            if max_qty_limit and qty_val > max_qty_limit:
+                return True
+            if max_notional_limit and notional_val > max_notional_limit:
+                return True
+            # margin-based rough cap
+            if notional_val > balance * self.leverage:
+                # Simplified check; ignores tiered/maintenance margin so exchange may still reject
+                return True
+            return False
+
+        risk_pct = self.risk_pct
+        qty, notional = _calc_qty(risk_pct)
+
+        if _too_big(qty, notional):
+            # reduce risk in 0.1% steps down to 0.1%
+            adjusted = False
+            # iterate risk from 0.9% down to 0.1% (decimal 0.009 → 0.001)
+            current_step = max(1, int(round(self.risk_pct * 1000)))
+            start_step = min(MAX_RISK_REDUCTION_STEP, max(1, current_step - 1))
+            for step in range(start_step, 0, -1):
+                candidate_pct = round(step / 1000.0, 4)
+                qty, notional = _calc_qty(candidate_pct)
+                if not _too_big(qty, notional):
+                    risk_pct = candidate_pct
+                    adjusted = True
+                    self.logger.warning(
+                        "Risk reduced to %.1f% (min 0.1%) because leverage maxed",
+                        risk_pct * 100,
+                    )
+                    break
+            if not adjusted:
+                self.logger.warning(
+                    "Skipping trade – even 0.1% risk too big (qty=%.6f notional=%.2f)",
+                    qty,
+                    notional,
+                )
+                self._pending_signal = None
+                return
 
         # ── Place real bracket order on testnet ───────────────────
         order_id = await self._place_bracket_order(
@@ -909,7 +994,7 @@ class PaperBot:
         self._pending_obs = obs
 
         # ── Track active trade (cleared by position poller on fill) ──
-        self._active_trade = {
+        trade_info = {
             "symbol": symbol,
             "direction": direction,
             "entry": price,
@@ -917,10 +1002,12 @@ class PaperBot:
             "tp": tp,
             "qty": qty,
             "leverage": self.leverage,
+            "risk_pct": risk_pct,
             "entry_time": datetime.now(timezone.utc),
             "score": score,
             "order_id": order_id,
         }
+        self._active_trades.append(trade_info)
         self.logger.info(
             "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f "
             "lev=%dx score=%.2f bal=%.2f order=%s",
@@ -940,7 +1027,7 @@ class PaperBot:
         qty: float,
     ) -> str | None:
         """
-        Place a market order with attached stopLoss + takeProfit on the
+        Place a market entry plus separate reduceOnly SL/TP orders on the
         Binance Testnet via ``create_order``.
 
         Returns the order ID on success, ``None`` on failure.
@@ -949,34 +1036,96 @@ class PaperBot:
             return None
 
         side = "buy" if direction == "long" else "sell"
+        exit_side = "sell" if direction == "long" else "buy"
+
+        async def _close_position(reason: str) -> None:
+            try:
+                close = await self.exchange.create_order(
+                    symbol,
+                    "market",
+                    exit_side,
+                    qty,
+                    params={"reduceOnly": True},
+                )
+                self.logger.warning(
+                    "Flattened position after %s | close_order=%s",
+                    reason,
+                    close.get("id"),
+                )
+            except Exception as close_exc:
+                self.logger.error(
+                    "Failed to flatten position after %s: %s", reason, close_exc,
+                )
         try:
-            order = await self.exchange.create_order(
+            entry = await self.exchange.create_order(symbol, "market", side, qty)
+            entry_id = entry.get("id")
+            self.logger.info(
+                "ENTRY %s %s qty=%.6f | id=%s",
+                side.upper(), symbol, qty, entry_id,
+            )
+        except Exception as exc:
+            self.logger.error("Entry order FAILED %s %s: %s", side.upper(), symbol, exc)
+            return None
+
+        # Place SL (STOP_MARKET reduceOnly)
+        sl_order_id: str | None = None
+        try:
+            sl_order = await self.exchange.create_order(
                 symbol,
-                "market",
-                side,
+                "STOP_MARKET",
+                exit_side,
                 qty,
                 params={
-                    "stopLoss": {
-                        "triggerPrice": sl,
-                        "type": "market",
-                    },
-                    "takeProfit": {
-                        "triggerPrice": tp,
-                        "type": "market",
-                    },
+                    "stopPrice": sl,
+                    "reduceOnly": True,
                 },
             )
-            order_id = order.get("id")
+            sl_order_id = sl_order.get("id")
             self.logger.info(
-                "BRACKET ORDER %s %s qty=%.6f | SL=%.6f TP=%.6f | id=%s",
-                side.upper(), symbol, qty, sl, tp, order_id,
+                "SL %s %s qty=%.6f @ %.6f | id=%s",
+                exit_side.upper(), symbol, qty, sl, sl_order_id,
             )
-            return order_id
         except Exception as exc:
             self.logger.error(
-                "Bracket order FAILED %s %s: %s", side.upper(), symbol, exc,
+                "SL order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
             )
+            await _close_position("SL placement failure")
             return None
+
+        # Place TP (TAKE_PROFIT_MARKET reduceOnly)
+        try:
+            tp_order = await self.exchange.create_order(
+                symbol,
+                "TAKE_PROFIT_MARKET",
+                exit_side,
+                qty,
+                params={
+                    "stopPrice": tp,
+                    "reduceOnly": True,
+                },
+            )
+            self.logger.info(
+                "TP %s %s qty=%.6f @ %.6f | id=%s",
+                exit_side.upper(), symbol, qty, tp, tp_order.get("id"),
+            )
+        except Exception as exc:
+            self.logger.error(
+                "TP order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
+            )
+            # Cancel SL to avoid dangling reduceOnly without TP
+            if sl_order_id:
+                try:
+                    await self.exchange.cancel_order(sl_order_id, symbol)
+                except Exception as cancel_exc:
+                    self.logger.warning(
+                        "Failed to cancel SL %s after TP failure: %s",
+                        sl_order_id,
+                        cancel_exc,
+                    )
+            await _close_position("TP placement failure")
+            return None
+
+        return entry_id
 
     # ── Fetch real testnet balance ────────────────────────────────
 
@@ -1031,13 +1180,13 @@ class PaperBot:
         return {
             "bot": self.tag,
             "symbol": self.symbol,
-            "equity": 0,
+            "cumulative_reward": round(self.cumulative_reward, 2),
             "pnl": round(self.total_pnl, 2),
             "return_pct": round(self.return_pct, 2),
             "trades": self.trades,
             "winrate": round(self.winrate * 100, 1),
             "drawdown_pct": round(self.drawdown_pct, 2),
-            "open_pos": 1 if self._active_trade is not None else 0,
+            "open_pos": len(self._active_trades),
         }
 
 
@@ -1098,7 +1247,7 @@ def _build_bot_table(
     table.add_column("#", justify="right", style="dim", width=4)
     table.add_column("Bot-ID", style="cyan", width=9)
     table.add_column("Coin", style="bright_yellow", width=18)
-    table.add_column("Equity", justify="right", width=14)
+    table.add_column("Cum. Reward", justify="right", width=14)
     table.add_column("PnL", justify="right", width=12)
     table.add_column("Return%", justify="right", width=9)
     table.add_column("Trades", justify="right", width=7)
@@ -1109,11 +1258,12 @@ def _build_bot_table(
     for i, r in enumerate(rows, 1):
         pnl_c = _pnl_color(r["pnl"])
         ret_c = _pnl_color(r["return_pct"])
+        reward_c = _pnl_color(r["cumulative_reward"])
         table.add_row(
             str(i),
             r["bot"],
             r.get("symbol", ""),
-            f"{r['equity']:,.2f}",
+            f"[{reward_c}]{r['cumulative_reward']:+.2f}[/{reward_c}]",
             f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
             f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
             str(r["trades"]),
@@ -1422,120 +1572,145 @@ class LiveMultiBotRunner:
         """
         Poll exchange positions every POSITION_POLL_SEC seconds.
 
-        Detects when a bracket order's SL or TP has been filled, then:
-          - determines exit price via ``fetch_my_trades``
-          - calculates PnL and commission
-          - feeds reward to the bot's RL brain
-          - updates equity / dashboard counters
-          - clears the bot's ``_active_trade``
+        Detects when bracket SL/TP has filled by inspecting trades and
+        position state, then updates bot stats and RL rewards.
         """
+
+        async def _record_close(bot: PaperBot, trade: dict[str, Any], exit_price: float) -> None:
+            entry_price = trade["entry"]
+            qty = trade["qty"]
+            direction = trade["direction"]
+            sl = trade["sl"]
+
+            if direction == "long":
+                raw_pnl = (exit_price - entry_price) * qty
+            else:
+                raw_pnl = (entry_price - exit_price) * qty
+
+            commission = qty * entry_price * COMMISSION_RATE * COMMISSION_MULTIPLIER
+            net_pnl = raw_pnl - commission
+
+            pnl_pct = (net_pnl / bot.equity * 100) if bot.equity > 0 else 0.0
+
+            bot.equity += net_pnl
+            bot.total_pnl += net_pnl
+            bot.trades += 1
+            if net_pnl > 0:
+                bot.wins += 1
+            if bot.equity > bot.peak_equity:
+                bot.peak_equity = bot.equity
+
+            bot._append_equity()
+
+            # Feed reward to RL brain + cumulative reward tracker
+            bot.brain.record_outcome(reward=pnl_pct, done=True)
+            bot.cumulative_reward += pnl_pct
+
+            outcome = "WIN" if net_pnl > 0 else "LOSS"
+            bot.logger.info(
+                "CLOSE %s %s %s @ %.6f → %.6f | pnl=%.2f equity=%.2f",
+                outcome,
+                direction.upper(),
+                bot.symbol,
+                entry_price,
+                exit_price,
+                net_pnl,
+                bot.equity,
+            )
+
         while not self._shutdown.is_set():
             try:
                 positions = await self.exchange.fetch_positions()
 
-                # Binance USDT-M one-way mode: one position per symbol.
-                # Build map: symbol → position (non-zero contracts only).
-                # Skip poll cycle if exchange returned nothing (API glitch).
+                pos_map: dict[str, Any] = {}
                 if positions:
-                    pos_map: dict[str, Any] = {}
                     for p in positions:
                         sym = p.get("symbol")
                         contracts = abs(float(p.get("contracts", 0) or 0))
                         if sym and contracts > 0:
                             pos_map[sym] = p
 
-                    for bot in self.bots:
-                        trade = bot._active_trade
-                        if trade is None:
-                            continue
+                for bot in self.bots:
+                    if not bot._active_trades:
+                        continue
 
-                        # Position still open on exchange → nothing to do
-                        if bot.symbol in pos_map:
-                            continue
+                    # Fetch recent trades since earliest entry
+                    recent: list[Any] = []
+                    try:
+                        earliest = min(
+                            int(t["entry_time"].timestamp() * 1000)
+                            for t in bot._active_trades
+                        )
+                        recent = await self.exchange.fetch_my_trades(
+                            bot.symbol, since=earliest, limit=50,
+                        )
+                    except Exception as exc:
+                        bot.logger.warning("fetch_my_trades failed: %s", exc)
 
-                        # ── Position closed (TP or SL filled) ─────
-                        entry_price = trade["entry"]
-                        sl = trade["sl"]
-                        tp = trade["tp"]
-                        qty = trade["qty"]
-                        direction = trade["direction"]
+                    remaining: list[dict[str, Any]] = []
+                    # Process each tracked trade independently
+                    for trade in list(bot._active_trades):
+                        exit_side = "sell" if trade["direction"] == "long" else "buy"
+                        entry_ms = int(trade["entry_time"].timestamp() * 1000)
 
-                        # Determine exit price from recent exchange
-                        # trades.  Filter to exit-side trades (sell for
-                        # long, buy for short) that occurred after entry.
                         exit_price: float | None = None
-                        exit_side = "sell" if direction == "long" else "buy"
-                        try:
-                            since_ms = int(
-                                trade["entry_time"].timestamp() * 1000
-                            )
-                            recent = await self.exchange.fetch_my_trades(
-                                bot.symbol, since=since_ms, limit=20,
-                            )
-                            # Find the last trade on the exit side
-                            for t in reversed(recent or []):
-                                if t.get("side") == exit_side:
-                                    exit_price = float(t["price"])
-                                    break
-                        except Exception as exc:
-                            bot.logger.warning(
-                                "fetch_my_trades failed: %s", exc,
-                            )
+                        exit_id: str | None = None
 
-                        # Fallback: assume SL (conservative)
-                        if exit_price is None:
-                            exit_price = sl
-                            bot.logger.warning(
-                                "Could not determine exit price for %s "
-                                "– assuming SL hit",
+                        for t in reversed(recent or []):
+                            # Binance trade id lives in "id"; fallback to "order" for safety
+                            tid = str(t.get("id") or t.get("order") or "")
+                            if tid and tid in bot._processed_exit_ids:
+                                continue
+                            if t.get("side") != exit_side:
+                                continue
+                            t_ts = t.get("timestamp") or 0
+                            t_amount = abs(float(t.get("amount", 0) or 0))
+                            if t_amount <= 0:
+                                continue
+                            # Match exit to trade size to avoid mixing fills
+                            diff_ratio = abs(t_amount - trade["qty"]) / max(t_amount, trade["qty"])
+                            # Normalised by larger qty to tolerate either side being slightly off and avoid div/0
+                            if diff_ratio > EXIT_QTY_MATCH_TOLERANCE:
+                                continue
+                            if t_ts and t_ts >= entry_ms:
+                                exit_price = float(t["price"])
+                                exit_id = tid or None
+                                break
+
+                        if exit_price is not None:
+                            if exit_id:
+                                bot._processed_exit_ids.add(exit_id)
+                            await _record_close(bot, trade, exit_price)
+                            continue
+
+                        # No exit trade found but position flat → use last known trade price or SL as fallback
+                        if bot.symbol not in pos_map:
+                            fallback_price = None
+                            if recent:
+                                try:
+                                    last_price_val = float(recent[-1].get("price", 0) or 0)
+                                    if last_price_val > 0:
+                                        fallback_price = last_price_val
+                                except Exception:
+                                    fallback_price = None
+                            exit_price = fallback_price or trade["sl"]
+                            fallback_label = (
+                                "last trade price" if fallback_price is not None else "SL price"
+                            )
+                            bot.logger.error(
+                                "Could not match exit trade for %s – using fallback (%s) %.6f",
                                 bot.symbol,
+                                fallback_label,
+                                exit_price,
                             )
+                            await _record_close(bot, trade, exit_price)
+                            continue
 
-                        # ── PnL calculation ───────────────────────
-                        if direction == "long":
-                            raw_pnl = (exit_price - entry_price) * qty
-                        else:
-                            raw_pnl = (entry_price - exit_price) * qty
+                        remaining.append(trade)
 
-                        commission = qty * entry_price * 0.0004 * 2
-                        net_pnl = raw_pnl - commission
+                    bot._active_trades = remaining
 
-                        pnl_pct = (
-                            (net_pnl / bot.equity * 100)
-                            if bot.equity > 0
-                            else 0.0
-                        )
-
-                        bot.equity += net_pnl
-                        bot.total_pnl += net_pnl
-                        bot.trades += 1
-                        if net_pnl > 0:
-                            bot.wins += 1
-                        if bot.equity > bot.peak_equity:
-                            bot.peak_equity = bot.equity
-
-                        bot._append_equity()
-
-                        # Feed reward to RL brain
-                        bot.brain.record_outcome(
-                            reward=pnl_pct, done=True,
-                        )
-
-                        outcome = "WIN" if net_pnl > 0 else "LOSS"
-                        bot.logger.info(
-                            "CLOSE %s %s %s @ %.6f → %.6f | "
-                            "pnl=%.2f equity=%.2f",
-                            outcome,
-                            direction.upper(),
-                            bot.symbol,
-                            entry_price,
-                            exit_price,
-                            net_pnl,
-                            bot.equity,
-                        )
-
-                        bot._active_trade = None
-                else:
+                if not positions:
                     logger.debug(
                         "fetch_positions returned empty – skipping poll cycle"
                     )
