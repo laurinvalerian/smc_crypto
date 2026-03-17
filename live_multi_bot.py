@@ -224,7 +224,7 @@ FIXED_SMC_PARAMS: dict[str, Any] = {
 
 # ── Fixed Money Management ────────────────────────────────────────
 FIXED_RISK_PCT = 0.01       # 1 % risk per trade
-FIXED_RR_MIN = 3.0          # minimum 1:3 reward-to-risk
+FIXED_RR_MIN = 2.5          # minimum 1:2.5 reward-to-risk
 FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
 FIXED_EMA_SLOW = 50
@@ -760,7 +760,7 @@ class PaperBot:
         """
         Evaluate multi-TF alignment + SMC SL/TP on the latest 5 m candle.
 
-        If all filters pass (alignment, RR ≥ 3.0), store a *pending
+        If all filters pass (alignment, RR ≥ 2.5), store a *pending
         signal* that ``on_tick`` will consume for real-time entry once
         the live price touches the entry zone. The RL gate runs in
         ``on_tick`` just before placing the order.
@@ -806,7 +806,7 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # Dynamic RR – never trade below FIXED_RR_MIN (1:3.0)
+        # Dynamic RR – never trade below FIXED_RR_MIN (1:2.5)
         rr = tp_dist / sl_dist
         if rr < FIXED_RR_MIN:
             self._pending_signal = None
@@ -876,6 +876,11 @@ class PaperBot:
             rl_tracked = True
             take_trade = rl_decision
             if not take_trade:
+                self.logger.info(
+                    "RL skipped trade for %s because decision=0 (score=%.2f)",
+                    symbol,
+                    score,
+                )
                 self.brain.record_outcome(reward=0.0, coin_id=self.symbol, done=True)
                 self._pending_signal = None
                 return
