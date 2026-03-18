@@ -899,7 +899,7 @@ class PaperBot:
             return
 
         # ── Determine leverage limits and max qty/notional ─────────
-        max_leverage = 50
+        max_leverage = 20
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
         lev_max = None
@@ -922,14 +922,13 @@ class PaperBot:
             )
         except Exception as exc:
             self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
-        if lev_max and lev_max > max_leverage:
+        if lev_max:
             max_leverage = int(lev_max)
         self.logger.info(
-            "Using coin-specific max leverage: %sx for %s",
-            max_leverage,
+            "Final max leverage for %s: %dx (from market limits or fallback)",
             symbol,
+            max_leverage,
         )
-        self.logger.info("Final max leverage for %s: %dx", symbol, max_leverage)
 
         def _calc_qty(risk_pct: float) -> tuple[float, float]:
             ra = balance * risk_pct
@@ -966,15 +965,12 @@ class PaperBot:
 
         if _too_big(qty, notional):
             adjusted = False
-            # iterate risk from current_pct - 0.1 down to 0.1% (decimal 0.001)
-            current_step = max(1, int(round(self.risk_pct * 1000)))
-            start_step = min(MAX_RISK_REDUCTION_STEP, max(1, current_step - 1))
-            for step in range(start_step, 0, -1):
+            for step in range(MAX_RISK_REDUCTION_STEP, 0, -1):
                 candidate_pct = round(step / 1000.0, 4)
                 self.logger.warning(
                     "Trying risk %.1f%% with %dx leverage for %s...",
                     candidate_pct * 100,
-                    max_leverage,
+                    target_leverage,
                     symbol,
                 )
                 qty, notional = _calc_qty(candidate_pct)
