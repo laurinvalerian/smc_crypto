@@ -956,6 +956,12 @@ class PaperBot:
         balance: float,
         sl_dist: float,
     ) -> tuple[str | None, float, float, int]:
+        """
+        Execute a bracket order with leverage-bracket lookup and risk reduction.
+
+        Returns:
+            tuple: (order_id, quantity, used_risk_pct, applied_leverage)
+        """
         if self.exchange is None:
             return None, 0.0, self.risk_pct, self.leverage
 
@@ -964,12 +970,16 @@ class PaperBot:
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
         lev_max = None
+        got_bracket = False
         market_id = symbol.replace("/", "").replace(":", "")
         try:
             await self.exchange.load_markets()
             market = self.exchange.market(symbol)
             if market:
-                market_id = market.get("id", market_id)
+                try:
+                    market_id = self.exchange.market_id(symbol)
+                except Exception:
+                    market_id = market.get("id", market_id)
                 lev_max = market.get("limits", {}).get("leverage", {}).get("max")
                 limits = market.get("limits", {}) if isinstance(market, dict) else {}
                 amt_limits = limits.get("amount", {}) if isinstance(limits, dict) else {}
@@ -993,14 +1003,19 @@ class PaperBot:
                 ]
                 if leverage_candidates:
                     max_leverage = int(max(leverage_candidates))
-                    leverage_source = "leverageBracket API"
+                    got_bracket = True
         except Exception as exc:
-            self.logger.warning("leverageBracket fetch failed for %s: %s", symbol, exc)
+            self.logger.warning(
+                "leverageBracket fetch failed for %s (market_id=%s): %s",
+                symbol,
+                market_id,
+                exc,
+            )
 
-        if leverage_source != "leverageBracket API":
-            if lev_max:
-                max_leverage = int(lev_max)
-            leverage_source = "market limits fallback"
+        if got_bracket:
+            leverage_source = "leverageBracket API"
+        elif lev_max:
+            max_leverage = int(lev_max)
 
         self.logger.info(
             "Max leverage for %s = %dx (source: %s)",
@@ -1008,6 +1023,8 @@ class PaperBot:
             max_leverage,
             leverage_source,
         )
+
+        planned_leverage = max(1, int(max_leverage))
 
         def _calc_qty(risk_pct: float) -> tuple[float, float]:
             ra = balance * risk_pct
@@ -1021,7 +1038,8 @@ class PaperBot:
                 return True
             if max_notional_limit and notional_val > max_notional_limit:
                 return True
-            if notional_val > balance * max_leverage:
+            # Simplified pre-check using planned leverage; tiered/maintenance margin or unrealized PnL can still trigger exchange errors
+            if notional_val > balance * planned_leverage:
                 return True
             return False
 
@@ -1036,27 +1054,50 @@ class PaperBot:
             return code, msg
 
         def _is_2027(code: int | str | None, msg: str) -> bool:
-            msg_l = msg or ""
+            msg_str = msg or ""
             return (
                 code == -2027
                 or str(code) == "-2027"
-                or "-2027" in msg_l
-                or "Exceeded the maximum allowable position at current leverage" in msg_l
+                or "-2027" in msg_str
+                or "Exceeded the maximum allowable position at current leverage" in msg_str
             )
 
         # === ROBUST RISK REDUCTION LOGIC ===
-        risk_steps = [self.risk_pct] + [
-            round(step / 1000.0, 4) for step in range(MAX_RISK_REDUCTION_STEP, 0, -1)
+        # MAX_RISK_REDUCTION_STEP (module constant) represents 0.1% decrements from 1.0% down to 0.1% (e.g., 9 -> 0.9% ... 0.1%)
+        RISK_STEP_DIVISOR = 1000.0
+        base_risk_steps = [self.risk_pct] + [
+            round(step / RISK_STEP_DIVISOR, 4) for step in range(MAX_RISK_REDUCTION_STEP, 0, -1)
         ]
+        # Deduplicate to avoid duplicate attempts when the configured risk matches a step value
+        risk_steps: list[float] = []
+        seen_steps: set[float] = set()
+        for step_val in base_risk_steps:
+            if step_val not in seen_steps:
+                risk_steps.append(step_val)
+                seen_steps.add(step_val)
+        risk_steps.sort(reverse=True)
         total_steps = len(risk_steps)
+        min_risk_pct = risk_steps[-1] if risk_steps else 0.0
+        last_qty = 0.0
+        last_risk = self.risk_pct
 
-        for idx, risk_pct in enumerate(risk_steps, start=1):
+        def _log_final_skip() -> None:
+            self.logger.error(
+                "FINAL SKIP: Even %.1f%% risk + max leverage not possible for %s – position limits too tight",
+                min_risk_pct * 100,
+                symbol,
+            )
+
+        for idx, risk_pct in enumerate(risk_steps):
+            attempt_num = idx + 1
             qty, notional = _calc_qty(risk_pct)
-            expected_margin = notional / max_leverage if max_leverage else notional
+            last_qty = qty
+            last_risk = risk_pct
+            expected_margin = notional / planned_leverage if planned_leverage > 0 else notional
             self.logger.info(
                 "[ORDER_ATTEMPT #%d] %s %s | target risk=%.1f%% used risk=%.1f%% | "
                 "leverage=%dx (%s) | notional=%.2f qty=%.6f SLdist=%.6f expected_margin=%.2f",
-                idx,
+                attempt_num,
                 direction.upper(),
                 symbol,
                 self.risk_pct * 100,
@@ -1070,18 +1111,14 @@ class PaperBot:
             )
 
             if _too_big(qty, notional):
-                if idx == total_steps:
-                    self.logger.error(
-                        "FINAL SKIP: Even 0.1%% risk + max leverage not possible for %s – position limits too tight",
-                        symbol,
-                    )
-                    return None, qty, risk_pct, max_leverage
+                if attempt_num == total_steps:
+                    _log_final_skip()
+                    return None, qty, risk_pct, planned_leverage
                 continue
 
-            target_leverage = max(1, int(max_leverage))
             try:
-                await self.exchange.set_leverage(target_leverage, symbol)
-                self.leverage = target_leverage
+                await self.exchange.set_leverage(planned_leverage, symbol)
+                self.leverage = planned_leverage
             except Exception as exc:
                 self.logger.warning(
                     "set_leverage failed for %s: %s (keeping %dx)",
@@ -1100,27 +1137,26 @@ class PaperBot:
                     direction.upper(),
                     symbol,
                     risk_pct * 100,
-                    target_leverage,
+                    planned_leverage,
                     leverage_source,
                     qty,
                     notional,
                     expected_margin,
                     order_id or "no-exchange",
                 )
-                return order_id, qty, risk_pct, target_leverage
+                return order_id, qty, risk_pct, planned_leverage
             except Exception as exc:
                 code, msg = _extract_code_msg(exc)
                 self.logger.error(
                     "[ORDER_ATTEMPT #%d FAILURE] %s %s | code=%s msg=%s",
-                    idx,
+                    attempt_num,
                     direction.upper(),
                     symbol,
                     code if code is not None else "unknown",
                     msg,
                 )
                 if _is_2027(code, msg):
-                    if idx < total_steps:
-                        next_risk = risk_steps[idx]
+                    if attempt_num < total_steps:
                         self.logger.error(
                             "[ORDER_RETRY] Failed with -2027 for %s %s | notional=%.2f | lev=%dx",
                             direction.upper(),
@@ -1131,17 +1167,15 @@ class PaperBot:
                         self.logger.warning(
                             "→ Reducing risk from %.1f%% to %.1f%% and retrying with max leverage",
                             risk_pct * 100,
-                            next_risk * 100,
+                            risk_steps[idx + 1] * 100,
                         )
                         continue
-                    self.logger.error(
-                        "FINAL SKIP: Even 0.1%% risk + max leverage not possible for %s – position limits too tight",
-                        symbol,
-                    )
-                    return None, qty, risk_pct, max_leverage
-                return None, qty, risk_pct, max_leverage
+                    _log_final_skip()
+                    return None, qty, risk_pct, planned_leverage
+                # Other failures are not retried; they are surfaced immediately
+                return None, qty, risk_pct, planned_leverage
 
-        return None, 0.0, self.risk_pct, max_leverage
+        return None, last_qty, last_risk, planned_leverage
 
     # ── Real testnet bracket order ────────────────────────────────
 
@@ -1158,8 +1192,8 @@ class PaperBot:
         Place a market entry plus separate reduceOnly SL/TP orders on the
         Binance Testnet via ``create_order``.
 
-        Returns the order ID on success. Raises on placement failures so the
-        caller can handle risk reduction or cleanup.
+        Returns the order ID on success. Raises Exceptions on placement failures so
+        the caller can handle risk reduction or cleanup.
         """
         if self.exchange is None:
             return None
