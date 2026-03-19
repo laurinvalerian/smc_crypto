@@ -47,7 +47,7 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +236,13 @@ WARMUP_TRADES = 100
 COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
 MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
+MIN_DYNAMIC_RISK_PCT = 0.0025  # 0.25 % floor for dynamic sizing
+MAX_DYNAMIC_RISK_PCT = 0.03    # 3.0 % cap for dynamic sizing
+RR_DIVISOR = 3.0               # RR contribution scaled down (RR / 3) to avoid aggressive sizing
+RR_CONTRIBUTION_CAP = 2.0      # RR contribution capped at +2.0 to bound boost from extreme RR setups
+EPSILON_SL_DIST = 1e-6         # Minimum SL distance tolerance to avoid divide-by-zero
+PRICE_TOLERANCE_FACTOR = 0.001
+MIN_PRICE_TOLERANCE = 1e-6
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
@@ -465,7 +472,11 @@ class PaperBot:
                     try:
                         parsed = datetime.fromisoformat(et)
                         if parsed.tzinfo is None:
+                            # Persisted timestamps are written in UTC; assume UTC if missing tzinfo.
                             parsed = parsed.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        if parsed > now + timedelta(days=1) or parsed < now - timedelta(days=3650):
+                            parsed = now
                         t["entry_time"] = parsed
                     except Exception:
                         t["entry_time"] = datetime.now(timezone.utc)
@@ -1037,12 +1048,16 @@ class PaperBot:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
         # === FIX 2026-03-19: fetch_leverage_bracket unified + -4005 retry + target risk logging ===
-        rr = tp_dist / sl_dist if sl_dist > 0 else 0.0
+        # === DYNAMIC RISK ===
+        # Smooth sizing: base 0.5× + score*2 + RR/3, clamped to 0.25–3.0 %.
+        # Calibrated so a neutral score with RR≈3 keeps base risk, while strong confluence
+        # plus high RR can scale up without exceeding a 3 % safety cap.
+        rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
         score_factor = score * 2.0
-        rr_factor = min(rr / 3.0, 2.0)
+        rr_factor = min(rr / RR_DIVISOR, RR_CONTRIBUTION_CAP)  # Cap RR contribution to avoid excessive sizing on extreme RR
         dynamic_risk = base_risk * (0.5 + score_factor + rr_factor)
-        dynamic_risk = max(0.0025, min(dynamic_risk, 0.03))
+        dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
             "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%)",
             score,
@@ -1076,21 +1091,25 @@ class PaperBot:
                 exc,
             )
 
-        if not got_bracket:
+        if not got_bracket and market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
             try:
                 raw_brackets = await self.exchange.fapiPrivateGetLeverageBracket({"symbol": market_id})
                 if raw_brackets:
                     tiers = raw_brackets if isinstance(raw_brackets, list) else raw_brackets.get("brackets", [])
-                    max_leverage = max(
+                    lev_values = [
                         int(t.get("initialLeverage", 20)) for t in tiers if isinstance(t, dict)
-                    )
-                    leverage_source = "fapiPrivateGetLeverageBracket"
-                    got_bracket = True
+                    ]
+                    if lev_values:
+                        max_leverage = max(lev_values)
+                        leverage_source = "fapiPrivateGetLeverageBracket"
+                        got_bracket = True
             except Exception as exc:
+                fallback_code = getattr(exc, "code", None)
                 self.logger.warning(
-                    "fapiPrivateGetLeverageBracket failed for %s (market_id=%s): %s",
+                    "fapiPrivateGetLeverageBracket failed for %s (market_id=%s, code=%s): %s",
                     symbol,
                     market_id,
+                    fallback_code if fallback_code is not None else "unknown",
                     exc,
                 )
 
@@ -1179,18 +1198,18 @@ class PaperBot:
         # === ROBUST RISK REDUCTION LOGIC ===
         # MAX_RISK_REDUCTION_STEP (module constant) represents 0.1% decrements from 1.0% down to 0.1% (e.g., 9 -> 0.9% ... 0.1%)
         RISK_STEP_DIVISOR = 1000.0
-        base_risk_steps = [dynamic_risk] + [
-            min(dynamic_risk, max(round(step / RISK_STEP_DIVISOR, 4), 0.0025))
-            for step in range(MAX_RISK_REDUCTION_STEP, 0, -1)
-        ]
-        # Deduplicate to avoid duplicate attempts when the configured risk matches a step value
-        risk_steps: list[float] = []
-        seen_steps: set[float] = set()
-        for step_val in base_risk_steps:
-            if step_val not in seen_steps:
-                risk_steps.append(step_val)
-                seen_steps.add(step_val)
-        risk_steps.sort(reverse=True)
+        # Build descending risk steps: start at dynamic_risk, then step down in 0.1% increments,
+        # never exceeding dynamic_risk and never dropping below the configured floor.
+        base_risk_steps = [dynamic_risk]
+        seen_steps = {dynamic_risk}
+        for step in range(MAX_RISK_REDUCTION_STEP, 0, -1):
+            step_value = round(step / RISK_STEP_DIVISOR, 4)
+            clamped_step = min(dynamic_risk, max(step_value, MIN_DYNAMIC_RISK_PCT))
+            if clamped_step in seen_steps:
+                continue
+            base_risk_steps.append(clamped_step)
+            seen_steps.add(clamped_step)
+        risk_steps = sorted(base_risk_steps, reverse=True)
         total_steps = len(risk_steps)
         min_risk_pct = risk_steps[-1] if risk_steps else 0.0
         last_qty = 0.0
@@ -1898,28 +1917,37 @@ class LiveMultiBotRunner:
             # === LEVERAGE + CLEANUP ===
             sl_order_id = trade.get("sl_order_id")
             tp_order_id = trade.get("tp_order_id")
-            cancel_id: str | None = None
-            if sl_order_id and tp_order_id:
-                if abs(exit_price - sl) <= abs(exit_price - trade["tp"]):
-                    cancel_id = tp_order_id
+            cancel_targets: list[str] = []
+            if sl_order_id or tp_order_id:
+                tp_price = trade.get("tp", exit_price)
+                dist_sl = abs(exit_price - sl)
+                dist_tp = abs(exit_price - tp_price)
+                tol = max(MIN_PRICE_TOLERANCE, max(dist_sl, dist_tp) * PRICE_TOLERANCE_FACTOR)
+                if sl_order_id and tp_order_id:
+                    # If distances are effectively equal (manual close/liquidation), cancel both to avoid dangling orders.
+                    if abs(dist_sl - dist_tp) <= tol:
+                        cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
+                    elif dist_sl <= dist_tp:
+                        cancel_targets = [tp_order_id]
+                    else:
+                        cancel_targets = [sl_order_id]
                 else:
-                    cancel_id = sl_order_id
-            else:
-                cancel_id = tp_order_id or sl_order_id
+                    cancel_targets = [oid for oid in (tp_order_id, sl_order_id) if oid]
 
-            if cancel_id and self.exchange is not None:
-                try:
-                    await self.exchange.cancel_order(cancel_id, bot.symbol)
-                    bot.logger.info(
-                        "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
-                    )
-                except Exception as exc:
-                    bot.logger.warning(
-                        "Failed to cancel dangling order %s for %s: %s",
-                        cancel_id,
-                        bot.symbol,
-                        exc,
-                    )
+            if cancel_targets and self.exchange is not None:
+                for cancel_id in cancel_targets:
+                    try:
+                        await self.exchange.cancel_order(cancel_id, bot.symbol)
+                        bot.logger.info(
+                            "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
+                        )
+                    except Exception as exc:
+                        bot.logger.warning(
+                            "Failed to cancel dangling order %s for %s: %s",
+                            cancel_id,
+                            bot.symbol,
+                            exc,
+                        )
 
             outcome = "WIN" if net_pnl > 0 else "LOSS"
             bot.logger.info(
