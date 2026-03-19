@@ -223,7 +223,7 @@ FIXED_SMC_PARAMS: dict[str, Any] = {
 }
 
 # ── Fixed Money Management ────────────────────────────────────────
-FIXED_RISK_PCT = 0.01       # 1 % risk per trade
+FIXED_RISK_PCT = 0.0025     # 0.25 % risk per trade
 FIXED_RR_MIN = 2.5          # minimum 1:2.5 reward-to-risk
 FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
@@ -1047,42 +1047,44 @@ class PaperBot:
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
-        # === FIX 2026-03-19: fetch_leverage_bracket unified + -4005 retry + target risk logging ===
         # === DYNAMIC RISK ===
-        # Smooth sizing: base 0.5× + score*2 + RR/3, clamped to 0.25–3.0 %.
-        # Calibrated so a neutral score with RR≈3 keeps base risk, while strong confluence
-        # plus high RR can scale up without exceeding a 3 % safety cap.
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
-        score_factor = score * 2.0
-        rr_factor = min(rr / RR_DIVISOR, RR_CONTRIBUTION_CAP)  # Cap RR contribution to avoid excessive sizing on extreme RR
-        dynamic_risk = base_risk * (0.5 + score_factor + rr_factor)
+
+        # RR bands reflect incremental confidence at RR 3/6/9; score bands mirror alignment certainty 0.55/0.70/0.85.
+        rr_mult = self._step_mult(rr, [(9.0, 2.5), (6.0, 2.0), (3.0, 1.5)])
+        score_mult = self._step_mult(score, [(0.85, 2.5), (0.70, 2.0), (0.55, 1.5)])
+        dynamic_risk = base_risk * rr_mult * score_mult
         dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
-            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%)",
+            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) (RR_mult=%.1fx, score_mult=%.1fx)",
             score,
             rr,
             dynamic_risk * 100,
             base_risk * 100,
+            rr_mult,
+            score_mult,
         )
 
         if self.exchange is None:
             return None, None, None, 0.0, dynamic_risk, self.leverage
 
         ORIGINAL_RISK_PCT = dynamic_risk
+        # === LEVERAGE FIX ===
         max_leverage = 20
-        leverage_source = "market limits fallback"
+        leverage_source = "default"
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
         lev_max = None
-        got_bracket = False
         market_id = symbol.replace("/", "").replace(":", "")
+
+        leverage_options_with_source: list[tuple[int, str]] = []
 
         try:
             brackets = await self.exchange.fetch_leverage_bracket(symbol)
-            max_leverage = max(int(b.get("initialLeverage", 20)) for b in brackets)
-            leverage_source = "fetch_leverage_bracket (unified)"
-            got_bracket = True
+            vals = self._extract_initial_leverage(brackets, self.logger)
+            if vals:
+                leverage_options_with_source.append((max(vals), "fetch_leverage_bracket"))
         except Exception as exc:
             self.logger.warning(
                 "fetch_leverage_bracket failed for %s (market_id=%s): %s",
@@ -1091,18 +1093,12 @@ class PaperBot:
                 exc,
             )
 
-        if not got_bracket and market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
+        if market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
             try:
                 raw_brackets = await self.exchange.fapiPrivateGetLeverageBracket({"symbol": market_id})
-                if raw_brackets:
-                    tiers = raw_brackets if isinstance(raw_brackets, list) else raw_brackets.get("brackets", [])
-                    lev_values = [
-                        int(t.get("initialLeverage", 20)) for t in tiers if isinstance(t, dict)
-                    ]
-                    if lev_values:
-                        max_leverage = max(lev_values)
-                        leverage_source = "fapiPrivateGetLeverageBracket"
-                        got_bracket = True
+                vals = self._extract_initial_leverage(raw_brackets, self.logger)
+                if vals:
+                    leverage_options_with_source.append((max(vals), "fapiPrivateGetLeverageBracket"))
             except Exception as exc:
                 fallback_code = getattr(exc, "code", None)
                 self.logger.warning(
@@ -1132,8 +1128,18 @@ class PaperBot:
         except Exception as exc:
             self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
 
-        if not got_bracket and lev_max:
-            max_leverage = int(lev_max)
+        if lev_max:
+            try:
+                leverage_options_with_source.append((int(lev_max), "market limits"))
+            except Exception:
+                pass
+
+        used_default_leverage = False
+        if not leverage_options_with_source:
+            leverage_options_with_source.append((max_leverage, leverage_source))
+            used_default_leverage = True
+
+        max_leverage, leverage_source = max(leverage_options_with_source, key=lambda t: t[0])
 
         self.logger.info(
             "Max leverage for %s = %dx (source: %s)",
@@ -1141,6 +1147,8 @@ class PaperBot:
             max_leverage,
             leverage_source,
         )
+        if used_default_leverage:
+            self.logger.info("Using default leverage fallback %dx for %s", max_leverage, symbol)
 
         planned_leverage = max(1, int(max_leverage))
 
@@ -1466,6 +1474,66 @@ class PaperBot:
             tr = max(h - l, abs(h - pc), abs(l - pc))
             trs.append(tr)
         return float(np.mean(trs))
+
+    @staticmethod
+        def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
+        """
+        Return multiplier for *val* based on descending ``(threshold, multiplier)`` bands.
+
+        :param val: input value to compare against thresholds.
+        :param bands: list of (threshold, multiplier) sorted in descending threshold order; ordering is required for first-match semantics.
+        :returns: first matching multiplier or 1.0 when no threshold matches.
+        """
+        for threshold, mult in bands:
+            if val >= threshold:
+                return mult
+        return 1.0
+
+    @staticmethod
+    def _extract_initial_leverage(
+        brackets: Any,
+        logger: logging.Logger | None = None,
+        max_depth: int = 6,
+    ) -> list[int]:
+        """
+        Collect positive initialLeverage values from nested leverage bracket payloads.
+
+        :param brackets: dict or list structure containing leverage bracket data (may nest via ``brackets`` key).
+        :param logger: optional logger for debug parsing errors.
+        :param max_depth: recursion depth guard to avoid runaway nesting.
+        :returns: list of positive integer leverage values extracted.
+        """
+        values: list[int] = []
+        if max_depth <= 0:
+            return values
+        if isinstance(brackets, dict):
+            values.extend(PaperBot._extract_initial_leverage(brackets.get("brackets", []), logger, max_depth - 1))
+            if "initialLeverage" in brackets:
+                    raw_val = brackets.get("initialLeverage")
+                    if raw_val is not None:
+                        try:
+                            ival = int(raw_val)
+                            if ival > 0:
+                                values.append(ival)
+                        except Exception as exc:
+                            if logger:
+                                logger.debug("Failed to parse initialLeverage from bracket dict: %s", exc)
+        elif isinstance(brackets, list):
+            for item in brackets:
+                if isinstance(item, dict):
+                    if "initialLeverage" in item:
+                        raw_val = item.get("initialLeverage")
+                        if raw_val is not None:
+                            try:
+                                ival = int(raw_val)
+                                if ival > 0:
+                                    values.append(ival)
+                            except Exception as exc:
+                                if logger:
+                                    logger.debug("Failed to parse initialLeverage from bracket item: %s", exc)
+                                continue
+                    values.extend(PaperBot._extract_initial_leverage(item.get("brackets", []), logger, max_depth - 1))
+        return [v for v in values if v > 0]
 
     # ── Summary helpers ───────────────────────────────────────────
 
@@ -1914,25 +1982,10 @@ class LiveMultiBotRunner:
             if trade.get("rl_tracked"):
                 bot.brain.record_outcome(reward=pnl_pct, coin_id=bot.symbol, done=True)
 
-            # === LEVERAGE + CLEANUP ===
+            # === CLEANUP ===
             sl_order_id = trade.get("sl_order_id")
             tp_order_id = trade.get("tp_order_id")
-            cancel_targets: list[str] = []
-            if sl_order_id or tp_order_id:
-                tp_price = trade.get("tp", exit_price)
-                dist_sl = abs(exit_price - sl)
-                dist_tp = abs(exit_price - tp_price)
-                tol = max(MIN_PRICE_TOLERANCE, max(dist_sl, dist_tp) * PRICE_TOLERANCE_FACTOR)
-                if sl_order_id and tp_order_id:
-                    # If distances are effectively equal (manual close/liquidation), cancel both to avoid dangling orders.
-                    if abs(dist_sl - dist_tp) <= tol:
-                        cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
-                    elif dist_sl <= dist_tp:
-                        cancel_targets = [tp_order_id]
-                    else:
-                        cancel_targets = [sl_order_id]
-                else:
-                    cancel_targets = [oid for oid in (tp_order_id, sl_order_id) if oid]
+            cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
 
             if cancel_targets and self.exchange is not None:
                 for cancel_id in cancel_targets:
