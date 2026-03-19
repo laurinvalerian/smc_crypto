@@ -1051,6 +1051,7 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
 
+        # RR bands reflect incremental confidence at RR 3/6/9; score bands mirror alignment certainty 0.55/0.70/0.85.
         rr_mult = self._step_mult(rr, [(9.0, 2.5), (6.0, 2.0), (3.0, 1.5)])
         score_mult = self._step_mult(score, [(0.85, 2.5), (0.70, 2.0), (0.55, 1.5)])
         dynamic_risk = base_risk * rr_mult * score_mult
@@ -1473,18 +1474,37 @@ class PaperBot:
 
     @staticmethod
     def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
-        """Return multiplier for val based on descending (threshold, multiplier) bands."""
+        """
+        Return multiplier for *val* based on descending ``(threshold, multiplier)`` bands.
+
+        :param val: input value to compare against thresholds.
+        :param bands: list of (threshold, multiplier) sorted in descending threshold order.
+        :returns: first matching multiplier or 1.0 when no threshold matches.
+        """
         for threshold, mult in bands:
             if val >= threshold:
                 return mult
         return 1.0
 
     @staticmethod
-    def _extract_initial_leverage(brackets: Any, logger: logging.Logger | None = None) -> list[int]:
-        """Collect initialLeverage values from nested leverage bracket payloads."""
+    def _extract_initial_leverage(
+        brackets: Any,
+        logger: logging.Logger | None = None,
+        max_depth: int = 6,
+    ) -> list[int]:
+        """
+        Collect positive initialLeverage values from nested leverage bracket payloads.
+
+        :param brackets: dict or list structure containing leverage bracket data (may nest via ``brackets`` key).
+        :param logger: optional logger for debug parsing errors.
+        :param max_depth: recursion depth guard to avoid runaway nesting.
+        :returns: list of positive integer leverage values extracted.
+        """
         values: list[int] = []
+        if max_depth <= 0:
+            return values
         if isinstance(brackets, dict):
-            values.extend(PaperBot._extract_initial_leverage(brackets.get("brackets", []), logger))
+            values.extend(PaperBot._extract_initial_leverage(brackets.get("brackets", []), logger, max_depth - 1))
             if "initialLeverage" in brackets:
                 raw_val = brackets.get("initialLeverage")
                 if raw_val is not None:
@@ -1505,7 +1525,7 @@ class PaperBot:
                                 if logger:
                                     logger.debug("Failed to parse initialLeverage from bracket item: %s", exc)
                                 continue
-                    values.extend(PaperBot._extract_initial_leverage(item.get("brackets", []), logger))
+                    values.extend(PaperBot._extract_initial_leverage(item.get("brackets", []), logger, max_depth - 1))
         return [v for v in values if v > 0]
 
     # ── Summary helpers ───────────────────────────────────────────
