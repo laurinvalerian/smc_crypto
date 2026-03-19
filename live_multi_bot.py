@@ -1047,42 +1047,82 @@ class PaperBot:
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
-        # === FIX 2026-03-19: fetch_leverage_bracket unified + -4005 retry + target risk logging ===
         # === DYNAMIC RISK ===
-        # Smooth sizing: base 0.5× + score*2 + RR/3, clamped to 0.25–3.0 %.
-        # Calibrated so a neutral score with RR≈3 keeps base risk, while strong confluence
-        # plus high RR can scale up without exceeding a 3 % safety cap.
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
-        base_risk = FIXED_RISK_PCT
-        score_factor = score * 2.0
-        rr_factor = min(rr / RR_DIVISOR, RR_CONTRIBUTION_CAP)  # Cap RR contribution to avoid excessive sizing on extreme RR
-        dynamic_risk = base_risk * (0.5 + score_factor + rr_factor)
+        base_risk = min(FIXED_RISK_PCT, MIN_DYNAMIC_RISK_PCT)
+
+        def _rr_mult(val: float) -> float:
+            if val >= 9.0:
+                return 2.5
+            if val >= 6.0:
+                return 2.0
+            if val >= 3.0:
+                return 1.5
+            return 1.0
+
+        def _score_mult(val: float) -> float:
+            if val >= 0.85:
+                return 2.5
+            if val >= 0.70:
+                return 2.0
+            if val >= 0.55:
+                return 1.5
+            return 1.0
+
+        rr_mult = _rr_mult(rr)
+        score_mult = _score_mult(score)
+        dynamic_risk = base_risk * rr_mult * score_mult
         dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
-            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%)",
+            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) "
+            "(RR_mult=%.1fx, score_mult=%.1fx)",
             score,
             rr,
             dynamic_risk * 100,
             base_risk * 100,
+            rr_mult,
+            score_mult,
         )
 
         if self.exchange is None:
             return None, None, None, 0.0, dynamic_risk, self.leverage
 
         ORIGINAL_RISK_PCT = dynamic_risk
+        # === LEVERAGE FIX ===
         max_leverage = 20
         leverage_source = "market limits fallback"
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
         lev_max = None
-        got_bracket = False
         market_id = symbol.replace("/", "").replace(":", "")
+
+        def _extract_initial_leverage(brackets: Any) -> list[int]:
+            values: list[int] = []
+            if isinstance(brackets, dict):
+                values.extend(_extract_initial_leverage(brackets.get("brackets", [])))
+                if "initialLeverage" in brackets:
+                    try:
+                        values.append(int(brackets.get("initialLeverage") or 0))
+                    except Exception:
+                        pass
+            elif isinstance(brackets, list):
+                for item in brackets:
+                    if isinstance(item, dict):
+                        if "initialLeverage" in item:
+                            try:
+                                values.append(int(item.get("initialLeverage") or 0))
+                            except Exception:
+                                continue
+                        values.extend(_extract_initial_leverage(item.get("brackets", [])))
+            return [v for v in values if v > 0]
+
+        leverage_candidates: list[tuple[int, str]] = [(max_leverage, leverage_source)]
 
         try:
             brackets = await self.exchange.fetch_leverage_bracket(symbol)
-            max_leverage = max(int(b.get("initialLeverage", 20)) for b in brackets)
-            leverage_source = "fetch_leverage_bracket (unified)"
-            got_bracket = True
+            vals = _extract_initial_leverage(brackets)
+            if vals:
+                leverage_candidates.append((max(vals), "fetch_leverage_bracket"))
         except Exception as exc:
             self.logger.warning(
                 "fetch_leverage_bracket failed for %s (market_id=%s): %s",
@@ -1091,18 +1131,12 @@ class PaperBot:
                 exc,
             )
 
-        if not got_bracket and market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
+        if market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
             try:
                 raw_brackets = await self.exchange.fapiPrivateGetLeverageBracket({"symbol": market_id})
-                if raw_brackets:
-                    tiers = raw_brackets if isinstance(raw_brackets, list) else raw_brackets.get("brackets", [])
-                    lev_values = [
-                        int(t.get("initialLeverage", 20)) for t in tiers if isinstance(t, dict)
-                    ]
-                    if lev_values:
-                        max_leverage = max(lev_values)
-                        leverage_source = "fapiPrivateGetLeverageBracket"
-                        got_bracket = True
+                vals = _extract_initial_leverage(raw_brackets)
+                if vals:
+                    leverage_candidates.append((max(vals), "fapiPrivateGetLeverageBracket"))
             except Exception as exc:
                 fallback_code = getattr(exc, "code", None)
                 self.logger.warning(
@@ -1132,8 +1166,13 @@ class PaperBot:
         except Exception as exc:
             self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
 
-        if not got_bracket and lev_max:
-            max_leverage = int(lev_max)
+        if lev_max:
+            try:
+                leverage_candidates.append((int(lev_max), "market limits"))
+            except Exception:
+                pass
+
+        max_leverage, leverage_source = max(leverage_candidates, key=lambda t: t[0]) if leverage_candidates else (max_leverage, leverage_source)
 
         self.logger.info(
             "Max leverage for %s = %dx (source: %s)",
@@ -1914,25 +1953,10 @@ class LiveMultiBotRunner:
             if trade.get("rl_tracked"):
                 bot.brain.record_outcome(reward=pnl_pct, coin_id=bot.symbol, done=True)
 
-            # === LEVERAGE + CLEANUP ===
+            # === CLEANUP ===
             sl_order_id = trade.get("sl_order_id")
             tp_order_id = trade.get("tp_order_id")
-            cancel_targets: list[str] = []
-            if sl_order_id or tp_order_id:
-                tp_price = trade.get("tp", exit_price)
-                dist_sl = abs(exit_price - sl)
-                dist_tp = abs(exit_price - tp_price)
-                tol = max(MIN_PRICE_TOLERANCE, max(dist_sl, dist_tp) * PRICE_TOLERANCE_FACTOR)
-                if sl_order_id and tp_order_id:
-                    # If distances are effectively equal (manual close/liquidation), cancel both to avoid dangling orders.
-                    if abs(dist_sl - dist_tp) <= tol:
-                        cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
-                    elif dist_sl <= dist_tp:
-                        cancel_targets = [tp_order_id]
-                    else:
-                        cancel_targets = [sl_order_id]
-                else:
-                    cancel_targets = [oid for oid in (tp_order_id, sl_order_id) if oid]
+            cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
 
             if cancel_targets and self.exchange is not None:
                 for cancel_id in cancel_targets:
