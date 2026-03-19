@@ -223,7 +223,7 @@ FIXED_SMC_PARAMS: dict[str, Any] = {
 }
 
 # ── Fixed Money Management ────────────────────────────────────────
-FIXED_RISK_PCT = 0.01       # 1 % risk per trade
+FIXED_RISK_PCT = 0.0025     # 0.25 % risk per trade
 FIXED_RR_MIN = 2.5          # minimum 1:2.5 reward-to-risk
 FIXED_ATR_PERIOD = 14
 FIXED_EMA_FAST = 20
@@ -1049,9 +1049,10 @@ class PaperBot:
         """
         # === DYNAMIC RISK ===
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
-        base_risk = min(FIXED_RISK_PCT, MIN_DYNAMIC_RISK_PCT)
+        base_risk = FIXED_RISK_PCT
 
         def _rr_mult(val: float) -> float:
+            """Step RR multiplier: 1.0 <3, 1.5 [3,6), 2.0 [6,9), 2.5 ≥9."""
             if val >= 9.0:
                 return 2.5
             if val >= 6.0:
@@ -1061,6 +1062,7 @@ class PaperBot:
             return 1.0
 
         def _score_mult(val: float) -> float:
+            """Step score multiplier: 1.0 <0.55, 1.5 [0.55,0.70), 2.0 [0.70,0.85), 2.5 ≥0.85."""
             if val >= 0.85:
                 return 2.5
             if val >= 0.70:
@@ -1097,6 +1099,7 @@ class PaperBot:
         market_id = symbol.replace("/", "").replace(":", "")
 
         def _extract_initial_leverage(brackets: Any) -> list[int]:
+            """Collect initialLeverage values from nested leverage bracket payloads."""
             values: list[int] = []
             if isinstance(brackets, dict):
                 values.extend(_extract_initial_leverage(brackets.get("brackets", [])))
@@ -1172,7 +1175,8 @@ class PaperBot:
             except Exception:
                 pass
 
-        max_leverage, leverage_source = max(leverage_candidates, key=lambda t: t[0]) if leverage_candidates else (max_leverage, leverage_source)
+        if leverage_candidates:
+            max_leverage, leverage_source = max(leverage_candidates, key=lambda t: t[0])
 
         self.logger.info(
             "Max leverage for %s = %dx (source: %s)",
