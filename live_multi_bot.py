@@ -962,9 +962,11 @@ class PaperBot:
         Returns:
             tuple: (order_id, quantity, used_risk_pct, applied_leverage)
         """
+        # === FIX 2026-03-19: fetch_leverage_bracket unified + -4005 retry + target risk logging ===
         if self.exchange is None:
             return None, 0.0, self.risk_pct, self.leverage
 
+        ORIGINAL_RISK_PCT = FIXED_RISK_PCT
         max_leverage = 20
         leverage_source = "market limits fallback"
         max_qty_limit: float | None = None
@@ -972,6 +974,20 @@ class PaperBot:
         lev_max = None
         got_bracket = False
         market_id = symbol.replace("/", "").replace(":", "")
+
+        try:
+            brackets = await self.exchange.fetch_leverage_bracket(symbol)
+            max_leverage = max(int(b.get("initialLeverage", 20)) for b in brackets)
+            leverage_source = "fetch_leverage_bracket (unified)"
+            got_bracket = True
+        except Exception as exc:
+            self.logger.warning(
+                "fetch_leverage_bracket failed for %s (market_id=%s): %s",
+                symbol,
+                market_id,
+                exc,
+            )
+
         try:
             await self.exchange.load_markets()
             market = self.exchange.market(symbol)
@@ -991,30 +1007,7 @@ class PaperBot:
         except Exception as exc:
             self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
 
-        try:
-            brackets = await self.exchange.fapiPrivate_get_leverage_bracket({"symbol": market_id})
-            bracket_obj = brackets[0] if isinstance(brackets, list) else brackets
-            bracket_list = bracket_obj.get("brackets") if isinstance(bracket_obj, dict) else []
-            if bracket_list:
-                leverage_candidates = [
-                    float(b.get("initialLeverage"))
-                    for b in bracket_list
-                    if b.get("initialLeverage") is not None
-                ]
-                if leverage_candidates:
-                    max_leverage = int(max(leverage_candidates))
-                    got_bracket = True
-        except Exception as exc:
-            self.logger.warning(
-                "leverageBracket fetch failed for %s (market_id=%s): %s",
-                symbol,
-                market_id,
-                exc,
-            )
-
-        if got_bracket:
-            leverage_source = "leverageBracket API"
-        elif lev_max:
+        if not got_bracket and lev_max:
             max_leverage = int(lev_max)
 
         self.logger.info(
@@ -1051,16 +1044,31 @@ class PaperBot:
                 if isinstance(maybe_code, dict):
                     code = maybe_code.get("code", code)
                     msg = maybe_code.get("msg", msg)
+                elif isinstance(maybe_code, (int, str)):
+                    code = maybe_code
+            if hasattr(exc, "response"):
+                resp = getattr(exc, "response")
+                if isinstance(resp, dict):
+                    code = resp.get("code", code)
+                    msg = resp.get("msg", msg or resp.get("message", ""))
             return code, msg
 
-        def _is_2027(code: int | str | None, msg: str) -> bool:
-            msg_str = msg or ""
+        def _is_position_limit_error(code: int | str | None, msg: str) -> bool:
+            msg_str = (msg or "").lower()
             return (
                 code == -2027
                 or str(code) == "-2027"
                 or "-2027" in msg_str
-                or "Exceeded the maximum allowable position at current leverage" in msg_str
+                or code == -4005
+                or str(code) == "-4005"
+                or "quantity greater than max quantity" in msg_str
+                or "exceeded the maximum allowable position at current leverage" in msg_str
+                or ("position" in msg_str and "leverage" in msg_str)
             )
+
+        def _is_rate_limit_error(code: int | str | None, msg: str) -> bool:
+            msg_l = (msg or "").lower()
+            return code == -1000 or "429" in msg_l or "rate limit" in msg_l
 
         # === ROBUST RISK REDUCTION LOGIC ===
         # MAX_RISK_REDUCTION_STEP (module constant) represents 0.1% decrements from 1.0% down to 0.1% (e.g., 9 -> 0.9% ... 0.1%)
@@ -1100,7 +1108,7 @@ class PaperBot:
                 attempt_num,
                 direction.upper(),
                 symbol,
-                self.risk_pct * 100,
+                ORIGINAL_RISK_PCT * 100,
                 risk_pct * 100,
                 max_leverage,
                 leverage_source,
@@ -1127,53 +1135,58 @@ class PaperBot:
                     self.leverage,
                 )
 
-            try:
-                order_id = await self._place_bracket_order(
-                    symbol, direction, price, sl, tp, qty,
-                )
-                self.logger.info(
-                    "[ORDER_SUCCESS] %s %s | risk_used=%.1f%% leverage=%dx (%s) "
-                    "qty=%.6f notional=%.2f expected_margin=%.2f order=%s",
-                    direction.upper(),
-                    symbol,
-                    risk_pct * 100,
-                    planned_leverage,
-                    leverage_source,
-                    qty,
-                    notional,
-                    expected_margin,
-                    order_id or "no-exchange",
-                )
-                return order_id, qty, risk_pct, planned_leverage
-            except Exception as exc:
-                code, msg = _extract_code_msg(exc)
-                self.logger.error(
-                    "[ORDER_ATTEMPT #%d FAILURE] %s %s | code=%s msg=%s",
-                    attempt_num,
-                    direction.upper(),
-                    symbol,
-                    code if code is not None else "unknown",
-                    msg,
-                )
-                if _is_2027(code, msg):
-                    if attempt_num < total_steps:
-                        self.logger.error(
-                            "[ORDER_RETRY] Failed with -2027 for %s %s | notional=%.2f | lev=%dx",
-                            direction.upper(),
-                            symbol,
-                            notional,
-                            max_leverage,
-                        )
-                        self.logger.warning(
-                            "→ Reducing risk from %.1f%% to %.1f%% and retrying with max leverage",
-                            risk_pct * 100,
-                            risk_steps[idx + 1] * 100,
-                        )
+            rate_limit_retries = 0
+            while rate_limit_retries <= 2:
+                try:
+                    order_id = await self._place_bracket_order(
+                        symbol, direction, price, sl, tp, qty,
+                    )
+                    self.logger.info(
+                        "[ORDER_SUCCESS] %s %s | risk_used=%.1f%% leverage=%dx (%s) "
+                        "qty=%.6f notional=%.2f expected_margin=%.2f order=%s",
+                        direction.upper(),
+                        symbol,
+                        risk_pct * 100,
+                        planned_leverage,
+                        leverage_source,
+                        qty,
+                        notional,
+                        expected_margin,
+                        order_id or "no-exchange",
+                    )
+                    return order_id, qty, risk_pct, planned_leverage
+                except Exception as exc:
+                    code, msg = _extract_code_msg(exc)
+                    self.logger.error(
+                        "[ORDER_ATTEMPT #%d FAILURE] %s %s | code=%s msg=%s",
+                        attempt_num,
+                        direction.upper(),
+                        symbol,
+                        code if code is not None else "unknown",
+                        msg,
+                    )
+                    if _is_rate_limit_error(code, msg) and rate_limit_retries < 2:
+                        rate_limit_retries += 1
+                        await asyncio.sleep(0.5)
                         continue
-                    _log_final_skip()
+                    if _is_position_limit_error(code, msg):
+                        if attempt_num < total_steps:
+                            self.logger.error(
+                                "[ORDER_RETRY] Failed with position limit for %s %s | notional=%.2f | lev=%dx",
+                                direction.upper(),
+                                symbol,
+                                notional,
+                                max_leverage,
+                            )
+                            self.logger.warning(
+                                "→ Reducing risk from %.1f%% to %.1f%% and retrying with max leverage",
+                                risk_pct * 100,
+                                risk_steps[idx + 1] * 100,
+                            )
+                            break
+                        _log_final_skip()
+                        return None, qty, risk_pct, planned_leverage
                     return None, qty, risk_pct, planned_leverage
-                # Other failures are not retried; they are surfaced immediately
-                return None, qty, risk_pct, planned_leverage
 
         return None, last_qty, last_risk, planned_leverage
 
