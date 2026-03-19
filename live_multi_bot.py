@@ -1051,19 +1051,21 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
 
-        # RR bands reflect incremental confidence at RR 3/6/9; score bands mirror alignment certainty 0.55/0.70/0.85.
-        rr_mult = self._step_mult(rr, [(9.0, 2.5), (6.0, 2.0), (3.0, 1.5)])
-        score_mult = self._step_mult(score, [(0.85, 2.5), (0.70, 2.0), (0.55, 1.5)])
-        dynamic_risk = base_risk * rr_mult * score_mult
-        dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
+        rr_mult = self._step_mult(rr, [(9.0, 3.375), (6.0, 2.25), (3.0, 1.5)])
+        score_mult = self._step_mult(score, [(0.85, 3.375), (0.70, 2.25), (0.55, 1.5)])
+
+        def _fmt_mult(mult: float) -> str:
+            return f"{mult:.3f}".rstrip("0").rstrip(".")
+
+        final_risk = base_risk * rr_mult * score_mult
+        dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(final_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
-            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) (RR_mult=%.1fx, score_mult=%.1fx)",
+            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (RR_mult=%sx, score_mult=%sx)",
             score,
             rr,
             dynamic_risk * 100,
-            base_risk * 100,
-            rr_mult,
-            score_mult,
+            _fmt_mult(rr_mult),
+            _fmt_mult(score_mult),
         )
 
         if self.exchange is None:
@@ -1476,7 +1478,7 @@ class PaperBot:
         return float(np.mean(trs))
 
     @staticmethod
-        def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
+    def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
         """
         Return multiplier for *val* based on descending ``(threshold, multiplier)`` bands.
 
