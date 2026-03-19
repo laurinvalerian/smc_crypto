@@ -47,7 +47,7 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +236,13 @@ WARMUP_TRADES = 100
 COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
 MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
+MIN_DYNAMIC_RISK_PCT = 0.0025  # 0.25 % floor for dynamic sizing
+MAX_DYNAMIC_RISK_PCT = 0.03    # 3.0 % cap for dynamic sizing
+RR_DIVISOR = 3.0               # RR contribution scaled down (RR / 3) to avoid aggressive sizing
+RR_CONTRIBUTION_CAP = 2.0      # RR contribution capped at +2.0 to bound boost from extreme RR setups
+EPSILON_SL_DIST = 1e-6         # Minimum SL distance tolerance to avoid divide-by-zero
+PRICE_TOLERANCE_FACTOR = 0.001
+MIN_PRICE_TOLERANCE = 1e-6
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
@@ -365,6 +372,8 @@ class PaperBot:
 
         # Output
         output_dir.mkdir(parents=True, exist_ok=True)
+        # === PERSISTENCE ===
+        self._state_path = output_dir / f"{self.tag}_state.json"
         self._equity_path = output_dir / f"{self.tag}_equity.csv"
         self._init_equity_csv()
         self.logger = _make_logger(
@@ -383,6 +392,7 @@ class PaperBot:
         self.buffer_15m: pd.DataFrame = pd.DataFrame()
         self.buffer_5m: pd.DataFrame = pd.DataFrame()
         self._load_history()
+        self._load_state()
 
     # ── History loading (multi-TF buffers) ───────────────────────────
 
@@ -414,6 +424,74 @@ class PaperBot:
                 self.logger.warning(
                     "History load failed %s/%s: %s", self.symbol, tf, exc,
                 )
+
+    # === PERSISTENCE ===
+    def _save_state(self) -> None:
+        """Persist core bot state to JSON."""
+        try:
+            def _ser(trade: dict[str, Any]) -> dict[str, Any]:
+                d = dict(trade)
+                et = d.get("entry_time")
+                if isinstance(et, datetime):
+                    d["entry_time"] = et.isoformat()
+                return d
+
+            payload = {
+                "trades": self.trades,
+                "wins": self.wins,
+                "total_pnl": self.total_pnl,
+                "equity": self.equity,
+                "peak_equity": self.peak_equity,
+                "active_trades": [_ser(t) for t in self._active_trades],
+            }
+            with open(self._state_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+        except Exception as exc:
+            self.logger.warning("State save failed: %s", exc)
+
+    def _load_state(self) -> None:
+        """Load persisted bot state if present."""
+        if not self._state_path.exists():
+            return
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.trades = int(data.get("trades", self.trades))
+            self.wins = int(data.get("wins", self.wins))
+            self.total_pnl = float(data.get("total_pnl", self.total_pnl))
+            self.equity = float(data.get("equity", self.equity))
+            self.peak_equity = float(data.get("peak_equity", self.peak_equity))
+
+            active: list[dict[str, Any]] = []
+            for raw in data.get("active_trades", []):
+                if not isinstance(raw, dict):
+                    continue
+                t = dict(raw)
+                et = t.get("entry_time")
+                if isinstance(et, str):
+                    try:
+                        parsed = datetime.fromisoformat(et)
+                        if parsed.tzinfo is None:
+                            # Persisted timestamps are written in UTC; assume UTC if missing tzinfo.
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        if parsed > now + timedelta(days=1) or parsed < now - timedelta(days=3650):
+                            parsed = now
+                        t["entry_time"] = parsed
+                    except Exception:
+                        t["entry_time"] = datetime.now(timezone.utc)
+                active.append(t)
+            self._active_trades = active
+            self.logger.info(
+                "Restored state: trades=%d wins=%d pnl=%.2f equity=%.2f active=%d",
+                self.trades,
+                self.wins,
+                self.total_pnl,
+                self.equity,
+                len(self._active_trades),
+            )
+        except Exception as exc:
+            self.logger.warning("State load failed: %s", exc)
 
     # ── Multi-TF alignment score ──────────────────────────────────
 
@@ -895,10 +973,11 @@ class PaperBot:
             balance = self.equity  # fallback to tracked equity
 
         sl_dist = abs(price - sl)
+        tp_dist = abs(tp - price)
         if sl_dist <= 0:
             return
 
-        order_id, qty, risk_pct, used_leverage = (
+        order_id, sl_order_id, tp_order_id, qty, risk_pct, used_leverage = (
             await self._execute_bracket_order_with_risk_reduction(
                 symbol=symbol,
                 direction=direction,
@@ -907,6 +986,8 @@ class PaperBot:
                 tp=tp,
                 balance=balance,
                 sl_dist=sl_dist,
+                tp_dist=tp_dist,
+                score=score,
             )
         )
 
@@ -936,6 +1017,8 @@ class PaperBot:
             "entry_time": datetime.now(timezone.utc),
             "score": score,
             "order_id": order_id,
+            "sl_order_id": sl_order_id,
+            "tp_order_id": tp_order_id,
             "rl_tracked": rl_tracked,
         }
         self._active_trades.append(trade_info)
@@ -955,18 +1038,38 @@ class PaperBot:
         tp: float,
         balance: float,
         sl_dist: float,
-    ) -> tuple[str | None, float, float, int]:
+        tp_dist: float,
+        score: float,
+    ) -> tuple[str | None, str | None, str | None, float, float, int]:
         """
         Execute a bracket order with leverage-bracket lookup and risk reduction.
 
         Returns:
-            tuple: (order_id, quantity, used_risk_pct, applied_leverage)
+            tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
         # === FIX 2026-03-19: fetch_leverage_bracket unified + -4005 retry + target risk logging ===
-        if self.exchange is None:
-            return None, 0.0, self.risk_pct, self.leverage
+        # === DYNAMIC RISK ===
+        # Smooth sizing: base 0.5× + score*2 + RR/3, clamped to 0.25–3.0 %.
+        # Calibrated so a neutral score with RR≈3 keeps base risk, while strong confluence
+        # plus high RR can scale up without exceeding a 3 % safety cap.
+        rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
+        base_risk = FIXED_RISK_PCT
+        score_factor = score * 2.0
+        rr_factor = min(rr / RR_DIVISOR, RR_CONTRIBUTION_CAP)  # Cap RR contribution to avoid excessive sizing on extreme RR
+        dynamic_risk = base_risk * (0.5 + score_factor + rr_factor)
+        dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
+        self.logger.info(
+            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%)",
+            score,
+            rr,
+            dynamic_risk * 100,
+            base_risk * 100,
+        )
 
-        ORIGINAL_RISK_PCT = FIXED_RISK_PCT
+        if self.exchange is None:
+            return None, None, None, 0.0, dynamic_risk, self.leverage
+
+        ORIGINAL_RISK_PCT = dynamic_risk
         max_leverage = 20
         leverage_source = "market limits fallback"
         max_qty_limit: float | None = None
@@ -987,6 +1090,28 @@ class PaperBot:
                 market_id,
                 exc,
             )
+
+        if not got_bracket and market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
+            try:
+                raw_brackets = await self.exchange.fapiPrivateGetLeverageBracket({"symbol": market_id})
+                if raw_brackets:
+                    tiers = raw_brackets if isinstance(raw_brackets, list) else raw_brackets.get("brackets", [])
+                    lev_values = [
+                        int(t.get("initialLeverage", 20)) for t in tiers if isinstance(t, dict)
+                    ]
+                    if lev_values:
+                        max_leverage = max(lev_values)
+                        leverage_source = "fapiPrivateGetLeverageBracket"
+                        got_bracket = True
+            except Exception as exc:
+                fallback_code = getattr(exc, "code", None)
+                self.logger.warning(
+                    "fapiPrivateGetLeverageBracket failed for %s (market_id=%s, code=%s): %s",
+                    symbol,
+                    market_id,
+                    fallback_code if fallback_code is not None else "unknown",
+                    exc,
+                )
 
         try:
             await self.exchange.load_markets()
@@ -1073,17 +1198,18 @@ class PaperBot:
         # === ROBUST RISK REDUCTION LOGIC ===
         # MAX_RISK_REDUCTION_STEP (module constant) represents 0.1% decrements from 1.0% down to 0.1% (e.g., 9 -> 0.9% ... 0.1%)
         RISK_STEP_DIVISOR = 1000.0
-        base_risk_steps = [self.risk_pct] + [
-            round(step / RISK_STEP_DIVISOR, 4) for step in range(MAX_RISK_REDUCTION_STEP, 0, -1)
-        ]
-        # Deduplicate to avoid duplicate attempts when the configured risk matches a step value
-        risk_steps: list[float] = []
-        seen_steps: set[float] = set()
-        for step_val in base_risk_steps:
-            if step_val not in seen_steps:
-                risk_steps.append(step_val)
-                seen_steps.add(step_val)
-        risk_steps.sort(reverse=True)
+        # Build descending risk steps: start at dynamic_risk, then step down in 0.1% increments,
+        # never exceeding dynamic_risk and never dropping below the configured floor.
+        base_risk_steps = [dynamic_risk]
+        seen_steps = {dynamic_risk}
+        for step in range(MAX_RISK_REDUCTION_STEP, 0, -1):
+            step_value = round(step / RISK_STEP_DIVISOR, 4)
+            clamped_step = min(dynamic_risk, max(step_value, MIN_DYNAMIC_RISK_PCT))
+            if clamped_step in seen_steps:
+                continue
+            base_risk_steps.append(clamped_step)
+            seen_steps.add(clamped_step)
+        risk_steps = sorted(base_risk_steps, reverse=True)
         total_steps = len(risk_steps)
         min_risk_pct = risk_steps[-1] if risk_steps else 0.0
         last_qty = 0.0
@@ -1121,7 +1247,7 @@ class PaperBot:
             if _too_big(qty, notional):
                 if attempt_num == total_steps:
                     _log_final_skip()
-                    return None, qty, risk_pct, planned_leverage
+                    return None, None, None, qty, risk_pct, planned_leverage
                 continue
 
             try:
@@ -1138,7 +1264,7 @@ class PaperBot:
             rate_limit_retries = 0
             while rate_limit_retries <= 2:
                 try:
-                    order_id = await self._place_bracket_order(
+                    order_id, sl_order_id, tp_order_id = await self._place_bracket_order(
                         symbol, direction, price, sl, tp, qty,
                     )
                     self.logger.info(
@@ -1154,7 +1280,14 @@ class PaperBot:
                         expected_margin,
                         order_id or "no-exchange",
                     )
-                    return order_id, qty, risk_pct, planned_leverage
+                    return (
+                        order_id,
+                        sl_order_id,
+                        tp_order_id,
+                        qty,
+                        risk_pct,
+                        planned_leverage,
+                    )
                 except Exception as exc:
                     code, msg = _extract_code_msg(exc)
                     self.logger.error(
@@ -1185,10 +1318,10 @@ class PaperBot:
                             )
                             break
                         _log_final_skip()
-                        return None, qty, risk_pct, planned_leverage
-                    return None, qty, risk_pct, planned_leverage
+                        return None, None, None, qty, risk_pct, planned_leverage
+                    return None, None, None, qty, risk_pct, planned_leverage
 
-        return None, last_qty, last_risk, planned_leverage
+        return None, None, None, last_qty, last_risk, planned_leverage
 
     # ── Real testnet bracket order ────────────────────────────────
 
@@ -1200,16 +1333,16 @@ class PaperBot:
         sl: float,
         tp: float,
         qty: float,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None, str | None]:
         """
         Place a market entry plus separate reduceOnly SL/TP orders on the
         Binance Testnet via ``create_order``.
 
-        Returns the order ID on success. Raises Exceptions on placement failures so
+        Returns (entry_id, sl_order_id, tp_order_id). Raises Exceptions on placement failures so
         the caller can handle risk reduction or cleanup.
         """
         if self.exchange is None:
-            return None
+            return None, None, None
 
         side = "buy" if direction == "long" else "sell"
         exit_side = "sell" if direction == "long" else "buy"
@@ -1301,7 +1434,7 @@ class PaperBot:
             await _close_position("TP placement failure")
             raise
 
-        return entry_id
+        return entry_id, sl_order_id, tp_order.get("id")
 
     # ── Fetch real testnet balance ────────────────────────────────
 
@@ -1781,6 +1914,41 @@ class LiveMultiBotRunner:
             if trade.get("rl_tracked"):
                 bot.brain.record_outcome(reward=pnl_pct, coin_id=bot.symbol, done=True)
 
+            # === LEVERAGE + CLEANUP ===
+            sl_order_id = trade.get("sl_order_id")
+            tp_order_id = trade.get("tp_order_id")
+            cancel_targets: list[str] = []
+            if sl_order_id or tp_order_id:
+                tp_price = trade.get("tp", exit_price)
+                dist_sl = abs(exit_price - sl)
+                dist_tp = abs(exit_price - tp_price)
+                tol = max(MIN_PRICE_TOLERANCE, max(dist_sl, dist_tp) * PRICE_TOLERANCE_FACTOR)
+                if sl_order_id and tp_order_id:
+                    # If distances are effectively equal (manual close/liquidation), cancel both to avoid dangling orders.
+                    if abs(dist_sl - dist_tp) <= tol:
+                        cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
+                    elif dist_sl <= dist_tp:
+                        cancel_targets = [tp_order_id]
+                    else:
+                        cancel_targets = [sl_order_id]
+                else:
+                    cancel_targets = [oid for oid in (tp_order_id, sl_order_id) if oid]
+
+            if cancel_targets and self.exchange is not None:
+                for cancel_id in cancel_targets:
+                    try:
+                        await self.exchange.cancel_order(cancel_id, bot.symbol)
+                        bot.logger.info(
+                            "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
+                        )
+                    except Exception as exc:
+                        bot.logger.warning(
+                            "Failed to cancel dangling order %s for %s: %s",
+                            cancel_id,
+                            bot.symbol,
+                            exc,
+                        )
+
             outcome = "WIN" if net_pnl > 0 else "LOSS"
             bot.logger.info(
                 "CLOSE %s %s %s @ %.6f → %.6f | pnl=%.2f equity=%.2f",
@@ -1792,6 +1960,7 @@ class LiveMultiBotRunner:
                 net_pnl,
                 bot.equity,
             )
+            bot._save_state()
 
         while not self._shutdown.is_set():
             try:
@@ -2007,6 +2176,11 @@ class LiveMultiBotRunner:
         final_equity = await self._fetch_real_total_equity()
         for b in self.bots:
             b._account_equity = final_equity
+            # === PERSISTENCE ===
+            try:
+                b._save_state()
+            except Exception:
+                pass
 
         # Close exchange WebSocket connections
         try:
@@ -2042,6 +2216,12 @@ class LiveMultiBotRunner:
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
+        # === PERSISTENCE ===
+        for b in self.bots:
+            try:
+                b._save_state()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════
