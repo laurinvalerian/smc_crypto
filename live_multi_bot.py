@@ -1057,8 +1057,7 @@ class PaperBot:
         dynamic_risk = base_risk * rr_mult * score_mult
         dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
-            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) "
-            "(RR_mult=%.1fx, score_mult=%.1fx)",
+            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) (RR_mult=%.1fx, score_mult=%.1fx)",
             score,
             rr,
             dynamic_risk * 100,
@@ -1135,8 +1134,10 @@ class PaperBot:
             except Exception:
                 pass
 
+        used_default_leverage = False
         if not leverage_options_with_source:
             leverage_options_with_source.append((max_leverage, leverage_source))
+            used_default_leverage = True
 
         max_leverage, leverage_source = max(leverage_options_with_source, key=lambda t: t[0])
 
@@ -1146,6 +1147,8 @@ class PaperBot:
             max_leverage,
             leverage_source,
         )
+        if used_default_leverage:
+            self.logger.info("Using default leverage fallback %dx for %s", max_leverage, symbol)
 
         planned_leverage = max(1, int(max_leverage))
 
@@ -1473,12 +1476,12 @@ class PaperBot:
         return float(np.mean(trs))
 
     @staticmethod
-    def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
+        def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
         """
         Return multiplier for *val* based on descending ``(threshold, multiplier)`` bands.
 
         :param val: input value to compare against thresholds.
-        :param bands: list of (threshold, multiplier) sorted in descending threshold order.
+        :param bands: list of (threshold, multiplier) sorted in descending threshold order; ordering is required for first-match semantics.
         :returns: first matching multiplier or 1.0 when no threshold matches.
         """
         for threshold, mult in bands:
@@ -1506,13 +1509,15 @@ class PaperBot:
         if isinstance(brackets, dict):
             values.extend(PaperBot._extract_initial_leverage(brackets.get("brackets", []), logger, max_depth - 1))
             if "initialLeverage" in brackets:
-                raw_val = brackets.get("initialLeverage")
-                if raw_val is not None:
-                    try:
-                        values.append(int(raw_val))
-                    except Exception as exc:
-                        if logger:
-                            logger.debug("Failed to parse initialLeverage from bracket dict: %s", exc)
+                    raw_val = brackets.get("initialLeverage")
+                    if raw_val is not None:
+                        try:
+                            ival = int(raw_val)
+                            if ival > 0:
+                                values.append(ival)
+                        except Exception as exc:
+                            if logger:
+                                logger.debug("Failed to parse initialLeverage from bracket dict: %s", exc)
         elif isinstance(brackets, list):
             for item in brackets:
                 if isinstance(item, dict):
@@ -1520,7 +1525,9 @@ class PaperBot:
                         raw_val = item.get("initialLeverage")
                         if raw_val is not None:
                             try:
-                                values.append(int(raw_val))
+                                ival = int(raw_val)
+                                if ival > 0:
+                                    values.append(ival)
                             except Exception as exc:
                                 if logger:
                                     logger.debug("Failed to parse initialLeverage from bracket item: %s", exc)
