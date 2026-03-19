@@ -1051,28 +1051,15 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
 
-        def _rr_mult(val: float) -> float:
-            """Step RR multiplier: 1.0 <3, 1.5 [3,6), 2.0 [6,9), 2.5 ≥9."""
-            if val >= 9.0:
-                return 2.5
-            if val >= 6.0:
-                return 2.0
-            if val >= 3.0:
-                return 1.5
+        def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
+            """Return multiplier for val based on descending (threshold, multiplier) bands."""
+            for threshold, mult in bands:
+                if val >= threshold:
+                    return mult
             return 1.0
 
-        def _score_mult(val: float) -> float:
-            """Step score multiplier: 1.0 <0.55, 1.5 [0.55,0.70), 2.0 [0.70,0.85), 2.5 ≥0.85."""
-            if val >= 0.85:
-                return 2.5
-            if val >= 0.70:
-                return 2.0
-            if val >= 0.55:
-                return 1.5
-            return 1.0
-
-        rr_mult = _rr_mult(rr)
-        score_mult = _score_mult(score)
+        rr_mult = _step_mult(rr, [(9.0, 2.5), (6.0, 2.0), (3.0, 1.5)])
+        score_mult = _step_mult(score, [(0.85, 2.5), (0.70, 2.0), (0.55, 1.5)])
         dynamic_risk = base_risk * rr_mult * score_mult
         dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
@@ -1106,15 +1093,16 @@ class PaperBot:
                 if "initialLeverage" in brackets:
                     try:
                         values.append(int(brackets.get("initialLeverage") or 0))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self.logger.debug("Failed to parse initialLeverage from bracket dict: %s", exc)
             elif isinstance(brackets, list):
                 for item in brackets:
                     if isinstance(item, dict):
                         if "initialLeverage" in item:
                             try:
                                 values.append(int(item.get("initialLeverage") or 0))
-                            except Exception:
+                            except Exception as exc:
+                                self.logger.debug("Failed to parse initialLeverage from bracket item: %s", exc)
                                 continue
                         values.extend(_extract_initial_leverage(item.get("brackets", [])))
             return [v for v in values if v > 0]
