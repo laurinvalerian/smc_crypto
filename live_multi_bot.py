@@ -1051,15 +1051,8 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
 
-        def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
-            """Return multiplier for val based on descending (threshold, multiplier) bands."""
-            for threshold, mult in bands:
-                if val >= threshold:
-                    return mult
-            return 1.0
-
-        rr_mult = _step_mult(rr, [(9.0, 2.5), (6.0, 2.0), (3.0, 1.5)])
-        score_mult = _step_mult(score, [(0.85, 2.5), (0.70, 2.0), (0.55, 1.5)])
+        rr_mult = self._step_mult(rr, [(9.0, 2.5), (6.0, 2.0), (3.0, 1.5)])
+        score_mult = self._step_mult(score, [(0.85, 2.5), (0.70, 2.0), (0.55, 1.5)])
         dynamic_risk = base_risk * rr_mult * score_mult
         dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(dynamic_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
@@ -1085,39 +1078,13 @@ class PaperBot:
         lev_max = None
         market_id = symbol.replace("/", "").replace(":", "")
 
-        def _extract_initial_leverage(brackets: Any) -> list[int]:
-            """Collect initialLeverage values from nested leverage bracket payloads."""
-            values: list[int] = []
-            if isinstance(brackets, dict):
-                values.extend(_extract_initial_leverage(brackets.get("brackets", [])))
-                if "initialLeverage" in brackets:
-                    raw_val = brackets.get("initialLeverage")
-                    if raw_val is not None:
-                        try:
-                            values.append(int(raw_val))
-                        except Exception as exc:
-                            self.logger.debug("Failed to parse initialLeverage from bracket dict: %s", exc)
-            elif isinstance(brackets, list):
-                for item in brackets:
-                    if isinstance(item, dict):
-                        if "initialLeverage" in item:
-                            raw_val = item.get("initialLeverage")
-                            if raw_val is not None:
-                                try:
-                                    values.append(int(raw_val))
-                                except Exception as exc:
-                                    self.logger.debug("Failed to parse initialLeverage from bracket item: %s", exc)
-                                    continue
-                        values.extend(_extract_initial_leverage(item.get("brackets", [])))
-            return [v for v in values if v > 0]
-
-        leverage_candidates: list[tuple[int, str]] = []
+        leverage_options_with_source: list[tuple[int, str]] = []
 
         try:
             brackets = await self.exchange.fetch_leverage_bracket(symbol)
-            vals = _extract_initial_leverage(brackets)
+            vals = self._extract_initial_leverage(brackets, self.logger)
             if vals:
-                leverage_candidates.append((max(vals), "fetch_leverage_bracket"))
+                leverage_options_with_source.append((max(vals), "fetch_leverage_bracket"))
         except Exception as exc:
             self.logger.warning(
                 "fetch_leverage_bracket failed for %s (market_id=%s): %s",
@@ -1129,9 +1096,9 @@ class PaperBot:
         if market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
             try:
                 raw_brackets = await self.exchange.fapiPrivateGetLeverageBracket({"symbol": market_id})
-                vals = _extract_initial_leverage(raw_brackets)
+                vals = self._extract_initial_leverage(raw_brackets, self.logger)
                 if vals:
-                    leverage_candidates.append((max(vals), "fapiPrivateGetLeverageBracket"))
+                    leverage_options_with_source.append((max(vals), "fapiPrivateGetLeverageBracket"))
             except Exception as exc:
                 fallback_code = getattr(exc, "code", None)
                 self.logger.warning(
@@ -1163,15 +1130,14 @@ class PaperBot:
 
         if lev_max:
             try:
-                leverage_candidates.append((int(lev_max), "market limits"))
+                leverage_options_with_source.append((int(lev_max), "market limits"))
             except Exception:
                 pass
 
-        if not leverage_candidates:
-            leverage_candidates.append((max_leverage, leverage_source))
+        if not leverage_options_with_source:
+            leverage_options_with_source.append((max_leverage, leverage_source))
 
-        if leverage_candidates:
-            max_leverage, leverage_source = max(leverage_candidates, key=lambda t: t[0])
+        max_leverage, leverage_source = max(leverage_options_with_source, key=lambda t: t[0])
 
         self.logger.info(
             "Max leverage for %s = %dx (source: %s)",
@@ -1504,6 +1470,43 @@ class PaperBot:
             tr = max(h - l, abs(h - pc), abs(l - pc))
             trs.append(tr)
         return float(np.mean(trs))
+
+    @staticmethod
+    def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
+        """Return multiplier for val based on descending (threshold, multiplier) bands."""
+        for threshold, mult in bands:
+            if val >= threshold:
+                return mult
+        return 1.0
+
+    @staticmethod
+    def _extract_initial_leverage(brackets: Any, logger: logging.Logger | None = None) -> list[int]:
+        """Collect initialLeverage values from nested leverage bracket payloads."""
+        values: list[int] = []
+        if isinstance(brackets, dict):
+            values.extend(PaperBot._extract_initial_leverage(brackets.get("brackets", []), logger))
+            if "initialLeverage" in brackets:
+                raw_val = brackets.get("initialLeverage")
+                if raw_val is not None:
+                    try:
+                        values.append(int(raw_val))
+                    except Exception as exc:
+                        if logger:
+                            logger.debug("Failed to parse initialLeverage from bracket dict: %s", exc)
+        elif isinstance(brackets, list):
+            for item in brackets:
+                if isinstance(item, dict):
+                    if "initialLeverage" in item:
+                        raw_val = item.get("initialLeverage")
+                        if raw_val is not None:
+                            try:
+                                values.append(int(raw_val))
+                            except Exception as exc:
+                                if logger:
+                                    logger.debug("Failed to parse initialLeverage from bracket item: %s", exc)
+                                continue
+                    values.extend(PaperBot._extract_initial_leverage(item.get("brackets", []), logger))
+        return [v for v in values if v > 0]
 
     # ── Summary helpers ───────────────────────────────────────────
 
