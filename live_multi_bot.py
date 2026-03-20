@@ -360,6 +360,10 @@ class PaperBot:
         # Pending signal for real-time entry (set by on_candle, consumed by on_tick)
         self._pending_signal: dict[str, Any] | None = None
 
+        # Cooldown: minimum 2 h between entries on the same coin
+        self._last_entry_time: datetime | None = None
+        self._entry_cooldown = timedelta(hours=1)
+
         # Active exchange order ID (for bracket order tracking)
         self._active_order_id: str | None = None
 
@@ -847,6 +851,13 @@ class PaperBot:
             self._pending_signal = None
             return
 
+        # Cooldown: skip if last entry on this coin was < 2 h ago
+        if self._last_entry_time is not None:
+            elapsed = datetime.now(timezone.utc) - self._last_entry_time
+            if elapsed < self._entry_cooldown:
+                self._pending_signal = None
+                return
+
         # Volume filter: skip if current volume < 1.0× avg(20)
         volumes = [c["volume"] for c in buf[-20:]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
@@ -934,6 +945,11 @@ class PaperBot:
         if len(self._active_trades) >= 3:
             self._pending_signal = None
             return
+        if self._last_entry_time is not None:
+            elapsed = datetime.now(timezone.utc) - self._last_entry_time
+            if elapsed < self._entry_cooldown:
+                self._pending_signal = None
+                return
 
         # Check if price is inside the entry zone
         if not (sig["zone_low"] <= price <= sig["zone_high"]):
@@ -1024,6 +1040,7 @@ class PaperBot:
             "rl_trade_id": rl_trade_id,
         }
         self._active_trades.append(trade_info)
+        self._last_entry_time = datetime.now(timezone.utc)
         self.logger.info(
             "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f "
             "lev=%dx score=%.2f bal=%.2f order=%s",
@@ -2166,6 +2183,61 @@ class LiveMultiBotRunner:
                             bot.symbol,
                             exc,
                         )
+
+            # Belt-and-suspenders: fetch open orders and cancel any remaining
+            # reduce-only SL/TP orders whose stop price matches this trade.
+            # This catches zombie orders when ID-based cancels fail (e.g. the
+            # triggered order already filled and its ID was re-used, or the
+            # stored ID was wrong).
+            if self.exchange is not None:
+                try:
+                    open_orders = await self.exchange.fetch_open_orders(bot.symbol)
+                    trade_sl = trade.get("sl")
+                    trade_tp = trade.get("tp")
+                    for o in open_orders:
+                        o_id = str(o.get("id") or "")
+                        if not o_id:
+                            continue
+                        # Skip orders we already successfully cancelled above
+                        if o_id in cancel_targets:
+                            continue
+                        o_stop = float(
+                            o.get("stopPrice")
+                            or o.get("info", {}).get("stopPrice", 0)
+                            or 0
+                        )
+                        o_type = (o.get("type", "") or "").lower()
+                        is_exit_type = any(
+                            k in o_type for k in ("stop", "take_profit")
+                        )
+                        if not (is_exit_type and o_stop > 0):
+                            continue
+                        tol = max(
+                            abs(o_stop) * PRICE_TOLERANCE_FACTOR,
+                            MIN_PRICE_TOLERANCE,
+                        )
+                        price_matches = (
+                            (trade_sl and abs(o_stop - trade_sl) <= tol)
+                            or (trade_tp and abs(o_stop - trade_tp) <= tol)
+                        )
+                        if price_matches:
+                            try:
+                                await self.exchange.cancel_order(o_id, bot.symbol)
+                                bot.logger.info(
+                                    "Zombie order cancelled (price-match) %s"
+                                    " stopPrice=%.6f for %s",
+                                    o_id, o_stop, bot.symbol,
+                                )
+                            except Exception as ce:
+                                bot.logger.warning(
+                                    "Zombie cancel failed %s for %s: %s",
+                                    o_id, bot.symbol, ce,
+                                )
+                except Exception as exc:
+                    bot.logger.warning(
+                        "fetch_open_orders cleanup failed for %s: %s",
+                        bot.symbol, exc,
+                    )
 
             outcome = "WIN" if net_pnl > 0 else "LOSS"
             bot.logger.info(
