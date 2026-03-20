@@ -237,7 +237,7 @@ COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
 MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
 MIN_DYNAMIC_RISK_PCT = 0.0025  # 0.25 % floor for dynamic sizing
-MAX_DYNAMIC_RISK_PCT = 0.03    # 3.0 % cap for dynamic sizing
+MAX_DYNAMIC_RISK_PCT = 0.02    # 2.0 % cap for dynamic sizing
 RR_DIVISOR = 3.0               # RR contribution scaled down (RR / 3) to avoid aggressive sizing
 RR_CONTRIBUTION_CAP = 2.0      # RR contribution capped at +2.0 to bound boost from extreme RR setups
 EPSILON_SL_DIST = 1e-6         # Minimum SL distance tolerance to avoid divide-by-zero
@@ -1051,21 +1051,22 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
         base_risk = FIXED_RISK_PCT
 
-        rr_mult = self._step_mult(rr, [(9.0, 3.375), (6.0, 2.25), (3.0, 1.5)])
-        score_mult = self._step_mult(score, [(0.85, 3.375), (0.70, 2.25), (0.55, 1.5)])
+        # Max Multiplikator = 3.2 * 2.5 = 8.0 -> 0.25% * 8 = exakt 2.0% Max Risk
+        rr_mult = self._step_mult(rr, [(9.0, 3.2), (6.0, 2.0), (3.0, 1.5)])
+        score_mult = self._step_mult(score, [(0.85, 2.5), (0.70, 1.5), (0.55, 1.1)])
 
         def _fmt_mult(mult: float) -> str:
             return f"{mult:.3f}".rstrip("0").rstrip(".")
 
         final_risk = base_risk * rr_mult * score_mult
-        dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(final_risk, MAX_DYNAMIC_RISK_PCT))
         self.logger.info(
-            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (RR_mult=%sx, score_mult=%sx)",
+            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) (RR_mult=%.1fx, score_mult=%.1fx)",
             score,
             rr,
-            dynamic_risk * 100,
-            _fmt_mult(rr_mult),
-            _fmt_mult(score_mult),
+            final_risk * 100,
+            base_risk * 100,
+            rr_mult,
+            score_mult,
         )
 
         if self.exchange is None:
@@ -1073,7 +1074,7 @@ class PaperBot:
 
         ORIGINAL_RISK_PCT = dynamic_risk
         # === LEVERAGE FIX ===
-        max_leverage = 20
+        max_leverage = 10
         leverage_source = "default"
         max_qty_limit: float | None = None
         max_notional_limit: float | None = None
@@ -1314,22 +1315,25 @@ class PaperBot:
                         continue
                     if _is_position_limit_error(code, msg):
                         if attempt_num < total_steps:
+                            new_leverage = max(1, planned_leverage // 2)
                             self.logger.error(
                                 "[ORDER_RETRY] Failed with position limit for %s %s | notional=%.2f | lev=%dx",
                                 direction.upper(),
                                 symbol,
                                 notional,
-                                max_leverage,
+                                planned_leverage,
                             )
                             self.logger.warning(
-                                "→ Reducing risk from %.1f%% to %.1f%% and retrying with max leverage",
+                                "→ Reducing risk from %.1f%% to %.1f%% AND leverage from %dx to %dx",
                                 risk_pct * 100,
                                 risk_steps[idx + 1] * 100,
+                                planned_leverage,
+                                new_leverage,
                             )
+                            planned_leverage = new_leverage
                             break
                         _log_final_skip()
                         return None, None, None, qty, risk_pct, planned_leverage
-                    return None, None, None, qty, risk_pct, planned_leverage
 
         return None, None, None, last_qty, last_risk, planned_leverage
 
