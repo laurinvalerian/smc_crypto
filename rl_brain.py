@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 #  Constants
 # ═══════════════════════════════════════════════════════════════════
 
-BASE_OBS_DIM = 12      # market feature length (from extract_features)
+BASE_OBS_DIM = 16      # market feature length (from extract_features)
 OBS_DIM = BASE_OBS_DIM + 1  # +1 coin-id feature
 DEFAULT_COIN_FEATURE_DENOM = 100  # expected number of coins for normalisation
 HIDDEN_DIM = 64        # hidden layer size
@@ -61,10 +61,14 @@ def extract_features(
     candles: list[dict[str, Any]],
     alignment_score: float,
     direction: str,
+    setup_tier: str = "",
+    trade_style: str = "",
+    rr_ratio: float = 3.0,
+    daily_atr_pct: float = 0.01,
 ) -> np.ndarray:
     """
-    Build a 12-dim observation vector from the candle buffer and the
-    SMC alignment score / direction.
+    Build a 16-dim observation vector from the candle buffer, SMC
+    alignment score, direction, and setup classification.
 
     Features:
       0  alignment_score           [0, 1]
@@ -79,6 +83,10 @@ def extract_features(
       9  close_return_20           20-bar return
      10  high_low_range_norm       (H-L) / close  (current bar)
      11  rsi_14_normalised         RSI(14) scaled to [0, 1]
+     12  setup_tier_encoded        0.0=SPEC, 0.5=A, 1.0=AAA+
+     13  trade_style_encoded       0.0=scalp, 0.5=day, 1.0=swing
+     14  rr_ratio_normalised       RR / 10, clamped to [0, 1]
+     15  daily_atr_pct_normalised  daily ATR%, clamped to [0, 1]
     """
     n = len(candles)
     if n < 50:
@@ -116,6 +124,14 @@ def extract_features(
     # RSI(14)
     rsi = _rsi(closes, 14)
 
+    # Encode setup tier: SPEC=0.0, A=0.5, AAA+=1.0
+    tier_map = {"SPEC": 0.0, "A": 0.5, "AAA+": 1.0}
+    tier_val = tier_map.get(setup_tier, 0.5)
+
+    # Encode trade style: scalp=0.0, day=0.5, swing=1.0
+    style_map = {"scalp": 0.0, "day": 0.5, "swing": 1.0}
+    style_val = style_map.get(trade_style, 0.5)
+
     obs = np.array([
         alignment_score,
         1.0 if direction == "long" else -1.0,
@@ -123,12 +139,17 @@ def extract_features(
         (price - ema20) / price,
         (price - ema50) / price,
         1.0 if ema20 > ema50 else 0.0,
-        min(vol_ratio, 5.0),           # clamp extreme volume spikes
+        min(vol_ratio, 5.0),
         ret1,
         ret5,
         ret20,
         (highs[-1] - lows[-1]) / price,
         rsi / 100.0,
+        # New features for setup quality awareness
+        tier_val,
+        style_val,
+        min(rr_ratio / 10.0, 1.0),
+        min(daily_atr_pct * 10.0, 1.0),  # 10% daily ATR → 1.0
     ], dtype=np.float32)
 
     return obs

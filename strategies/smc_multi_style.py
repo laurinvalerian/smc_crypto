@@ -395,24 +395,60 @@ def _compute_alignment_score(
     entry_zone: dict | None,
     precision_trigger: bool,
     style_weight: float = 1.0,
+    *,
+    bias_strong: bool = False,
+    h4_confirms: bool = False,
+    h4_poi: bool = False,
+    h1_choch: bool = False,
+    volume_ok: bool = False,
 ) -> float:
     """
-    Combine top-down alignment signals into a 0–1 score.
-      • Daily bias present (1D)       → +0.25
-      • 1H structure confirms          → +0.25
-      • 15m entry zone exists          → +0.25
-      • 5m precision trigger active    → +0.25
-    Multiplied by *style_weight* and clamped to [0, 1].
+    Granular top-down alignment score (0–1).
+
+    Scoring breakdown (adds up to 1.0 maximum):
+      • Daily bias present (1D)       → +0.12
+      • Daily bias from BOS/CHoCH     → +0.08  (bonus for strong bias)
+      • 4H structure confirms          → +0.08
+      • 4H POI (OB/FVG) active        → +0.08
+      • 1H structure confirms          → +0.08
+      • 1H CHoCH detected             → +0.06  (stronger than BOS)
+      • 15m entry zone exists          → +0.15
+      • 5m precision trigger active    → +0.15
+      • 5m volume above average       → +0.10
+      • Style weight multiplier        → ×weight
+
+    Clamped to [0, 1].
     """
     score = 0.0
+
     if daily_bias in ("bullish", "bearish"):
-        score += 0.25
+        score += 0.12
+        if bias_strong:
+            score += 0.08
+    if h4_confirms:
+        score += 0.08
+    if h4_poi:
+        score += 0.08
     if h1_confirms:
-        score += 0.25
+        score += 0.08
+        if h1_choch:
+            score += 0.06
     if entry_zone is not None:
-        score += 0.25
+        score += 0.15
     if precision_trigger:
-        score += 0.25
+        score += 0.15
+    if volume_ok:
+        score += 0.10
+
+    # Backward compat: if using old 4-arg call and no new flags,
+    # fall back to roughly equivalent old scoring
+    old_style = (
+        not bias_strong and not h4_confirms and not h4_poi
+        and not h1_choch and not volume_ok
+    )
+    if old_style and score > 0:
+        # Boost to roughly match old 0.25-per-step scale
+        score = min(score * 1.3, 1.0)
 
     return min(score * style_weight, 1.0)
 
@@ -471,7 +507,7 @@ class SMCMultiStyleStrategy:
 
     def _load_all_timeframes(self, symbol: str) -> dict[str, pd.DataFrame]:
         """Load or resample all required timeframes from 1 m base."""
-        tfs_needed = {"1m", "5m", "15m", "1h", "1d"}
+        tfs_needed = {"1m", "5m", "15m", "1h", "4h", "1d"}
         frames: dict[str, pd.DataFrame] = {}
 
         # Try loading pre-saved Parquet for each TF

@@ -244,6 +244,68 @@ EPSILON_SL_DIST = 1e-6         # Minimum SL distance tolerance to avoid divide-b
 PRICE_TOLERANCE_FACTOR = 0.001
 MIN_PRICE_TOLERANCE = 1e-6
 
+# ── Volatility Filter ────────────────────────────────────────────
+# Coins with daily ATR below this % are too quiet for SMC
+# (noise dominates, structure is unreliable, stop-hunts are random)
+MIN_DAILY_ATR_PCT = 0.008    # 0.8% daily ATR minimum
+# 5m ATR floor – prevents entries where the per-bar range is too small
+# for SL/TP to be meaningful (spreads & slippage eat the edge)
+MIN_5M_ATR_PCT = 0.0012      # 0.12% per 5m bar minimum
+# Minimum absolute SL distance as multiple of ATR(14) on 5m
+# Ensures SL is placed beyond noise, not inside it
+MIN_SL_ATR_MULT = 1.5
+
+# ── Trade Style Configuration ────────────────────────────────────
+# Styles are STRICTLY separated – no mixing of entry/exit tactics
+STYLE_SCALP = "scalp"
+STYLE_DAY = "day"
+STYLE_SWING = "swing"
+
+STYLE_CONFIG: dict[str, dict[str, Any]] = {
+    STYLE_SCALP: {
+        "min_sl_pct": 0.002,    # 0.2% min SL
+        "max_sl_pct": 0.006,    # 0.6% max SL
+        "min_tp_pct": 0.004,    # 0.4% min TP
+        "max_tp_pct": 0.012,    # 1.2% max TP
+        "min_rr": 2.0,
+        "cooldown_minutes": 15,
+    },
+    STYLE_DAY: {
+        "min_sl_pct": 0.0035,   # 0.35% min SL
+        "max_sl_pct": 0.025,    # 2.5% max SL
+        "min_tp_pct": 0.008,    # 0.8% min TP
+        "max_tp_pct": 0.06,     # 6% max TP
+        "min_rr": 2.5,
+        "cooldown_minutes": 60,
+    },
+    STYLE_SWING: {
+        "min_sl_pct": 0.008,    # 0.8% min SL
+        "max_sl_pct": 0.05,     # 5% max SL
+        "min_tp_pct": 0.02,     # 2% min TP
+        "max_tp_pct": 0.15,     # 15% max TP
+        "min_rr": 3.0,
+        "cooldown_minutes": 240,
+    },
+}
+
+# ── Setup Quality Tiers ─────────────────────────────────────────
+# 80% capital in AAA+, 15% in A, 5% in SPEC
+TIER_AAA_PLUS = "AAA+"
+TIER_A = "A"
+TIER_SPECULATIVE = "SPEC"
+
+TIER_THRESHOLDS: dict[str, dict[str, float]] = {
+    TIER_AAA_PLUS: {"min_score": 0.78, "min_rr": 4.0},
+    TIER_A:        {"min_score": 0.58, "min_rr": 3.0},
+    TIER_SPECULATIVE: {"min_score": 0.40, "min_rr": 2.5},
+}
+
+TIER_RISK: dict[str, dict[str, float]] = {
+    TIER_AAA_PLUS:    {"base_risk": 0.006, "max_risk": 0.020},  # 0.6%–2.0%
+    TIER_A:           {"base_risk": 0.003, "max_risk": 0.008},  # 0.3%–0.8%
+    TIER_SPECULATIVE: {"base_risk": 0.001, "max_risk": 0.003},  # 0.1%–0.3%
+}
+
 # ── Shared sync exchange for history fetching (public endpoints) ──
 _history_exchange: Any = None
 
@@ -360,9 +422,14 @@ class PaperBot:
         # Pending signal for real-time entry (set by on_candle, consumed by on_tick)
         self._pending_signal: dict[str, Any] | None = None
 
-        # Cooldown: minimum 2 h between entries on the same coin
+        # Cooldown: dynamic per trade style
         self._last_entry_time: datetime | None = None
         self._entry_cooldown = timedelta(hours=1)
+        self._last_trade_style: str = STYLE_DAY
+
+        # Volatility cache (refreshed every candle)
+        self._daily_atr_pct: float = 0.0
+        self._5m_atr_pct: float = 0.0
 
         # Active exchange order ID (for bracket order tracking)
         self._active_order_id: str | None = None
@@ -501,67 +568,119 @@ class PaperBot:
 
     def _multi_tf_alignment_score(
         self, current_candle: dict[str, Any],
-    ) -> tuple[float, str]:
+    ) -> tuple[float, str, dict[str, Any]]:
         """
-        Multi-timeframe SMC alignment score.
+        Granular multi-timeframe SMC alignment score.
 
-        Flow:
-          1D + 4H → Bias   (BOS/CHoCH + EMA200 fallback)
-          1H + 15m → Structure
-          5m → Entry trigger  (FVG + Liquidity + Alignment)
+        Proper SMC top-down flow:
+          1D  → HTF bias + large liquidity zones       (0.20 max)
+          4H  → Strong OB / FVG as primary POI         (0.20 max)
+          1H  → Internal structure observation          (0.15 max)
+          15m → Entry zone / setup identification       (0.20 max)
+          5m  → Precision trigger for entry             (0.25 max)
 
-        Returns (score 0–1, direction "long" | "short").
+        Returns (score 0–1, direction, components_dict).
         """
         swing_len = self.swing_length
         fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
         ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
         liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
 
-        daily_bias = "neutral"
-        h4_confirms = False
-        h1_confirms = False
-        entry_zone = None
-        precision_trigger = False
+        # Components tracked for tier classification
+        comp: dict[str, Any] = {
+            "bias": False, "bias_strong": False,
+            "h4_confirms": False, "h4_poi": False,
+            "h1_confirms": False, "h1_choch": False,
+            "entry_zone": None, "zone_fresh": False,
+            "precision_trigger": False, "volume_ok": False,
+        }
 
-        # 1. Daily Bias from 1D (BOS/CHoCH + EMA200 fallback) ─────
+        daily_bias = "neutral"
+        score = 0.0
+
+        # ═══ STEP 1: Daily Bias (1D) – HTF direction ═════════════
+        # 0.15 for any bias, +0.05 bonus if from BOS/CHoCH (not EMA fallback)
         if len(self.buffer_1d) >= swing_len * 2:
             try:
                 ind_1d = compute_smc_indicators(
                     self.buffer_1d, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                # Full bias (BOS/CHoCH + EMA fallback)
                 running_bias = _precompute_running_bias(ind_1d, self.buffer_1d)
                 daily_bias = _bias_from_running(running_bias, len(self.buffer_1d))
+
+                if daily_bias != "neutral":
+                    score += 0.15
+                    comp["bias"] = True
+
+                    # Check if bias comes from BOS/CHoCH (stronger) vs EMA fallback
+                    pure_struct = _precompute_running_structure(ind_1d)
+                    pure_bias = _bias_from_running(pure_struct, len(self.buffer_1d))
+                    if pure_bias != "neutral" and pure_bias == daily_bias:
+                        score += 0.05
+                        comp["bias_strong"] = True
             except Exception as exc:
                 self.logger.debug("1D bias computation failed: %s", exc)
 
-        # 2. 4H Bias confirmation ─────────────────────────────────
-        if daily_bias != "neutral" and len(self.buffer_4h) >= swing_len * 2:
+        if daily_bias == "neutral":
+            direction = "long"  # placeholder
+            return 0.0, direction, comp
+
+        # ═══ STEP 2: 4H – Strong OB/FVG as primary POI ═══════════
+        # 0.10 for structure confirmation, +0.10 for active OB/FVG POI
+        if len(self.buffer_4h) >= swing_len * 2:
             try:
                 ind_4h = compute_smc_indicators(
                     self.buffer_4h, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                # Structure confirmation
                 running_4h = _precompute_running_structure(ind_4h)
-                h4_confirms = _structure_confirms_from_running(
-                    running_4h, daily_bias, len(self.buffer_4h),
-                )
-            except Exception as exc:
-                self.logger.debug("4H structure computation failed: %s", exc)
+                if _structure_confirms_from_running(running_4h, daily_bias, len(self.buffer_4h)):
+                    score += 0.10
+                    comp["h4_confirms"] = True
 
-        # 3. 1H Structure confirmation ────────────────────────────
-        if daily_bias != "neutral" and len(self.buffer_1h) >= swing_len * 2:
+                # 4H POI: find active OB or FVG aligned with bias
+                price = float(self.buffer_4h["close"].iloc[-1])
+                h4_poi = self._find_poi_from_indicators(
+                    ind_4h, price, daily_bias, lookback_bars=10,
+                )
+                if h4_poi is not None:
+                    score += 0.10
+                    comp["h4_poi"] = True
+                    comp["h4_poi_data"] = h4_poi
+            except Exception as exc:
+                self.logger.debug("4H computation failed: %s", exc)
+
+        # ═══ STEP 3: 1H – Internal structure observation ═════════
+        # 0.10 for structure confirmation, +0.05 if latest signal is CHoCH
+        if len(self.buffer_1h) >= swing_len * 2:
             try:
                 ind_1h = compute_smc_indicators(
                     self.buffer_1h, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
                 running_1h = _precompute_running_structure(ind_1h)
-                h1_confirms = _structure_confirms_from_running(
-                    running_1h, daily_bias, len(self.buffer_1h),
-                )
+                if _structure_confirms_from_running(running_1h, daily_bias, len(self.buffer_1h)):
+                    score += 0.10
+                    comp["h1_confirms"] = True
+
+                # Check for CHoCH (stronger than BOS)
+                bos_choch_1h = ind_1h.get("bos_choch")
+                if bos_choch_1h is not None and not bos_choch_1h.empty:
+                    for i in range(len(bos_choch_1h) - 1, max(0, len(bos_choch_1h) - 4), -1):
+                        choch_val = bos_choch_1h["CHOCH"].iat[i]
+                        if pd.notna(choch_val) and choch_val != 0:
+                            choch_dir = "bullish" if choch_val > 0 else "bearish"
+                            if choch_dir == daily_bias:
+                                score += 0.05
+                                comp["h1_choch"] = True
+                            break
             except Exception as exc:
                 self.logger.debug("1H structure computation failed: %s", exc)
 
-        # 4. 15m Entry zone (FVG / OB) ────────────────────────────
-        if daily_bias != "neutral" and len(self.buffer_15m) >= swing_len * 2:
+        # ═══ STEP 4: 15m – Entry zone / setup identification ═════
+        # 0.15 for entry zone found, +0.05 if zone is fresh (last 6 bars)
+        entry_zone = None
+        if len(self.buffer_15m) >= swing_len * 2:
             try:
                 ind_15m = compute_smc_indicators(
                     self.buffer_15m, swing_len, fvg_thresh, ob_lookback, liq_range,
@@ -570,35 +689,47 @@ class PaperBot:
                     ind_15m, self.buffer_15m, daily_bias,
                     fvg_thresh, len(self.buffer_15m),
                 )
+                if entry_zone is not None:
+                    score += 0.15
+                    comp["entry_zone"] = entry_zone
+                    # Freshness: zone from last 4 bars (1 hour) is fresh
+                    comp["zone_fresh"] = True  # _find_entry_zone_at already limits to 6 bars
+                    score += 0.05
             except Exception as exc:
                 self.logger.debug("15m entry zone computation failed: %s", exc)
 
-        # 5. 5m Precision trigger (BOS/CHoCH) ─────────────────────
-        if daily_bias != "neutral" and len(self.buffer_5m) >= swing_len * 2:
+        # ═══ STEP 5: 5m – Precision trigger ══════════════════════
+        # 0.15 for BOS/CHoCH trigger, +0.10 for volume confirmation
+        if len(self.buffer_5m) >= swing_len * 2:
             try:
                 ind_5m = compute_smc_indicators(
                     self.buffer_5m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
                 bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m)
                 if len(bull_mask) > 0:
-                    if daily_bias == "bullish":
-                        precision_trigger = bool(bull_mask[-1])
-                    elif daily_bias == "bearish":
-                        precision_trigger = bool(bear_mask[-1])
+                    if daily_bias == "bullish" and bull_mask[-1]:
+                        score += 0.15
+                        comp["precision_trigger"] = True
+                    elif daily_bias == "bearish" and bear_mask[-1]:
+                        score += 0.15
+                        comp["precision_trigger"] = True
+
+                # Volume confirmation on 5m
+                if not self.buffer_5m.empty and len(self.buffer_5m) >= 21:
+                    vol_current = float(self.buffer_5m["volume"].iloc[-1])
+                    vol_avg = float(self.buffer_5m["volume"].iloc[-21:-1].mean())
+                    if vol_avg > 0 and vol_current >= vol_avg:
+                        score += 0.10
+                        comp["volume_ok"] = True
             except Exception as exc:
                 self.logger.debug("5m trigger computation failed: %s", exc)
 
-        # ── Combine into score (5 × 0.20 = 1.0 max) ─────────────
-        score = _compute_alignment_score(
-            daily_bias,
-            h4_confirms and h1_confirms,
-            entry_zone,
-            precision_trigger,
-            style_weight=FIXED_SMC_PARAMS.get("weight_day", 1.0),
-        )
+        # Apply style weight and clamp
+        weight = FIXED_SMC_PARAMS.get("weight_day", 1.0)
+        score = min(score * weight, 1.0)
 
         direction = "long" if daily_bias == "bullish" else "short"
-        return float(np.clip(score, 0.0, 1.0)), direction
+        return float(np.clip(score, 0.0, 1.0)), direction, comp
 
     # ── Equity CSV ────────────────────────────────────────────────
 
@@ -840,32 +971,46 @@ class PaperBot:
         candle: dict[str, Any],
     ) -> None:
         """
-        Evaluate multi-TF alignment + SMC SL/TP on the latest 5 m candle.
-
-        If all filters pass (alignment, RR ≥ 2.5), store a *pending
-        signal* that ``on_tick`` will consume for real-time entry once
-        the live price touches the entry zone. The RL gate runs in
-        ``on_tick`` just before placing the order.
+        Enhanced signal preparation with:
+        1. Volatility filter (skip coins with too little price movement)
+        2. Granular multi-TF alignment scoring
+        3. Style-aware SL/TP (scalp/day/swing – never mixed)
+        4. Setup quality tier classification (AAA+/A/SPEC)
+        5. ATR-based minimum SL distance (not just fixed %)
         """
         if len(self._active_trades) >= 3:
             self._pending_signal = None
             return
 
-        # Cooldown: skip if last entry on this coin was < 2 h ago
+        # ── Cooldown (dynamic per last trade style) ───────────────
         if self._last_entry_time is not None:
+            style_cfg = STYLE_CONFIG.get(self._last_trade_style, STYLE_CONFIG[STYLE_DAY])
+            cooldown = timedelta(minutes=style_cfg["cooldown_minutes"])
             elapsed = datetime.now(timezone.utc) - self._last_entry_time
-            if elapsed < self._entry_cooldown:
+            if elapsed < cooldown:
                 self._pending_signal = None
                 return
 
-        # Volume filter: skip if current volume < 1.0× avg(20)
+        # ── Volatility gate (skip coins with too little movement) ─
+        tradeable, daily_atr, fivem_atr = self._check_volatility()
+        if not tradeable:
+            self._pending_signal = None
+            self.logger.debug(
+                "VOLATILITY SKIP %s | daily_atr=%.4f%% (min %.4f%%) 5m_atr=%.4f%% (min %.4f%%)",
+                symbol, daily_atr * 100, MIN_DAILY_ATR_PCT * 100,
+                fivem_atr * 100, MIN_5M_ATR_PCT * 100,
+            )
+            return
+
+        # ── Volume filter ─────────────────────────────────────────
         volumes = [c["volume"] for c in buf[-20:]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
         if avg_vol > 0 and candle["volume"] < FIXED_MIN_VOL_MULT * avg_vol:
             self._pending_signal = None
             return
 
-        score, direction = self._multi_tf_alignment_score(candle)
+        # ── Multi-TF alignment score (granular) ───────────────────
+        score, direction, components = self._multi_tf_alignment_score(candle)
         if score < self.alignment_threshold:
             self._pending_signal = None
             return
@@ -875,57 +1020,123 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # ── Dynamic SMC SL/TP (Order Blocks + Liquidity + FVG) ────
+        # ── Initial SL/TP from 5m SMC (to classify trade style) ──
         sl_tp = self._find_smc_sl_tp(price, direction)
         if sl_tp is None:
             self._pending_signal = None
             return
-        sl, tp = sl_tp
+
+        initial_sl, initial_tp = sl_tp
+
+        # ── Classify trade style from natural SL/TP distances ─────
+        style = self._classify_trade_style(price, initial_sl, initial_tp)
+
+        # ── Re-compute SL/TP using style-appropriate timeframes ───
+        # This prevents mixing tactics (e.g. scalp SL with swing TP)
+        styled_sl_tp = self._find_smc_sl_tp_for_style(price, direction, style)
+        if styled_sl_tp is None:
+            self._pending_signal = None
+            return
+        sl, tp = styled_sl_tp
 
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
 
-        # Enforce minimum SL distance (0.35% of price); keep SMC level when wider
-        min_sl_dist = price * 0.0035
+        # ── ATR-based minimum SL distance (adaptive to volatility) ─
+        # Uses MAX of: fixed % floor, and ATR-multiple floor
+        # This ensures SL is beyond noise for THIS specific coin
+        atr_min_sl = fivem_atr * price * MIN_SL_ATR_MULT if fivem_atr > 0 else 0
+        style_cfg = STYLE_CONFIG[style]
+        pct_min_sl = price * style_cfg["min_sl_pct"]
+        min_sl_dist = max(atr_min_sl, pct_min_sl)
+
         if sl_dist < min_sl_dist:
             sl_dist = min_sl_dist
             sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
+
+        # ── Enforce maximum SL for style ──────────────────────────
+        max_sl_dist = price * style_cfg["max_sl_pct"]
+        if sl_dist > max_sl_dist:
+            self._pending_signal = None
+            self.logger.debug(
+                "SL TOO WIDE for %s style: %.4f%% > max %.4f%%",
+                style, sl_dist / price * 100, style_cfg["max_sl_pct"] * 100,
+            )
+            return
 
         if tp_dist <= 0:
             self._pending_signal = None
             return
 
-        # Dynamic RR – never trade below FIXED_RR_MIN (1:2.5)
-        rr = tp_dist / sl_dist
-        if rr < FIXED_RR_MIN:
+        # ── Enforce TP constraints for style ──────────────────────
+        tp_pct = tp_dist / price
+        if tp_pct < style_cfg["min_tp_pct"]:
+            self._pending_signal = None
+            return
+        if tp_pct > style_cfg["max_tp_pct"]:
+            # Clamp TP to max for this style
+            tp_dist = price * style_cfg["max_tp_pct"]
+            tp = (price + tp_dist) if direction == "long" else (price - tp_dist)
+
+        # ── RR check (style-specific minimum) ─────────────────────
+        rr = tp_dist / sl_dist if sl_dist > 0 else 0
+        if rr < style_cfg["min_rr"]:
             self._pending_signal = None
             return
 
-        # ── Compute entry zone from 15 m analysis ─────────────────
-        # Zone boundaries: for long, enter when price reaches SL side
-        # (pullback into zone); for short, enter when price rallies into zone.
+        # ── Setup quality tier classification ─────────────────────
+        tier = self._classify_setup_tier(score, rr, components)
+        if not tier:
+            self._pending_signal = None
+            self.logger.debug(
+                "NO TIER %s | score=%.2f RR=%.1f – setup quality too low",
+                symbol, score, rr,
+            )
+            return
+
+        # ── Final style constraint validation ─────────────────────
+        if not self._validate_style_constraints(style, price, sl, tp):
+            self._pending_signal = None
+            self.logger.debug(
+                "STYLE MISMATCH %s %s | SL/TP don't conform to %s constraints",
+                direction.upper(), symbol, style,
+            )
+            return
+
+        # ── Compute entry zone ────────────────────────────────────
         if direction == "long":
             zone_low = sl
-            zone_high = price  # enter between SL and current close
+            zone_high = price
         else:
             zone_low = price
             zone_high = sl
 
-        # Store pending signal – on_tick will trigger the actual entry
+        # ── Store pending signal with all classification data ─────
         self._pending_signal = {
             "symbol": symbol,
             "direction": direction,
             "sl": sl,
             "tp": tp,
+            "rr": rr,
             "score": score,
-            "obs": extract_features(buf, score, direction),
+            "style": style,
+            "tier": tier,
+            "components": components,
+            "daily_atr_pct": daily_atr,
+            "obs": extract_features(
+                buf, score, direction,
+                setup_tier=tier, trade_style=style,
+                rr_ratio=rr, daily_atr_pct=daily_atr,
+            ),
             "zone_low": zone_low,
             "zone_high": zone_high,
             "ref_price": price,
         }
-        self.logger.debug(
-            "PENDING %s %s | zone=[%.6f, %.6f] SL=%.6f TP=%.6f score=%.2f",
-            direction.upper(), symbol, zone_low, zone_high, sl, tp, score,
+        self.logger.info(
+            "PENDING %s %s %s [%s] | zone=[%.6f, %.6f] SL=%.6f TP=%.6f "
+            "RR=%.1f score=%.2f daily_atr=%.3f%%",
+            tier, style.upper(), direction.upper(), symbol,
+            zone_low, zone_high, sl, tp, rr, score, daily_atr * 100,
         )
 
     # ── Real-time tick handler (called from watch_ticker) ─────────
@@ -946,8 +1157,10 @@ class PaperBot:
             self._pending_signal = None
             return
         if self._last_entry_time is not None:
+            style_cfg = STYLE_CONFIG.get(self._last_trade_style, STYLE_CONFIG[STYLE_DAY])
+            cooldown = timedelta(minutes=style_cfg["cooldown_minutes"])
             elapsed = datetime.now(timezone.utc) - self._last_entry_time
-            if elapsed < self._entry_cooldown:
+            if elapsed < cooldown:
                 self._pending_signal = None
                 return
 
@@ -960,6 +1173,8 @@ class PaperBot:
         tp = sig["tp"]
         score = sig["score"]
         obs = sig["obs"]
+        tier = sig.get("tier", TIER_A)
+        style = sig.get("style", STYLE_DAY)
 
         # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
         use_brain = self.trades >= WARMUP_TRADES
@@ -1005,6 +1220,8 @@ class PaperBot:
                 sl_dist=sl_dist,
                 tp_dist=tp_dist,
                 score=score,
+                tier=tier,
+                style=style,
             )
         )
 
@@ -1033,6 +1250,8 @@ class PaperBot:
             "risk_pct": risk_pct,
             "entry_time": datetime.now(timezone.utc),
             "score": score,
+            "tier": tier,
+            "style": style,
             "order_id": order_id,
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
@@ -1041,11 +1260,14 @@ class PaperBot:
         }
         self._active_trades.append(trade_info)
         self._last_entry_time = datetime.now(timezone.utc)
+        self._last_trade_style = style
         self.logger.info(
-            "OPEN %s %s @ %.6f | SL=%.6f TP=%.6f | qty=%.4f "
-            "lev=%dx score=%.2f bal=%.2f order=%s",
-            direction.upper(), symbol, price, sl, tp, qty,
-            used_leverage, score, balance, order_id or "no-exchange",
+            "OPEN [%s|%s] %s %s @ %.6f | SL=%.6f TP=%.6f RR=%.1f | qty=%.4f "
+            "risk=%.2f%% lev=%dx score=%.2f bal=%.2f order=%s",
+            tier, style.upper(), direction.upper(), symbol, price, sl, tp,
+            abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0,
+            qty, risk_pct * 100, used_leverage, score, balance,
+            order_id or "no-exchange",
         )
 
     async def _execute_bracket_order_with_risk_reduction(
@@ -1059,35 +1281,43 @@ class PaperBot:
         sl_dist: float,
         tp_dist: float,
         score: float,
+        tier: str = TIER_A,
+        style: str = STYLE_DAY,
     ) -> tuple[str | None, str | None, str | None, float, float, int]:
         """
-        Execute a bracket order with leverage-bracket lookup and risk reduction.
+        Execute a bracket order with tier-based risk allocation.
+
+        Risk allocation:
+          AAA+ → 0.6%–2.0% (80% of trading capital)
+          A    → 0.3%–0.8% (15% of trading capital)
+          SPEC → 0.1%–0.3% (5%  of trading capital – moonshots)
 
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
-        # === DYNAMIC RISK ===
+        # === TIER-BASED DYNAMIC RISK ===
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
-        base_risk = FIXED_RISK_PCT
 
-        # Max Multiplikator = 3.2 * 2.5 = 8.0 -> 0.25% * 8 = exakt 2.0% Max Risk
-        rr_mult = self._step_mult(rr, [(9.0, 3.2), (6.0, 2.0), (3.0, 1.5)])
-        score_mult = self._step_mult(score, [(0.85, 2.5), (0.70, 1.5), (0.55, 1.1)])
+        # Get tier-specific risk bounds
+        tier_cfg = TIER_RISK.get(tier, TIER_RISK[TIER_A])
+        base_risk = tier_cfg["base_risk"]
+        max_risk = tier_cfg["max_risk"]
 
-        def _fmt_mult(mult: float) -> str:
-            return f"{mult:.3f}".rstrip("0").rstrip(".")
+        # Scale risk within tier bounds based on RR and score
+        # Higher RR + higher score = closer to max_risk
+        rr_factor = min(rr / 6.0, 1.0)        # RR 6+ → full factor
+        score_factor = min(score / 0.90, 1.0)  # Score 0.90+ → full factor
+        combined_factor = (rr_factor * 0.5 + score_factor * 0.5)
 
-        final_risk = base_risk * rr_mult * score_mult
-        dynamic_risk = max(MIN_DYNAMIC_RISK_PCT, min(final_risk, MAX_DYNAMIC_RISK_PCT))
-        
+        dynamic_risk = base_risk + (max_risk - base_risk) * combined_factor
+        dynamic_risk = max(base_risk, min(dynamic_risk, max_risk))
+
         self.logger.info(
-            "[DYNAMIC RISK] score=%.2f RR=%.2f → final risk=%.2f%% (base %.2f%%) (RR_mult=%.1fx, score_mult=%.1fx)",
-            score,
-            rr,
-            dynamic_risk * 100,
-            base_risk * 100,
-            rr_mult,
-            score_mult,
+            "[TIER RISK] %s|%s | score=%.2f RR=%.1f → risk=%.3f%% "
+            "(tier range %.3f%%–%.3f%%) rr_factor=%.2f score_factor=%.2f",
+            tier, style.upper(), score, rr,
+            dynamic_risk * 100, base_risk * 100, max_risk * 100,
+            rr_factor, score_factor,
         )
 
         if self.exchange is None:
@@ -1655,6 +1885,356 @@ class PaperBot:
             tr = max(h - l, abs(h - pc), abs(l - pc))
             trs.append(tr)
         return float(np.mean(trs))
+
+    # ── Volatility check ────────────────────────────────────────────
+
+    def _check_volatility(self) -> tuple[bool, float, float]:
+        """
+        Check if this coin has enough volatility for SMC trading.
+
+        Returns (is_tradeable, daily_atr_pct, five_m_atr_pct).
+        Coins with ATR% below thresholds are too noisy for reliable structure.
+        """
+        daily_atr_pct = 0.0
+        fivem_atr_pct = 0.0
+
+        # Daily ATR check
+        if len(self.buffer_1d) >= 15:
+            closes = self.buffer_1d["close"].values[-15:].astype(float)
+            highs = self.buffer_1d["high"].values[-15:].astype(float)
+            lows = self.buffer_1d["low"].values[-15:].astype(float)
+            trs = []
+            for i in range(1, len(closes)):
+                h, l, pc = highs[i], lows[i], closes[i - 1]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            if trs:
+                atr = float(np.mean(trs[-14:])) if len(trs) >= 14 else float(np.mean(trs))
+                price = closes[-1]
+                daily_atr_pct = atr / price if price > 0 else 0.0
+
+        # 5m ATR check
+        if len(self.buffer_5m) >= 15:
+            closes = self.buffer_5m["close"].values[-15:].astype(float)
+            highs = self.buffer_5m["high"].values[-15:].astype(float)
+            lows = self.buffer_5m["low"].values[-15:].astype(float)
+            trs = []
+            for i in range(1, len(closes)):
+                h, l, pc = highs[i], lows[i], closes[i - 1]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            if trs:
+                atr = float(np.mean(trs[-14:])) if len(trs) >= 14 else float(np.mean(trs))
+                price = closes[-1]
+                fivem_atr_pct = atr / price if price > 0 else 0.0
+
+        self._daily_atr_pct = daily_atr_pct
+        self._5m_atr_pct = fivem_atr_pct
+
+        tradeable = daily_atr_pct >= MIN_DAILY_ATR_PCT and fivem_atr_pct >= MIN_5M_ATR_PCT
+        return tradeable, daily_atr_pct, fivem_atr_pct
+
+    # ── Find POI (OB/FVG) from pre-computed indicators ───────────
+
+    def _find_poi_from_indicators(
+        self,
+        indicators: dict[str, Any],
+        price: float,
+        bias: str,
+        lookback_bars: int = 10,
+    ) -> dict[str, Any] | None:
+        """
+        Find the most recent Order Block or FVG aligned with bias.
+        Used for 4H primary POI detection.
+        """
+        # Check Order Blocks first (stronger institutional footprint)
+        ob_data = indicators.get("order_blocks")
+        if ob_data is not None and not ob_data.empty:
+            end = len(ob_data)
+            scan_start = max(0, end - lookback_bars)
+            for idx in range(end - 1, scan_start - 1, -1):
+                row = ob_data.iloc[idx]
+                ob_dir = row.get("OB", 0)
+                ob_top = row.get("Top", np.nan)
+                ob_bottom = row.get("Bottom", np.nan)
+                if pd.isna(ob_top) or pd.isna(ob_bottom) or pd.isna(ob_dir) or ob_dir == 0:
+                    continue
+                if bias == "bullish" and ob_dir > 0:
+                    return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom)}
+                if bias == "bearish" and ob_dir < 0:
+                    return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom)}
+
+        # Check FVGs (secondary)
+        fvg_data = indicators.get("fvg")
+        if fvg_data is not None and not fvg_data.empty:
+            end = len(fvg_data)
+            scan_start = max(0, end - lookback_bars)
+            for idx in range(end - 1, scan_start - 1, -1):
+                row = fvg_data.iloc[idx]
+                fvg_dir = row.get("FVG", 0)
+                top_val = row.get("Top", np.nan)
+                bottom_val = row.get("Bottom", np.nan)
+                if pd.isna(top_val) or pd.isna(bottom_val) or pd.isna(fvg_dir) or fvg_dir == 0:
+                    continue
+                gap_size = abs(top_val - bottom_val) / price if price > 0 else 0
+                if gap_size < FIXED_SMC_PARAMS["fvg_threshold"]:
+                    continue
+                if bias == "bullish" and fvg_dir > 0:
+                    return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val)}
+                if bias == "bearish" and fvg_dir < 0:
+                    return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val)}
+
+        return None
+
+    # ── Trade style classification ────────────────────────────────
+
+    def _classify_trade_style(
+        self, price: float, sl: float, tp: float,
+    ) -> str:
+        """
+        Classify trade as scalp, day, or swing based on TP distance.
+
+        This determines which SL/TP constraints apply and prevents
+        mixing of tactics (e.g. scalp SL on a swing TP target).
+        """
+        tp_dist_pct = abs(tp - price) / price if price > 0 else 0
+        sl_dist_pct = abs(price - sl) / price if price > 0 else 0
+
+        if tp_dist_pct < 0.005:  # < 0.5% TP
+            return STYLE_SCALP
+        elif tp_dist_pct < 0.03:  # < 3% TP
+            return STYLE_DAY
+        else:
+            return STYLE_SWING
+
+    def _validate_style_constraints(
+        self, style: str, price: float, sl: float, tp: float,
+    ) -> bool:
+        """
+        Validate that SL/TP conform to the detected trade style.
+        Prevents mixing (e.g. swing TP with scalp SL).
+        """
+        cfg = STYLE_CONFIG.get(style)
+        if cfg is None:
+            return False
+
+        sl_pct = abs(price - sl) / price if price > 0 else 0
+        tp_pct = abs(tp - price) / price if price > 0 else 0
+        rr = tp_pct / sl_pct if sl_pct > 0 else 0
+
+        if sl_pct < cfg["min_sl_pct"] or sl_pct > cfg["max_sl_pct"]:
+            return False
+        if tp_pct < cfg["min_tp_pct"] or tp_pct > cfg["max_tp_pct"]:
+            return False
+        if rr < cfg["min_rr"]:
+            return False
+
+        return True
+
+    # ── Setup quality tier classification ─────────────────────────
+
+    def _classify_setup_tier(
+        self, score: float, rr: float, components: dict[str, Any],
+    ) -> str:
+        """
+        Classify setup quality: AAA+ (80% of capital), A (15%), SPEC (5%).
+
+        AAA+ requires all major timeframes aligned + strong bias.
+        A requires good score and RR.
+        SPEC is for unusual setups with decent minimum quality.
+        """
+        # AAA+: Premium setup – all major TFs aligned, strong bias, high RR
+        t = TIER_THRESHOLDS[TIER_AAA_PLUS]
+        if (score >= t["min_score"]
+                and rr >= t["min_rr"]
+                and components.get("bias_strong", False)
+                and components.get("h4_confirms", False)
+                and components.get("h1_confirms", False)
+                and components.get("precision_trigger", False)):
+            return TIER_AAA_PLUS
+
+        # A: Good setup – solid score and RR
+        t = TIER_THRESHOLDS[TIER_A]
+        if score >= t["min_score"] and rr >= t["min_rr"]:
+            return TIER_A
+
+        # SPEC: Speculative – minimum requirements
+        t = TIER_THRESHOLDS[TIER_SPECULATIVE]
+        if score >= t["min_score"] and rr >= t["min_rr"]:
+            return TIER_SPECULATIVE
+
+        return ""  # Don't trade
+
+    # ── Style-aware SL/TP from multiple timeframes ───────────────
+
+    def _find_sl_from_buffer(
+        self, buffer: pd.DataFrame, price: float, direction: str,
+    ) -> float | None:
+        """Extract SL from a given timeframe's SMC indicators."""
+        swing_len = self.swing_length
+        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
+        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
+        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+
+        if len(buffer) < swing_len * 2:
+            return None
+
+        try:
+            ind = compute_smc_indicators(buffer, swing_len, fvg_thresh, ob_lookback, liq_range)
+        except Exception:
+            return None
+
+        ob_data = ind.get("order_blocks")
+        liq_data = ind.get("liquidity")
+        sl: float | None = None
+
+        if direction == "long":
+            if ob_data is not None and not ob_data.empty:
+                for i in range(len(ob_data) - 1, -1, -1):
+                    row = ob_data.iloc[i]
+                    d = row.get("OB", np.nan)
+                    bot = row.get("Bottom", np.nan)
+                    if pd.notna(d) and d > 0 and pd.notna(bot) and bot < price:
+                        sl = float(bot)
+                        break
+            if sl is None and liq_data is not None and not liq_data.empty:
+                best: float | None = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl < price:
+                        if best is None or lvl > best:
+                            best = lvl
+                if best is not None:
+                    sl = float(best)
+        else:
+            if ob_data is not None and not ob_data.empty:
+                for i in range(len(ob_data) - 1, -1, -1):
+                    row = ob_data.iloc[i]
+                    d = row.get("OB", np.nan)
+                    top = row.get("Top", np.nan)
+                    if pd.notna(d) and d < 0 and pd.notna(top) and top > price:
+                        sl = float(top)
+                        break
+            if sl is None and liq_data is not None and not liq_data.empty:
+                best = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl > price:
+                        if best is None or lvl < best:
+                            best = lvl
+                if best is not None:
+                    sl = float(best)
+
+        return sl
+
+    def _find_tp_from_buffer(
+        self, buffer: pd.DataFrame, price: float, direction: str,
+    ) -> float | None:
+        """Extract TP from a given timeframe's SMC indicators."""
+        swing_len = self.swing_length
+        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
+        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
+        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+
+        if len(buffer) < swing_len * 2:
+            return None
+
+        try:
+            ind = compute_smc_indicators(buffer, swing_len, fvg_thresh, ob_lookback, liq_range)
+        except Exception:
+            return None
+
+        liq_data = ind.get("liquidity")
+        fvg_data = ind.get("fvg")
+        tp: float | None = None
+
+        if direction == "long":
+            if liq_data is not None and not liq_data.empty:
+                best: float | None = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl > price:
+                        if best is None or lvl < best:
+                            best = lvl
+                if best is not None:
+                    tp = float(best)
+            if tp is None and fvg_data is not None and not fvg_data.empty:
+                best = None
+                for i in range(len(fvg_data)):
+                    row = fvg_data.iloc[i]
+                    d = row.get("FVG", np.nan)
+                    bot = row.get("Bottom", np.nan)
+                    if pd.notna(d) and d < 0 and pd.notna(bot) and bot > price:
+                        if best is None or bot < best:
+                            best = bot
+                if best is not None:
+                    tp = float(best)
+        else:
+            if liq_data is not None and not liq_data.empty:
+                best = None
+                for i in range(len(liq_data)):
+                    lvl = liq_data["Level"].iat[i]
+                    if pd.notna(lvl) and lvl < price:
+                        if best is None or lvl > best:
+                            best = lvl
+                if best is not None:
+                    tp = float(best)
+            if tp is None and fvg_data is not None and not fvg_data.empty:
+                best = None
+                for i in range(len(fvg_data)):
+                    row = fvg_data.iloc[i]
+                    d = row.get("FVG", np.nan)
+                    top_val = row.get("Top", np.nan)
+                    if pd.notna(d) and d > 0 and pd.notna(top_val) and top_val < price:
+                        if best is None or top_val > best:
+                            best = top_val
+                if best is not None:
+                    tp = float(best)
+
+        return tp
+
+    def _find_smc_sl_tp_for_style(
+        self, price: float, direction: str, style: str,
+    ) -> tuple[float, float] | None:
+        """
+        Compute SL and TP using timeframes appropriate for the trade style.
+
+        SCALP  → SL from 15m/5m,  TP from 1H/15m
+        DAY    → SL from 1H/15m,  TP from 4H/1H
+        SWING  → SL from 4H/1H,   TP from 1D/4H
+        """
+        if style == STYLE_SWING:
+            sl_buffers = [self.buffer_4h, self.buffer_1h]
+            tp_buffers = [self.buffer_1d, self.buffer_4h]
+        elif style == STYLE_SCALP:
+            sl_buffers = [self.buffer_15m, self.buffer_5m]
+            tp_buffers = [self.buffer_1h, self.buffer_15m]
+        else:  # DAY
+            sl_buffers = [self.buffer_1h, self.buffer_15m]
+            tp_buffers = [self.buffer_4h, self.buffer_1h]
+
+        sl: float | None = None
+        tp: float | None = None
+
+        for buf in sl_buffers:
+            sl = self._find_sl_from_buffer(buf, price, direction)
+            if sl is not None:
+                break
+
+        for buf in tp_buffers:
+            tp = self._find_tp_from_buffer(buf, price, direction)
+            if tp is not None:
+                break
+
+        # Fallback to original 5m-based method
+        if sl is None or tp is None:
+            fallback = self._find_smc_sl_tp(price, direction)
+            if fallback is None:
+                return None
+            if sl is None:
+                sl = fallback[0]
+            if tp is None:
+                tp = fallback[1]
+
+        return (sl, tp)
 
     @staticmethod
     def _step_mult(val: float, bands: list[tuple[float, float]]) -> float:
