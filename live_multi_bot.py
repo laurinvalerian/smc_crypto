@@ -1726,6 +1726,13 @@ class PaperBot:
                 self.logger.info("[ORDER_SKIP] Notional %.2f too large for leverage %dx, trying lower risk...", notional, planned_leverage)
                 continue
 
+            # Ensure cross margin mode (shared margin pool across positions)
+            if not leverage_already_set:
+                try:
+                    await self.exchange.set_margin_mode("cross", symbol)
+                except Exception:
+                    pass  # already set or position open – both fine
+
             # Set leverage (may need to re-set if reduced during retries)
             if not leverage_already_set:
                 try:
