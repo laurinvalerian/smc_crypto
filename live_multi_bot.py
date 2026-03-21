@@ -250,10 +250,14 @@ MIN_PRICE_TOLERANCE = 1e-6
 MIN_DAILY_ATR_PCT = 0.008    # 0.8% daily ATR minimum
 # 5m ATR floor – prevents entries where the per-bar range is too small
 # for SL/TP to be meaningful (spreads & slippage eat the edge)
-MIN_5M_ATR_PCT = 0.0012      # 0.12% per 5m bar minimum
+MIN_5M_ATR_PCT = 0.0015      # 0.15% per 5m bar minimum
 # Minimum absolute SL distance as multiple of ATR(14) on 5m
 # Ensures SL is placed beyond noise, not inside it
-MIN_SL_ATR_MULT = 1.5
+# 2.5× ATR means the SL sits well outside random wicks
+MIN_SL_ATR_MULT = 2.5
+# Minimum SL expressed as number of "ticks" (estimated from price magnitude)
+# Prevents 1-2 tick SLs that are pure noise on low-priced coins
+MIN_SL_TICKS = 5
 
 # ── Trade Style Configuration ────────────────────────────────────
 # Styles are STRICTLY separated – no mixing of entry/exit tactics
@@ -263,12 +267,12 @@ STYLE_SWING = "swing"
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
-        "min_sl_pct": 0.002,    # 0.2% min SL
-        "max_sl_pct": 0.006,    # 0.6% max SL
-        "min_tp_pct": 0.004,    # 0.4% min TP
-        "max_tp_pct": 0.012,    # 1.2% max TP
+        "min_sl_pct": 0.004,    # 0.4% min SL (prevents 1-tick SLs on low-price coins)
+        "max_sl_pct": 0.008,    # 0.8% max SL
+        "min_tp_pct": 0.006,    # 0.6% min TP
+        "max_tp_pct": 0.015,    # 1.5% max TP
         "min_rr": 2.0,
-        "cooldown_minutes": 15,
+        "cooldown_minutes": 20,
     },
     STYLE_DAY: {
         "min_sl_pct": 0.0035,   # 0.35% min SL
@@ -304,6 +308,14 @@ TIER_RISK: dict[str, dict[str, float]] = {
     TIER_AAA_PLUS:    {"base_risk": 0.006, "max_risk": 0.020},  # 0.6%–2.0%
     TIER_A:           {"base_risk": 0.003, "max_risk": 0.008},  # 0.3%–0.8%
     TIER_SPECULATIVE: {"base_risk": 0.001, "max_risk": 0.003},  # 0.1%–0.3%
+}
+
+# Maximum leverage per tier – SPEC gets conservative leverage,
+# AAA+ can use full exchange leverage for precise entries
+TIER_MAX_LEVERAGE: dict[str, int] = {
+    TIER_AAA_PLUS: 50,
+    TIER_A: 25,
+    TIER_SPECULATIVE: 15,
 }
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
@@ -1039,30 +1051,79 @@ class PaperBot:
             return
         sl, tp = styled_sl_tp
 
+        # ── RE-CLASSIFY after styled SL/TP (the style may have shifted) ─
+        # e.g. initial 5m SL/TP looked like SCALP but styled TP is DAY-range
+        new_style = self._classify_trade_style(price, sl, tp)
+        if new_style != style:
+            self.logger.debug(
+                "Style reclassified %s → %s after styled SL/TP for %s",
+                style, new_style, symbol,
+            )
+            style = new_style
+            # Re-compute SL/TP for the correct style
+            styled_sl_tp = self._find_smc_sl_tp_for_style(price, direction, style)
+            if styled_sl_tp is None:
+                self._pending_signal = None
+                return
+            sl, tp = styled_sl_tp
+
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
 
+        # ── Tick-size minimum SL (prevents 1-2 tick SLs on low-price coins) ─
+        # Estimate actual tick size from the buffer's smallest price changes.
+        # This is more reliable than guessing from price magnitude because
+        # different coins at the same price level have different precisions
+        # (e.g. 1000SHIB at $0.012 has tick 0.000001, STRK at $0.037 has tick 0.0001).
+        tick_min_sl = 0.0
+        if not self.buffer_5m.empty and len(self.buffer_5m) >= 20:
+            buf_closes = self.buffer_5m["close"].values[-20:].astype(float)
+            diffs = np.abs(np.diff(buf_closes))
+            non_zero = diffs[diffs > 0]
+            if len(non_zero) >= 3:
+                # Smallest observed price change ≈ tick size
+                est_tick = float(np.sort(non_zero)[:3].mean())
+                tick_min_sl = est_tick * MIN_SL_TICKS
+
         # ── ATR-based minimum SL distance (adaptive to volatility) ─
-        # Uses MAX of: fixed % floor, and ATR-multiple floor
+        # Uses MAX of: fixed % floor, ATR-multiple floor, AND tick floor
         # This ensures SL is beyond noise for THIS specific coin
         atr_min_sl = fivem_atr * price * MIN_SL_ATR_MULT if fivem_atr > 0 else 0
         style_cfg = STYLE_CONFIG[style]
         pct_min_sl = price * style_cfg["min_sl_pct"]
-        min_sl_dist = max(atr_min_sl, pct_min_sl)
+        min_sl_dist = max(atr_min_sl, pct_min_sl, tick_min_sl)
 
         if sl_dist < min_sl_dist:
             sl_dist = min_sl_dist
             sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
 
-        # ── Enforce maximum SL for style ──────────────────────────
+        # ── Enforce maximum SL for style (with auto-upgrade) ─────
+        # If SL widening pushed beyond current style limits,
+        # upgrade to next style (SCALP → DAY → SWING) instead of rejecting
         max_sl_dist = price * style_cfg["max_sl_pct"]
         if sl_dist > max_sl_dist:
-            self._pending_signal = None
-            self.logger.debug(
-                "SL TOO WIDE for %s style: %.4f%% > max %.4f%%",
-                style, sl_dist / price * 100, style_cfg["max_sl_pct"] * 100,
-            )
-            return
+            upgraded = False
+            upgrade_chain = {STYLE_SCALP: STYLE_DAY, STYLE_DAY: STYLE_SWING}
+            next_style = upgrade_chain.get(style)
+            if next_style:
+                next_cfg = STYLE_CONFIG[next_style]
+                next_max = price * next_cfg["max_sl_pct"]
+                if sl_dist <= next_max:
+                    self.logger.info(
+                        "Style upgraded %s → %s (SL %.4f%% > %s max %.4f%%) for %s",
+                        style, next_style, sl_dist / price * 100,
+                        style, style_cfg["max_sl_pct"] * 100, symbol,
+                    )
+                    style = next_style
+                    style_cfg = next_cfg
+                    upgraded = True
+            if not upgraded:
+                self._pending_signal = None
+                self.logger.debug(
+                    "SL TOO WIDE for %s style: %.4f%% > max %.4f%%",
+                    style, sl_dist / price * 100, style_cfg["max_sl_pct"] * 100,
+                )
+                return
 
         if tp_dist <= 0:
             self._pending_signal = None
@@ -1483,6 +1544,17 @@ class PaperBot:
 
         planned_leverage = max(1, int(max_leverage))
 
+        # ── Tier-based leverage cap ──────────────────────────────
+        # SPEC trades get conservative leverage (max 15x),
+        # A trades moderate (max 25x), AAA+ can use full exchange leverage
+        tier_max_lev = TIER_MAX_LEVERAGE.get(tier, 20)
+        if planned_leverage > tier_max_lev:
+            self.logger.info(
+                "Capping leverage %dx → %dx for tier %s on %s",
+                planned_leverage, tier_max_lev, tier, symbol,
+            )
+            planned_leverage = tier_max_lev
+
         # ═══════════════════════════════════════════════════════════
         #  STEP 3: Helper functions
         # ═══════════════════════════════════════════════════════════
@@ -1765,6 +1837,13 @@ class PaperBot:
 
         side = "buy" if direction == "long" else "sell"
         exit_side = "sell" if direction == "long" else "buy"
+
+        # Round SL/TP to exchange price precision to avoid truncation issues
+        try:
+            sl = float(self.exchange.price_to_precision(symbol, sl))
+            tp = float(self.exchange.price_to_precision(symbol, tp))
+        except Exception:
+            pass  # keep raw values if precision lookup fails
 
         async def _close_position(reason: str) -> None:
             try:
