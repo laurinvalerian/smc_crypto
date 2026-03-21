@@ -1460,22 +1460,21 @@ class PaperBot:
                     if _is_position_limit_error(code, msg):
                         # Binary-search the true max_qty: halve on every failure so we
                         # converge in O(log n) attempts regardless of how far off we are.
-                        # Example: true limit=20k, first try=235k → 117k→58k→29k→14k (4 steps)
                         if max_qty_limit is None:
                             max_qty_limit = qty * 0.5
                             self.logger.warning(
-                                "→ -4005: no max_qty known, binary-searching from %.0f for %s",
+                                "→ -2027: no max_qty known, binary-searching from %.0f for %s",
                                 max_qty_limit, symbol,
                             )
                         else:
-                            max_qty_limit = max(max_qty_limit * 0.5, qty * 0.5)
+                            max_qty_limit = min(max_qty_limit * 0.5, qty * 0.5)
                             self.logger.warning(
-                                "→ -4005: still failing, halving max_qty to %.0f for %s",
+                                "→ -2027: halving to max_qty=%.0f for %s",
                                 max_qty_limit, symbol,
                             )
-                        # Immediately recalculate qty with updated cap and retry the SAME
+                        # Recalculate qty with updated cap and retry the SAME
                         # risk level (don't waste a risk step if only qty was the issue).
-                        new_qty = _round_qty(qty)  # _round_qty now clamps to new max_qty_limit
+                        new_qty = _round_qty(min(qty, max_qty_limit))
                         if new_qty > 0 and new_qty < qty * 0.99 and qty_halve_retries <= 12:
                             # qty actually changed – retry at same risk without advancing step
                             qty = new_qty
@@ -2177,12 +2176,20 @@ class LiveMultiBotRunner:
                             "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
                         )
                     except Exception as exc:
-                        bot.logger.warning(
-                            "Failed to cancel dangling order %s for %s: %s",
-                            cancel_id,
-                            bot.symbol,
-                            exc,
-                        )
+                        # -2011 "Unknown order sent" means order was already
+                        # filled or cancelled on the exchange – expected when
+                        # SL/TP triggered the close.  Log at DEBUG to reduce noise.
+                        exc_str = str(exc)
+                        if "-2011" in exc_str or "Unknown order" in exc_str:
+                            bot.logger.debug(
+                                "Order %s for %s already gone (filled/cancelled): %s",
+                                cancel_id, bot.symbol, exc,
+                            )
+                        else:
+                            bot.logger.warning(
+                                "Failed to cancel dangling order %s for %s: %s",
+                                cancel_id, bot.symbol, exc,
+                            )
 
             # Belt-and-suspenders: fetch open orders and cancel any remaining
             # reduce-only SL/TP orders whose stop price matches this trade.
@@ -2254,7 +2261,20 @@ class LiveMultiBotRunner:
 
         while not self._shutdown.is_set():
             try:
-                positions = await self.exchange.fetch_positions()
+                # Retry fetch_positions up to 3 times on transient errors
+                positions = None
+                for _poll_try in range(3):
+                    try:
+                        positions = await self.exchange.fetch_positions()
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _poll_exc:
+                        if _poll_try < 2:
+                            logger.debug("fetch_positions attempt %d failed: %s", _poll_try + 1, _poll_exc)
+                            await asyncio.sleep(2 * (_poll_try + 1))
+                        else:
+                            raise  # let outer handler log it
 
                 pos_map: dict[str, Any] = {}
                 if positions:
@@ -2372,14 +2392,21 @@ class LiveMultiBotRunner:
 
     async def _fetch_real_total_equity(self) -> float:
         """Fetch real USDT free balance from Binance demo account."""
-        try:
-            bal = await self.exchange.fetch_balance()
-            usdt = bal.get("USDT", {})
-            free = float(usdt.get("free", 0.0))
-            return free
-        except Exception as exc:
-            logger.warning("_fetch_real_total_equity failed: %s", exc)
-            return 0.0
+        last_exc = None
+        for _attempt in range(3):
+            try:
+                bal = await self.exchange.fetch_balance()
+                usdt = bal.get("USDT", {})
+                free = float(usdt.get("free", 0.0))
+                return free
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if _attempt < 2:
+                    await asyncio.sleep(1 * (_attempt + 1))
+        logger.warning("_fetch_real_total_equity failed after 3 attempts: %s", last_exc)
+        return 0.0
 
     async def _dashboard_loop(self) -> None:
         """Render the Rich Live Dashboard every DASHBOARD_REFRESH_SEC."""
