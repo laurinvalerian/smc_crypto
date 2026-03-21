@@ -990,18 +990,12 @@ class PaperBot:
         4. Setup quality tier classification (AAA+/A/SPEC)
         5. ATR-based minimum SL distance (not just fixed %)
         """
-        if len(self._active_trades) >= 3:
+        # ── Duplicate zone check (replaces cooldown timer) ─────────
+        # Don't prepare a new signal if there's already an active trade
+        # on this symbol – prevents double-entries on the same zone
+        if self._active_trades:
             self._pending_signal = None
             return
-
-        # ── Cooldown (dynamic per last trade style) ───────────────
-        if self._last_entry_time is not None:
-            style_cfg = STYLE_CONFIG.get(self._last_trade_style, STYLE_CONFIG[STYLE_DAY])
-            cooldown = timedelta(minutes=style_cfg["cooldown_minutes"])
-            elapsed = datetime.now(timezone.utc) - self._last_entry_time
-            if elapsed < cooldown:
-                self._pending_signal = None
-                return
 
         # ── Volatility gate (skip coins with too little movement) ─
         tradeable, daily_atr, fivem_atr = self._check_volatility()
@@ -1214,16 +1208,10 @@ class PaperBot:
             return
         if sig["symbol"] != symbol:
             return
-        if len(self._active_trades) >= 3:
+        # ── Duplicate zone check (replaces cooldown timer) ─────────
+        if self._active_trades:
             self._pending_signal = None
             return
-        if self._last_entry_time is not None:
-            style_cfg = STYLE_CONFIG.get(self._last_trade_style, STYLE_CONFIG[STYLE_DAY])
-            cooldown = timedelta(minutes=style_cfg["cooldown_minutes"])
-            elapsed = datetime.now(timezone.utc) - self._last_entry_time
-            if elapsed < cooldown:
-                self._pending_signal = None
-                return
 
         # Check if price is inside the entry zone
         if not (sig["zone_low"] <= price <= sig["zone_high"]):
@@ -1268,6 +1256,28 @@ class PaperBot:
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
         if sl_dist <= 0:
+            return
+
+        # ── Enforce min SL distance at live price ─────────────────
+        # The pending signal's SL was validated at ref_price, but the
+        # live tick price may differ, making sl_dist too tight.
+        style_cfg = STYLE_CONFIG.get(style, STYLE_CONFIG[STYLE_DAY])
+        pct_min_sl = price * style_cfg["min_sl_pct"]
+        if sl_dist < pct_min_sl:
+            sl_dist = pct_min_sl
+            sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
+
+        # ── Fee profitability gate ─────────────────────────────────
+        # Skip trade if hitting TP would still be net-negative after fees.
+        # total_fee_pct = COMMISSION_RATE * COMMISSION_MULTIPLIER (entry + exit)
+        min_tp_for_profit = price * COMMISSION_RATE * COMMISSION_MULTIPLIER
+        if tp_dist <= min_tp_for_profit:
+            self.logger.info(
+                "FEE GATE: skipping %s %s – tp_dist=%.6f <= fee_cost=%.6f (%.4f%%)",
+                direction.upper(), symbol, tp_dist, min_tp_for_profit,
+                COMMISSION_RATE * COMMISSION_MULTIPLIER * 100,
+            )
+            self._pending_signal = None
             return
 
         order_id, sl_order_id, tp_order_id, qty, risk_pct, used_leverage = (
@@ -1484,9 +1494,9 @@ class PaperBot:
                 if isinstance(tiers, dict):
                     for tier_list in tiers.values():
                         if isinstance(tier_list, list):
-                            for tier in tier_list:
-                                if isinstance(tier, dict):
-                                    lv = tier.get("maxLeverage") or tier.get("initialLeverage")
+                            for bracket in tier_list:
+                                if isinstance(bracket, dict):
+                                    lv = bracket.get("maxLeverage") or bracket.get("initialLeverage")
                                     if lv:
                                         try:
                                             leverage_options_with_source.append((int(lv), _lev_method))
@@ -1716,7 +1726,7 @@ class PaperBot:
                 self.logger.info("[ORDER_SKIP] Notional %.2f too large for leverage %dx, trying lower risk...", notional, planned_leverage)
                 continue
 
-            # Set leverage once (or retry on failure)
+            # Set leverage (may need to re-set if reduced during retries)
             if not leverage_already_set:
                 try:
                     await self.exchange.set_leverage(planned_leverage, symbol)
@@ -1729,8 +1739,8 @@ class PaperBot:
                     )
 
             rate_limit_retries = 0
-            qty_halve_retries = 0
-            while rate_limit_retries <= 2 and qty_halve_retries <= 12:
+            leverage_retries = 0
+            while rate_limit_retries <= 2 and leverage_retries <= 6:
                 try:
                     order_id, sl_order_id, tp_order_id = await self._place_bracket_order(
                         symbol, direction, price, sl, tp, qty,
@@ -1760,42 +1770,44 @@ class PaperBot:
                         continue
 
                     if _is_position_limit_error(code, msg):
-                        # Binary-search the true max_qty: halve on every failure so we
-                        # converge in O(log n) attempts regardless of how far off we are.
-                        if max_qty_limit is None:
-                            max_qty_limit = qty * 0.5
-                            self.logger.warning(
-                                "→ -2027: no max_qty known, binary-searching from %.0f for %s",
-                                max_qty_limit, symbol,
-                            )
-                        else:
-                            max_qty_limit = min(max_qty_limit * 0.5, qty * 0.5)
-                            self.logger.warning(
-                                "→ -2027: halving to max_qty=%.0f for %s",
-                                max_qty_limit, symbol,
-                            )
-                        # Recalculate qty with updated cap and retry the SAME
-                        # risk level (don't waste a risk step if only qty was the issue).
-                        new_qty = _round_qty(min(qty, max_qty_limit))
-                        if new_qty > 0 and new_qty < qty * 0.99 and qty_halve_retries <= 12:
-                            # qty actually changed – retry at same risk without advancing step
-                            qty = new_qty
-                            qty_halve_retries += 1
-                            notional = qty * price
-                            expected_margin = notional / planned_leverage if planned_leverage > 0 else notional
-                            self.logger.info(
-                                "[ORDER_RETRY_SAME_STEP #%d] %s %s | new qty=%.6f notional=%.2f max_qty=%.0f",
-                                qty_halve_retries, direction.upper(), symbol, qty, notional, max_qty_limit,
-                            )
-                            continue  # retry inner while loop with reduced qty
-                        # qty didn't shrink (already at or below cap) – advance to next risk step
-                        if attempt_num < total_steps:
-                            self.logger.warning(
-                                "→ Reducing risk from %.2f%% to %.2f%% for %s (qty=%.0f max_qty=%.0f)",
-                                risk_pct * 100, risk_steps[idx + 1] * 100,
-                                symbol, qty, max_qty_limit or 0,
-                            )
-                        break  # go to next risk step
+                        # ── Leverage step-down strategy ──────────────────
+                        # Risk = qty × sl_dist → independent of leverage.
+                        # Lower leverage = exchange allows larger position.
+                        # Only margin changes: margin = notional / leverage.
+                        if planned_leverage > 1:
+                            new_leverage = max(1, planned_leverage // 2)
+                            new_margin = notional / new_leverage if new_leverage > 0 else notional
+                            if new_margin < balance * 0.90:
+                                self.logger.info(
+                                    "→ Position limit at %dx, stepping down to %dx for %s "
+                                    "(margin %.2f → %.2f, qty unchanged=%.0f)",
+                                    planned_leverage, new_leverage, symbol,
+                                    expected_margin, new_margin, qty,
+                                )
+                                planned_leverage = new_leverage
+                                expected_margin = new_margin
+                                leverage_retries += 1
+                                try:
+                                    await self.exchange.set_leverage(planned_leverage, symbol)
+                                    self.leverage = planned_leverage
+                                    leverage_already_set = True
+                                except Exception as lev_exc:
+                                    self.logger.warning(
+                                        "set_leverage(%dx) failed for %s: %s",
+                                        planned_leverage, symbol, lev_exc,
+                                    )
+                                continue  # retry with lower leverage, same qty
+                            else:
+                                self.logger.warning(
+                                    "→ Leverage %dx→%dx margin %.2f exceeds 90%% of balance %.2f for %s",
+                                    planned_leverage, new_leverage, new_margin, balance, symbol,
+                                )
+                        # Leverage at 1x or margin too high – cannot fit position
+                        self.logger.warning(
+                            "→ Position limit: leverage at %dx, cannot fit qty=%.0f notional=%.2f for %s",
+                            planned_leverage, qty, notional, symbol,
+                        )
+                        break  # go to next risk step (last resort)
 
                     if _is_insufficient_margin_error(code, msg):
                         if attempt_num < total_steps:
