@@ -19,12 +19,18 @@ risk_per_trade:
 risk_reward:
   options: [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]   # 1:2 … 1:5
 
-# ── Volume Filter ─────────────────────────────────────────────────
+# ── Volume Filter (3-Layer AAA++ Scoring) ────────────────────────
 volume_filter:
-  enabled: false           # Disabled – we use all available coins
+  enabled: true            # AAA++ mode: strict volume filtering
   rank_threshold: 100      # Only trade coins inside top-100 by 30d volume
   lookback_days: 30        # Rolling window for volume ranking
   update_interval_hours: 1 # Live: re-rank every hour
+  min_relative_ratio: 1.5  # Current vol must be >= 1.5x 100-bar avg
+  min_dollar_vol_5m:       # Minimum $ volume per 5m bar
+    crypto: 50000
+    forex: 100000
+    stocks: 100000
+    commodities: 50000
 
 # ── Trading Styles ────────────────────────────────────────────────
 styles:
@@ -52,12 +58,65 @@ top_down:
   structure_tf: "1h"       # 1H structure confirmation
   entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
   decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
-  alignment_threshold: 0.50 # Min alignment score [0-1] to take a trade
+  alignment_threshold: 0.65 # Min alignment score [0-1] to take a trade (raised for AAA++)
+
+# ── AAA++ Filter Settings ───────────────────────────────────────
+aaa_plus_plus:
+  min_adx: 25              # ADX floor (1H) – below this = choppy/ranging
+  min_session_score: 0.8   # Only trade in optimal sessions
+  min_zone_quality: 0.7    # Zone must be fresh, unmitigated, well-formed
+  min_volume_score: 0.6    # 3-layer volume must pass
+  require_momentum: true   # RSI + MACD must be confluent
+  require_all_tf_aligned: true  # 4/4 timeframes must agree on direction
+  tiers:
+    "AAA++":
+      min_score: 0.88
+      min_rr: 5.0
+      base_risk: 0.01       # 1.0%
+      max_risk: 0.02         # 2.0%
+      max_leverage: 50
+    "AAA+":
+      min_score: 0.78
+      min_rr: 4.0
+      base_risk: 0.005       # 0.5%
+      max_risk: 0.01          # 1.0%
+      max_leverage: 30
+
+# ── Multi-Asset SMC Profiles ────────────────────────────────────
+smc_profiles:
+  crypto:
+    swing_length: 8
+    fvg_threshold: 0.0006
+    order_block_lookback: 20
+    liquidity_range_percent: 0.01
+    min_daily_atr_pct: 0.008
+    min_5m_atr_pct: 0.0015
+  forex:
+    swing_length: 12
+    fvg_threshold: 0.0002
+    order_block_lookback: 25
+    liquidity_range_percent: 0.003
+    min_daily_atr_pct: 0.004
+    min_5m_atr_pct: 0.0005
+  stocks:
+    swing_length: 10
+    fvg_threshold: 0.0003
+    order_block_lookback: 20
+    liquidity_range_percent: 0.005
+    min_daily_atr_pct: 0.010
+    min_5m_atr_pct: 0.0010
+  commodities:
+    swing_length: 10
+    fvg_threshold: 0.0004
+    order_block_lookback: 20
+    liquidity_range_percent: 0.005
+    min_daily_atr_pct: 0.006
+    min_5m_atr_pct: 0.0008
 
 # ── Tuning Ranges (Optuna overrides) ─────────────────────────────
 tuning:
-  alignment_threshold_min: 0.35
-  alignment_threshold_max: 0.70
+  alignment_threshold_min: 0.60
+  alignment_threshold_max: 0.90
   swing_length_min: 6
   swing_length_max: 14
   fvg_threshold_min: 0.0002

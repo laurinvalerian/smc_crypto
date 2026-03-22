@@ -38,10 +38,10 @@ logger = logging.getLogger(__name__)
 #  Constants
 # ═══════════════════════════════════════════════════════════════════
 
-BASE_OBS_DIM = 16      # market feature length (from extract_features)
+BASE_OBS_DIM = 24      # market feature length (from extract_features)
 OBS_DIM = BASE_OBS_DIM + 1  # +1 coin-id feature
-DEFAULT_COIN_FEATURE_DENOM = 100  # expected number of coins for normalisation
-HIDDEN_DIM = 64        # hidden layer size
+DEFAULT_COIN_FEATURE_DENOM = 200  # expected number of instruments (crypto+forex+stocks+commodities)
+HIDDEN_DIM = 128       # hidden layer size (increased for 24-dim input)
 GAMMA = 0.99           # discount factor
 CLIP_EPS = 0.2         # PPO clipping epsilon
 LR = 3e-4              # learning rate
@@ -65,12 +65,20 @@ def extract_features(
     trade_style: str = "",
     rr_ratio: float = 3.0,
     daily_atr_pct: float = 0.01,
+    adx_normalized: float = 0.0,
+    session_score: float = 0.5,
+    zone_quality: float = 0.0,
+    volume_score: float = 0.0,
+    momentum_score: float = 0.0,
+    tf_agreement_score: float = 0.0,
+    spread_normalized: float = 0.0,
+    asset_class_id: float = 0.0,
 ) -> np.ndarray:
     """
-    Build a 16-dim observation vector from the candle buffer, SMC
-    alignment score, direction, and setup classification.
+    Build a 24-dim observation vector from the candle buffer, SMC
+    alignment score, direction, setup classification, and AAA++ filters.
 
-    Features:
+    Features (0-15: original, 16-23: new AAA++ features):
       0  alignment_score           [0, 1]
       1  direction_sign            -1 (short) or +1 (long)
       2  atr_14_normalised         ATR(14) / close
@@ -83,10 +91,18 @@ def extract_features(
       9  close_return_20           20-bar return
      10  high_low_range_norm       (H-L) / close  (current bar)
      11  rsi_14_normalised         RSI(14) scaled to [0, 1]
-     12  setup_tier_encoded        0.0=SPEC, 0.5=A, 1.0=AAA+
+     12  setup_tier_encoded        0.5=AAA+, 1.0=AAA++
      13  trade_style_encoded       0.0=scalp, 0.5=day, 1.0=swing
      14  rr_ratio_normalised       RR / 10, clamped to [0, 1]
      15  daily_atr_pct_normalised  daily ATR%, clamped to [0, 1]
+     16  adx_normalized            ADX / 50, clamped [0, 1]
+     17  session_score             session quality [0, 1]
+     18  zone_quality              zone quality score [0, 1]
+     19  volume_score              3-layer volume score [0, 1]
+     20  momentum_score            RSI+MACD confluence [0, 1]
+     21  tf_agreement_score        multi-TF trend agreement [0, 1]
+     22  spread_normalized         spread quality (lower = better) [0, 1]
+     23  asset_class_id            0.0=crypto, 0.33=forex, 0.66=stocks, 1.0=commodities
     """
     n = len(candles)
     if n < 50:
@@ -124,8 +140,8 @@ def extract_features(
     # RSI(14)
     rsi = _rsi(closes, 14)
 
-    # Encode setup tier: SPEC=0.0, A=0.5, AAA+=1.0
-    tier_map = {"SPEC": 0.0, "A": 0.5, "AAA+": 1.0}
+    # Encode setup tier: AAA+=0.5, AAA++=1.0
+    tier_map = {"AAA+": 0.5, "AAA++": 1.0}
     tier_val = tier_map.get(setup_tier, 0.5)
 
     # Encode trade style: scalp=0.0, day=0.5, swing=1.0
@@ -133,6 +149,7 @@ def extract_features(
     style_val = style_map.get(trade_style, 0.5)
 
     obs = np.array([
+        # Original 16 features
         alignment_score,
         1.0 if direction == "long" else -1.0,
         atr14 / price,
@@ -145,14 +162,61 @@ def extract_features(
         ret20,
         (highs[-1] - lows[-1]) / price,
         rsi / 100.0,
-        # New features for setup quality awareness
         tier_val,
         style_val,
         min(rr_ratio / 10.0, 1.0),
-        min(daily_atr_pct * 10.0, 1.0),  # 10% daily ATR → 1.0
+        min(daily_atr_pct * 10.0, 1.0),
+        # New AAA++ features (8 additional)
+        min(adx_normalized, 1.0),
+        min(max(session_score, 0.0), 1.0),
+        min(max(zone_quality, 0.0), 1.0),
+        min(max(volume_score, 0.0), 1.0),
+        min(max(momentum_score, 0.0), 1.0),
+        min(max(tf_agreement_score, 0.0), 1.0),
+        min(max(1.0 - spread_normalized, 0.0), 1.0),  # inverted: lower spread = higher score
+        min(max(asset_class_id, 0.0), 1.0),
     ], dtype=np.float32)
 
     return obs
+
+
+def compute_shaped_reward(
+    pnl_pct: float,
+    rr_ratio: float,
+    expected_rr: float,
+    tier: str,
+    bars_to_exit: int = 0,
+    hit_sl: bool = False,
+) -> float:
+    """
+    Shaped reward for RL brain training.
+
+    Components:
+      - Base: PnL %
+      - RR quality bonus: reward hitting TP efficiently
+      - Tier bonus: reward AAA++ trades more
+      - Quick SL penalty: penalise trades that hit SL within 3 bars (stop hunts)
+
+    Returns shaped reward (float).
+    """
+    # Base reward
+    reward = pnl_pct
+
+    # RR quality bonus (reward efficient TP hits)
+    if pnl_pct > 0 and expected_rr > 0:
+        actual_rr = rr_ratio if rr_ratio > 0 else 0.0
+        rr_quality = 1.0 + 0.2 * min(actual_rr / expected_rr, 2.0)
+        reward *= rr_quality
+
+    # Tier bonus
+    tier_multiplier = {"AAA++": 1.5, "AAA+": 1.2}
+    reward *= tier_multiplier.get(tier, 1.0)
+
+    # Quick SL penalty (stop hunt indicator)
+    if hit_sl and bars_to_exit <= 3:
+        reward -= 0.5
+
+    return reward
 
 
 def _ema(data: np.ndarray, span: int) -> float:

@@ -62,7 +62,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from rl_brain import CentralRLBrain, extract_features
+from rl_brain import CentralRLBrain, extract_features, compute_shaped_reward
 from strategies.smc_multi_style import (
     compute_smc_indicators,
     _precompute_running_bias,
@@ -73,6 +73,10 @@ from strategies.smc_multi_style import (
     _precompute_5m_trigger_mask,
     _compute_alignment_score,
 )
+from filters.trend_strength import compute_adx, check_momentum_confluence, multi_tf_trend_agreement
+from filters.volume_liquidity import compute_volume_score
+from filters.session_filter import compute_session_score
+from filters.zone_quality import compute_zone_quality
 
 # ── ccxt (sync) for history loading ───────────────────────────────
 import ccxt as ccxt_sync
@@ -218,7 +222,7 @@ FIXED_SMC_PARAMS: dict[str, Any] = {
     "fvg_threshold": 0.0006,
     "order_block_lookback": 20,
     "liquidity_range_percent": 0.01,
-    "alignment_threshold": 0.35,
+    "alignment_threshold": 0.65,
     "weight_day": 1.25,
     "bos_choch_filter": "medium",
 }
@@ -294,29 +298,26 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 # ── Setup Quality Tiers ─────────────────────────────────────────
-# 80% capital in AAA+, 15% in A, 5% in SPEC
+# AAA++ = sniper-only (highest probability, all components aligned)
+# AAA+  = strong fallback (still high quality)
+# No A or SPEC tiers – only the best trades
+TIER_AAA_PLUS_PLUS = "AAA++"
 TIER_AAA_PLUS = "AAA+"
-TIER_A = "A"
-TIER_SPECULATIVE = "SPEC"
 
 TIER_THRESHOLDS: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS: {"min_score": 0.78, "min_rr": 4.0},
-    TIER_A:        {"min_score": 0.58, "min_rr": 3.0},
-    TIER_SPECULATIVE: {"min_score": 0.40, "min_rr": 2.5},
+    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 5.0},
+    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 4.0},
 }
 
 TIER_RISK: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS:    {"base_risk": 0.006, "max_risk": 0.020},  # 0.6%–2.0%
-    TIER_A:           {"base_risk": 0.003, "max_risk": 0.008},  # 0.3%–0.8%
-    TIER_SPECULATIVE: {"base_risk": 0.001, "max_risk": 0.003},  # 0.1%–0.3%
+    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.020},  # 1.0%–2.0%
+    TIER_AAA_PLUS:      {"base_risk": 0.005, "max_risk": 0.010},  # 0.5%–1.0%
 }
 
-# Maximum leverage per tier – SPEC gets conservative leverage,
-# AAA+ can use full exchange leverage for precise entries
+# Maximum leverage per tier – both tiers get precise entry leverage
 TIER_MAX_LEVERAGE: dict[str, int] = {
-    TIER_AAA_PLUS: 50,
-    TIER_A: 25,
-    TIER_SPECULATIVE: 15,
+    TIER_AAA_PLUS_PLUS: 50,
+    TIER_AAA_PLUS: 30,
 }
 
 # ── Shared sync exchange for history fetching (public endpoints) ──
@@ -583,14 +584,20 @@ class PaperBot:
         self, current_candle: dict[str, Any],
     ) -> tuple[float, str, dict[str, Any]]:
         """
-        Granular multi-timeframe SMC alignment score.
+        AAA++ Granular multi-timeframe SMC alignment score.
 
-        Proper SMC top-down flow:
-          1D  → HTF bias + large liquidity zones       (0.20 max)
-          4H  → Strong OB / FVG as primary POI         (0.20 max)
-          1H  → Internal structure observation          (0.15 max)
-          15m → Entry zone / setup identification       (0.20 max)
-          5m  → Precision trigger for entry             (0.25 max)
+        13-component scoring system (max 1.0):
+          1D  → Daily bias (0.10)
+          4H  → Structure + POI (0.08 + 0.08)
+          1H  → Structure + CHoCH (0.08 + 0.06)
+          15m → Entry zone quality-weighted (0.12)
+          5m  → Precision trigger (0.10)
+          Vol → 3-layer volume score (0.08)
+          ADX → Trend strength on 1H (0.08)
+          Ses → Session optimality (0.06)
+          Mom → Momentum confluence (0.06)
+          TFA → Multi-TF trend agreement (0.05)
+          ZFr → Zone freshness decay (0.05)
 
         Returns (score 0–1, direction, components_dict).
         """
@@ -599,73 +606,78 @@ class PaperBot:
         ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
         liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
 
-        # Components tracked for tier classification
+        # Components tracked for tier classification (expanded for AAA++)
         comp: dict[str, Any] = {
             "bias": False, "bias_strong": False,
             "h4_confirms": False, "h4_poi": False,
             "h1_confirms": False, "h1_choch": False,
             "entry_zone": None, "zone_fresh": False,
             "precision_trigger": False, "volume_ok": False,
+            # New AAA++ components
+            "adx_strong": False, "adx_value": 0.0,
+            "session_optimal": False, "session_score": 0.0,
+            "momentum_confluent": False, "momentum_score": 0.0,
+            "tf_agreement": 0, "tf_agreement_score": 0.0,
+            "zone_quality": 0.0, "zone_quality_ok": False,
+            "volume_score": 0.0, "volume_details": None,
         }
 
         daily_bias = "neutral"
         score = 0.0
 
-        # ═══ STEP 1: Daily Bias (1D) – HTF direction ═════════════
-        # 0.15 for any bias, +0.05 bonus if from BOS/CHoCH (not EMA fallback)
+        # ═══ STEP 1: Daily Bias (1D) – HTF direction (0.10) ═════
         if len(self.buffer_1d) >= swing_len * 2:
             try:
                 ind_1d = compute_smc_indicators(
                     self.buffer_1d, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
-                # Full bias (BOS/CHoCH + EMA fallback)
                 running_bias = _precompute_running_bias(ind_1d, self.buffer_1d)
                 daily_bias = _bias_from_running(running_bias, len(self.buffer_1d))
 
                 if daily_bias != "neutral":
-                    score += 0.15
                     comp["bias"] = True
-
-                    # Check if bias comes from BOS/CHoCH (stronger) vs EMA fallback
+                    # Only count if from BOS/CHoCH (strong bias required for AAA++)
                     pure_struct = _precompute_running_structure(ind_1d)
                     pure_bias = _bias_from_running(pure_struct, len(self.buffer_1d))
                     if pure_bias != "neutral" and pure_bias == daily_bias:
-                        score += 0.05
+                        score += 0.10
                         comp["bias_strong"] = True
+                    else:
+                        score += 0.05  # EMA fallback only = half credit
             except Exception as exc:
                 self.logger.debug("1D bias computation failed: %s", exc)
 
         if daily_bias == "neutral":
-            direction = "long"  # placeholder
+            direction = "long"
             return 0.0, direction, comp
 
-        # ═══ STEP 2: 4H – Strong OB/FVG as primary POI ═══════════
-        # 0.10 for structure confirmation, +0.10 for active OB/FVG POI
+        direction = "long" if daily_bias == "bullish" else "short"
+
+        # ═══ STEP 2: 4H – Structure + POI (0.08 + 0.08) ═════════
+        htf_zones = []
         if len(self.buffer_4h) >= swing_len * 2:
             try:
                 ind_4h = compute_smc_indicators(
                     self.buffer_4h, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
-                # Structure confirmation
                 running_4h = _precompute_running_structure(ind_4h)
                 if _structure_confirms_from_running(running_4h, daily_bias, len(self.buffer_4h)):
-                    score += 0.10
+                    score += 0.08
                     comp["h4_confirms"] = True
 
-                # 4H POI: find active OB or FVG aligned with bias
                 price = float(self.buffer_4h["close"].iloc[-1])
                 h4_poi = self._find_poi_from_indicators(
                     ind_4h, price, daily_bias, lookback_bars=10,
                 )
                 if h4_poi is not None:
-                    score += 0.10
+                    score += 0.08
                     comp["h4_poi"] = True
                     comp["h4_poi_data"] = h4_poi
+                    htf_zones.append(h4_poi)
             except Exception as exc:
                 self.logger.debug("4H computation failed: %s", exc)
 
-        # ═══ STEP 3: 1H – Internal structure observation ═════════
-        # 0.10 for structure confirmation, +0.05 if latest signal is CHoCH
+        # ═══ STEP 3: 1H – Structure + CHoCH (0.08 + 0.06) ═══════
         if len(self.buffer_1h) >= swing_len * 2:
             try:
                 ind_1h = compute_smc_indicators(
@@ -673,10 +685,9 @@ class PaperBot:
                 )
                 running_1h = _precompute_running_structure(ind_1h)
                 if _structure_confirms_from_running(running_1h, daily_bias, len(self.buffer_1h)):
-                    score += 0.10
+                    score += 0.08
                     comp["h1_confirms"] = True
 
-                # Check for CHoCH (stronger than BOS)
                 bos_choch_1h = ind_1h.get("bos_choch")
                 if bos_choch_1h is not None and not bos_choch_1h.empty:
                     for i in range(len(bos_choch_1h) - 1, max(0, len(bos_choch_1h) - 4), -1):
@@ -684,15 +695,15 @@ class PaperBot:
                         if pd.notna(choch_val) and choch_val != 0:
                             choch_dir = "bullish" if choch_val > 0 else "bearish"
                             if choch_dir == daily_bias:
-                                score += 0.05
+                                score += 0.06
                                 comp["h1_choch"] = True
                             break
             except Exception as exc:
                 self.logger.debug("1H structure computation failed: %s", exc)
 
-        # ═══ STEP 4: 15m – Entry zone / setup identification ═════
-        # 0.15 for entry zone found, +0.05 if zone is fresh (last 6 bars)
+        # ═══ STEP 4: 15m – Entry zone quality-weighted (0.12) ════
         entry_zone = None
+        zone_quality_result = {}
         if len(self.buffer_15m) >= swing_len * 2:
             try:
                 ind_15m = compute_smc_indicators(
@@ -703,16 +714,42 @@ class PaperBot:
                     fvg_thresh, len(self.buffer_15m),
                 )
                 if entry_zone is not None:
-                    score += 0.15
                     comp["entry_zone"] = entry_zone
-                    # Freshness: zone from last 4 bars (1 hour) is fresh
-                    comp["zone_fresh"] = True  # _find_entry_zone_at already limits to 6 bars
-                    score += 0.05
+                    # Compute zone quality with decay
+                    closes_15m = self.buffer_15m["close"].values.astype(np.float64)
+                    # Estimate zone bar index (within last 6 bars as per _find_entry_zone_at)
+                    zone_bar_idx = max(0, len(self.buffer_15m) - 4)  # approximate
+                    # ATR on 15m
+                    atr_15m = 0.0
+                    if len(self.buffer_15m) >= 15:
+                        h15 = self.buffer_15m["high"].values[-15:].astype(np.float64)
+                        l15 = self.buffer_15m["low"].values[-15:].astype(np.float64)
+                        c15 = self.buffer_15m["close"].values[-15:].astype(np.float64)
+                        trs = []
+                        for i in range(1, len(h15)):
+                            trs.append(max(h15[i] - l15[i], abs(h15[i] - c15[i-1]), abs(l15[i] - c15[i-1])))
+                        atr_15m = float(np.mean(trs)) if trs else 0.0
+
+                    zone_quality_result = compute_zone_quality(
+                        zone_data=entry_zone,
+                        zone_bar_idx=zone_bar_idx,
+                        current_bar_idx=len(self.buffer_15m) - 1,
+                        closes_15m=closes_15m,
+                        df_15m=self.buffer_15m,
+                        atr_15m=atr_15m,
+                        htf_zones=htf_zones if htf_zones else None,
+                    )
+                    zq = zone_quality_result.get("zone_quality", 0.0)
+                    comp["zone_quality"] = zq
+                    comp["zone_quality_ok"] = zone_quality_result.get("zone_quality_ok", False)
+
+                    # Score weighted by zone quality (0.12 * zone_quality)
+                    score += 0.12 * zq
+                    comp["zone_fresh"] = zone_quality_result.get("decay_factor", 0.0) > 0.5
             except Exception as exc:
                 self.logger.debug("15m entry zone computation failed: %s", exc)
 
-        # ═══ STEP 5: 5m – Precision trigger ══════════════════════
-        # 0.15 for BOS/CHoCH trigger, +0.10 for volume confirmation
+        # ═══ STEP 5: 5m – Precision trigger (0.10) ═══════════════
         if len(self.buffer_5m) >= swing_len * 2:
             try:
                 ind_5m = compute_smc_indicators(
@@ -721,28 +758,103 @@ class PaperBot:
                 bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m)
                 if len(bull_mask) > 0:
                     if daily_bias == "bullish" and bull_mask[-1]:
-                        score += 0.15
+                        score += 0.10
                         comp["precision_trigger"] = True
                     elif daily_bias == "bearish" and bear_mask[-1]:
-                        score += 0.15
-                        comp["precision_trigger"] = True
-
-                # Volume confirmation on 5m
-                if not self.buffer_5m.empty and len(self.buffer_5m) >= 21:
-                    vol_current = float(self.buffer_5m["volume"].iloc[-1])
-                    vol_avg = float(self.buffer_5m["volume"].iloc[-21:-1].mean())
-                    if vol_avg > 0 and vol_current >= vol_avg:
                         score += 0.10
-                        comp["volume_ok"] = True
+                        comp["precision_trigger"] = True
             except Exception as exc:
                 self.logger.debug("5m trigger computation failed: %s", exc)
 
-        # Apply style weight and clamp
-        weight = FIXED_SMC_PARAMS.get("weight_day", 1.0)
-        score = min(score * weight, 1.0)
+        # ═══ STEP 6: Volume – 3-layer scoring (0.08) ═════════════
+        if not self.buffer_5m.empty and len(self.buffer_5m) >= 21:
+            try:
+                volumes_5m = self.buffer_5m["volume"].values.astype(np.float64)
+                price = float(self.buffer_5m["close"].iloc[-1])
+                current_vol = float(volumes_5m[-1])
 
-        direction = "long" if daily_bias == "bullish" else "short"
-        return float(np.clip(score, 0.0, 1.0)), direction, comp
+                # Optional 1H data for volume profile
+                h1h = l1h = c1h = v1h = None
+                if not self.buffer_1h.empty and len(self.buffer_1h) >= 20:
+                    h1h = self.buffer_1h["high"].values.astype(np.float64)
+                    l1h = self.buffer_1h["low"].values.astype(np.float64)
+                    c1h = self.buffer_1h["close"].values.astype(np.float64)
+                    v1h = self.buffer_1h["volume"].values.astype(np.float64)
+
+                vol_result = compute_volume_score(
+                    volumes_5m=volumes_5m,
+                    price=price,
+                    current_volume=current_vol,
+                    asset_class="crypto",
+                    highs_1h=h1h, lows_1h=l1h, closes_1h=c1h, volumes_1h=v1h,
+                    direction=direction,
+                )
+                vol_score = vol_result.get("volume_score", 0.0)
+                comp["volume_ok"] = vol_result.get("volume_ok", False)
+                comp["volume_score"] = vol_score
+                comp["volume_details"] = vol_result
+                score += 0.08 * vol_score
+            except Exception as exc:
+                self.logger.debug("Volume scoring failed: %s", exc)
+
+        # ═══ STEP 7: ADX Trend Strength on 1H (0.08) ═════════════
+        if not self.buffer_1h.empty and len(self.buffer_1h) >= 30:
+            try:
+                h1 = self.buffer_1h["high"].values.astype(np.float64)
+                l1 = self.buffer_1h["low"].values.astype(np.float64)
+                c1 = self.buffer_1h["close"].values.astype(np.float64)
+                adx, plus_di, minus_di = compute_adx(h1, l1, c1, period=14)
+                comp["adx_value"] = adx
+                comp["adx_strong"] = adx > 25.0
+                # Score: ADX 25+ = starts contributing, 50+ = full score
+                adx_score = min(max(adx - 15.0, 0.0) / 35.0, 1.0)
+                score += 0.08 * adx_score
+            except Exception as exc:
+                self.logger.debug("ADX computation failed: %s", exc)
+
+        # ═══ STEP 8: Session Optimality (0.06) ════════════════════
+        try:
+            session_sc = compute_session_score(asset_class="crypto")
+            comp["session_score"] = session_sc
+            comp["session_optimal"] = session_sc >= 0.8
+            score += 0.06 * session_sc
+        except Exception as exc:
+            self.logger.debug("Session scoring failed: %s", exc)
+
+        # ═══ STEP 9: Momentum Confluence on 1H (0.06) ════════════
+        if not self.buffer_1h.empty and len(self.buffer_1h) >= 35:
+            try:
+                c1h = self.buffer_1h["close"].values.astype(np.float64)
+                mom_ok, mom_score = check_momentum_confluence(c1h, direction)
+                comp["momentum_confluent"] = mom_ok
+                comp["momentum_score"] = mom_score
+                score += 0.06 * mom_score
+            except Exception as exc:
+                self.logger.debug("Momentum confluence failed: %s", exc)
+
+        # ═══ STEP 10: Multi-TF Trend Agreement (0.05) ════════════
+        try:
+            c_1d = self.buffer_1d["close"].values.astype(np.float64) if not self.buffer_1d.empty and len(self.buffer_1d) >= 50 else None
+            c_4h = self.buffer_4h["close"].values.astype(np.float64) if not self.buffer_4h.empty and len(self.buffer_4h) >= 50 else None
+            c_1h = self.buffer_1h["close"].values.astype(np.float64) if not self.buffer_1h.empty and len(self.buffer_1h) >= 50 else None
+            c_15m = self.buffer_15m["close"].values.astype(np.float64) if not self.buffer_15m.empty and len(self.buffer_15m) >= 50 else None
+
+            tf_count, tf_score = multi_tf_trend_agreement(c_1d, c_4h, c_1h, c_15m, direction)
+            comp["tf_agreement"] = tf_count
+            comp["tf_agreement_score"] = tf_score
+            score += 0.05 * tf_score
+        except Exception as exc:
+            self.logger.debug("Multi-TF trend agreement failed: %s", exc)
+
+        # ═══ STEP 11: Zone Freshness Decay Bonus (0.05) ══════════
+        if zone_quality_result:
+            decay_factor = zone_quality_result.get("decay_factor", 0.0)
+            score += 0.05 * decay_factor
+
+        # Clamp final score
+        score = float(np.clip(score, 0.0, 1.0))
+
+        return score, direction, comp
 
     # ── Equity CSV ────────────────────────────────────────────────
 
@@ -1009,10 +1121,12 @@ class PaperBot:
             )
             return
 
-        # ── Volume filter ─────────────────────────────────────────
+        # ── Volume filter (basic pre-check – detailed scoring in alignment) ─
+        # Quick reject if volume is clearly dead (< 0.5x avg)
+        # The full 3-layer volume scoring happens in _multi_tf_alignment_score
         volumes = [c["volume"] for c in buf[-20:]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
-        if avg_vol > 0 and candle["volume"] < FIXED_MIN_VOL_MULT * avg_vol:
+        if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
             self._pending_signal = None
             return
 
@@ -1183,6 +1297,14 @@ class PaperBot:
                 buf, score, direction,
                 setup_tier=tier, trade_style=style,
                 rr_ratio=rr, daily_atr_pct=daily_atr,
+                adx_normalized=min(components.get("adx_value", 0.0) / 50.0, 1.0),
+                session_score=components.get("session_score", 0.5),
+                zone_quality=components.get("zone_quality", 0.0),
+                volume_score=components.get("volume_score", 0.0),
+                momentum_score=components.get("momentum_score", 0.0),
+                tf_agreement_score=components.get("tf_agreement_score", 0.0),
+                spread_normalized=0.0,
+                asset_class_id=0.0,  # crypto=0.0
             ),
             "zone_low": zone_low,
             "zone_high": zone_high,
@@ -1226,7 +1348,7 @@ class PaperBot:
         tp = sig["tp"]
         score = sig["score"]
         obs = sig["obs"]
-        tier = sig.get("tier", TIER_A)
+        tier = sig.get("tier", TIER_AAA_PLUS)
         style = sig.get("style", STYLE_DAY)
 
         # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
@@ -1356,16 +1478,15 @@ class PaperBot:
         sl_dist: float,
         tp_dist: float,
         score: float,
-        tier: str = TIER_A,
+        tier: str = TIER_AAA_PLUS,
         style: str = STYLE_DAY,
     ) -> tuple[str | None, str | None, str | None, float, float, int]:
         """
         Execute a bracket order with tier-based risk allocation.
 
         Risk allocation:
-          AAA+ → 0.6%–2.0% (80% of trading capital)
-          A    → 0.3%–0.8% (15% of trading capital)
-          SPEC → 0.1%–0.3% (5%  of trading capital – moonshots)
+          AAA++ → 1.0%–2.0% (sniper trades, highest conviction)
+          AAA+  → 0.5%–1.0% (strong fallback trades)
 
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
@@ -1374,7 +1495,7 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
 
         # Get tier-specific risk bounds
-        tier_cfg = TIER_RISK.get(tier, TIER_RISK[TIER_A])
+        tier_cfg = TIER_RISK.get(tier, TIER_RISK[TIER_AAA_PLUS])
         base_risk = tier_cfg["base_risk"]
         max_risk = tier_cfg["max_risk"]
 
@@ -2137,33 +2258,45 @@ class PaperBot:
         self, score: float, rr: float, components: dict[str, Any],
     ) -> str:
         """
-        Classify setup quality: AAA+ (80% of capital), A (15%), SPEC (5%).
+        Classify setup quality: AAA++ (sniper) or AAA+ (strong fallback).
 
-        AAA+ requires all major timeframes aligned + strong bias.
-        A requires good score and RR.
-        SPEC is for unusual setups with decent minimum quality.
+        AAA++ requires ALL components aligned – the absolute best setups only.
+        AAA+ requires core SMC alignment + strong bias.
+
+        No A or SPEC tiers – only high-probability trades.
         """
-        # AAA+: Premium setup – all major TFs aligned, strong bias, high RR
+        # AAA++: Sniper setup – every single component must be True
+        t = TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]
+        if (score >= t["min_score"]
+                and rr >= t["min_rr"]
+                and components.get("bias_strong", False)
+                and components.get("h4_confirms", False)
+                and components.get("h4_poi", False)
+                and components.get("h1_confirms", False)
+                and components.get("h1_choch", False)
+                and components.get("entry_zone") is not None
+                and components.get("precision_trigger", False)
+                and components.get("volume_ok", False)
+                and components.get("adx_strong", False)
+                and components.get("session_optimal", False)
+                and components.get("zone_quality_ok", False)
+                and components.get("momentum_confluent", False)
+                and components.get("tf_agreement", 0) >= 4):
+            return TIER_AAA_PLUS_PLUS
+
+        # AAA+: Premium setup – core SMC alignment + strong bias
         t = TIER_THRESHOLDS[TIER_AAA_PLUS]
         if (score >= t["min_score"]
                 and rr >= t["min_rr"]
                 and components.get("bias_strong", False)
                 and components.get("h4_confirms", False)
                 and components.get("h1_confirms", False)
-                and components.get("precision_trigger", False)):
+                and components.get("precision_trigger", False)
+                and components.get("volume_ok", False)
+                and components.get("adx_strong", False)):
             return TIER_AAA_PLUS
 
-        # A: Good setup – solid score and RR
-        t = TIER_THRESHOLDS[TIER_A]
-        if score >= t["min_score"] and rr >= t["min_rr"]:
-            return TIER_A
-
-        # SPEC: Speculative – minimum requirements
-        t = TIER_THRESHOLDS[TIER_SPECULATIVE]
-        if score >= t["min_score"] and rr >= t["min_rr"]:
-            return TIER_SPECULATIVE
-
-        return ""  # Don't trade
+        return ""  # Don't trade – quality too low
 
     # ── Style-aware SL/TP from multiple timeframes ───────────────
 
@@ -2841,9 +2974,17 @@ class LiveMultiBotRunner:
 
             bot._append_equity()
 
-            # Feed reward to central RL brain when the decision was tracked
+            # Feed shaped reward to central RL brain when the decision was tracked
             if trade.get("rl_tracked") and trade.get("rl_trade_id"):
-                bot.brain.record_outcome(trade_id=trade["rl_trade_id"], reward=pnl_pct, done=True)
+                shaped_rew = compute_shaped_reward(
+                    pnl_pct=pnl_pct,
+                    rr_ratio=trade.get("rr", 3.0),
+                    expected_rr=trade.get("rr", 3.0),
+                    tier=trade.get("tier", "AAA+"),
+                    bars_to_exit=trade.get("bars_held", 0),
+                    hit_sl=(pnl_pct < 0),
+                )
+                bot.brain.record_outcome(trade_id=trade["rl_trade_id"], reward=shaped_rew, done=True)
 
             # === CLEANUP ===
             sl_order_id = trade.get("sl_order_id")
