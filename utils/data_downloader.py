@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,8 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────
 MS_PER_MINUTE = 60_000
 BATCH_LIMIT = 1_500          # Binance max candles per request
-RATE_LIMIT_SLEEP = 0.35      # Seconds between API calls
+RATE_LIMIT_SLEEP = 0.15      # Seconds between API calls (ccxt handles remaining rate-limit)
+NUM_WORKERS = 3              # Parallel download threads
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -281,8 +284,12 @@ def run(config_path: str = "config/default_config.yaml") -> None:
 
     logger.info(f"Top {len(symbols)} USDT-M Futures coins by volume")
 
-    # ── 2. Download 1 m candles per symbol ────────────────────────
-    for symbol in tqdm(symbols, desc="Downloading 1m data"):
+    # ── 2. Download 1 m candles per symbol (parallel) ─────────────
+    num_workers = getattr(run, '_workers', NUM_WORKERS)
+
+    def _download_one(symbol: str) -> str:
+        """Download a single symbol (runs in its own thread with own exchange)."""
+        thread_exchange = create_exchange(cfg)
         safe = symbol.replace("/", "_").replace(":", "_")
         out_path = data_dir / f"{safe}_1m.parquet"
 
@@ -294,29 +301,47 @@ def run(config_path: str = "config/default_config.yaml") -> None:
                 resume_ms = int(last_ts.timestamp() * 1000) + MS_PER_MINUTE
                 if resume_ms >= until_ms - MS_PER_MINUTE * 60:
                     logger.info("Skipping %s (up-to-date)", symbol)
-                    continue
+                    return f"skip:{symbol}"
                 logger.info("Resuming %s from %s", symbol, last_ts)
-                new_df = download_ohlcv(exchange, symbol, "1m", resume_ms, until_ms)
+                new_df = download_ohlcv(thread_exchange, symbol, "1m", resume_ms, until_ms)
                 if not new_df.empty:
                     old_df = pd.read_parquet(out_path)
                     df_1m = pd.concat([old_df, new_df]).drop_duplicates(
                         subset=["timestamp"]
                     ).sort_values("timestamp").reset_index(drop=True)
                     save_parquet(df_1m, out_path)
-                continue
+                return f"resume:{symbol}"
 
-        df_1m = download_ohlcv(exchange, symbol, "1m", since_ms, until_ms)
+        df_1m = download_ohlcv(thread_exchange, symbol, "1m", since_ms, until_ms)
         if df_1m.empty:
             logger.warning("No data for %s – skipping", symbol)
-            continue
+            return f"empty:{symbol}"
 
         save_parquet(df_1m, out_path)
 
-        # ── 3. Resample & save higher timeframes ─────────────────
+        # Resample & save higher timeframes
         for tf in resample_tfs:
             tf_df = resample_ohlcv(df_1m, tf)
             tf_path = data_dir / f"{safe}_{tf}.parquet"
             save_parquet(tf_df, tf_path)
+
+        return f"done:{symbol}"
+
+    logger.info("Downloading with %d parallel workers", num_workers)
+    progress = tqdm(total=len(symbols), desc="Downloading 1m data")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_download_one, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                result = future.result()
+                logger.info("Finished: %s", result)
+            except Exception as exc:
+                logger.error("Failed %s: %s", sym, exc)
+            progress.update(1)
+
+    progress.close()
 
     # ── 4. Volume ranking ─────────────────────────────────────────
     logger.info("Computing historical volume rankings …")
@@ -342,5 +367,12 @@ if __name__ == "__main__":
         default="config/default_config.yaml",
         help="Path to YAML config file",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=NUM_WORKERS,
+        help=f"Number of parallel download threads (default: {NUM_WORKERS})",
+    )
     args = parser.parse_args()
+    run._workers = args.workers
     run(config_path=args.config)
