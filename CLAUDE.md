@@ -14,6 +14,7 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 | `strategies/smc_multi_style.py` | SMC-Indikatoren (BOS, CHoCH, FVG, OB, Liquidity), Entry-Zone-Erkennung |
 | `rl_brain.py` | Zentrales PPO RL-Gehirn (24-dim Input, shared across alle Instrumente) |
 | `filters/` | AAA++ Filter-Module (trend_strength, volume_liquidity, session_filter, zone_quality) |
+| `exchanges/` | Exchange-Abstraktionsschicht (ExchangeAdapter Interface + BinanceAdapter) |
 | `config/default_config.yaml` | Alle konfigurierbaren Parameter |
 
 ### Signal-Flow (Top-Down)
@@ -79,22 +80,66 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 - **Shaped Reward**: `pnl × rr_quality_bonus × tier_bonus` + Quick-SL-Penalty
 - **Architektur-Änderung erfordert Neutraining** — alte Checkpoints sind inkompatibel
 
+### Exchange-Abstraktionsschicht (`exchanges/`)
+
+**Interface (`ExchangeAdapter`)** — Jeder Adapter implementiert:
+- `connect()` / `close()` — Lifecycle
+- `load_markets()` → `dict[symbol, InstrumentMeta]` — Instrument-Metadaten cachen
+- `fetch_ohlcv()` / `watch_ohlcv()` / `watch_ticker()` — Market Data (REST + WebSocket)
+- `create_market_order()` / `create_stop_loss()` / `create_take_profit()` — Trading → `OrderResult`
+- `fetch_balance()` → `BalanceInfo` / `fetch_positions()` → `list[PositionInfo]` — Account
+- `set_leverage()` / `set_margin_mode()` / `fetch_max_leverage()` — Margin-Management
+- `price_to_precision()` / `amount_to_precision()` — Precision-Helpers
+- `is_market_open()` — Trading-Hours-Check
+
+**`BinanceAdapter`** (Crypto) — Konkrete Implementierung:
+- Wraps `ccxt.pro` (async, WebSocket) + `ccxt` sync (Startup-History)
+- `raw` Property gibt direkten Zugriff auf ccxt.pro Objekt (für Migration)
+- `load_markets()` parsed Binance-Filters (LOT_SIZE, MARKET_LOT_SIZE) für korrekte max_qty
+- `fetch_max_leverage()` — 3-Methoden-Fallback (ccxt unified → fapiPrivateGetLeverageBracket → cached meta)
+
+**`OandaAdapter`** (Forex + Commodities):
+- OANDA v20 REST API (`pip install v20`)
+- 28 Forex-Pairs (7 Majors + 21 Crosses) + 4 Commodities (XAU, XAG, WTI, BCO)
+- `asyncio.to_thread()` für alle API-Calls (v20 ist sync)
+- SL/TP über Trade-attached Orders (OANDA-spezifisch, kein Bracket)
+- Spread-basiertes Pricing (keine Commission)
+- Trading Hours: Forex 24/5 (So 22:00 UTC → Fr 22:00 UTC), Commodities ~23h/Tag
+- Leverage: Forex max 30x, Commodities max 20x (reguliert)
+
+**`AlpacaAdapter`** (US Stocks):
+- Alpaca REST API (`pip install alpaca-py`)
+- Top 50 US-Aktien nach Market Cap
+- Fractional Shares Support
+- Commission-free, max 4x Leverage (Reg T)
+- Regular Trading Hours only (13:30-21:00 UTC, DST-aware)
+- Position Sizing in Shares (nicht Lots)
+
+**Datenmodelle (`models.py`)**:
+- `InstrumentMeta` — symbol, exchange_symbol, asset_class, tick/lot_size, min/max_qty, max_leverage, trading_hours, commission_pct
+- `OrderResult` — order_id, symbol, side, type, qty, price, status
+- `PositionInfo` — symbol, side, qty, entry_price, unrealized_pnl, leverage
+- `BalanceInfo` — currency, total, free, used
+
 ## Multi-Asset Roadmap
 
 ### Phase 1: AAA++ Filter (✅ FERTIG)
 Neue Filter-Module, 13-Komponenten-Scoring, Tier-Umbau, RL-Brain-Erweiterung.
 
-### Phase 2: Exchange-Abstraktionsschicht (NÄCHSTE)
-- `exchanges/base.py` — Abstract `ExchangeAdapter`
-- `exchanges/binance_adapter.py` — Bestehende Binance-Logik extrahieren
-- `exchanges/models.py` — `InstrumentMeta` Dataclass
+### Phase 2: Exchange-Abstraktionsschicht (✅ FERTIG)
+- `exchanges/models.py` — `InstrumentMeta`, `OrderResult`, `PositionInfo`, `BalanceInfo` Dataclasses
+- `exchanges/base.py` — Abstract `ExchangeAdapter` (alle Methoden: Market Data, Trading, Account, Leverage, Trading Hours)
+- `exchanges/binance_adapter.py` — `BinanceAdapter` wraps ccxt.pro + ccxt sync, `raw` Property für schrittweise Migration
+- `exchanges/__init__.py` — Package-Exports
+- **Migration**: `live_multi_bot.py` nutzt `BinanceAdapter` über `adapter.raw` Property während der Übergangsphase. Schrittweise Umstellung auf Adapter-Methoden geplant.
 
-### Phase 3: Multi-Asset Integration
-- `exchanges/oanda_adapter.py` — Forex (28 Pairs) + Commodities (XAU, XAG, WTI)
-- `exchanges/alpaca_adapter.py` — US Stocks (Top 50)
-- Asset-spezifische SMC-Profile in Config
+### Phase 3: Multi-Asset Integration (✅ FERTIG)
+- `exchanges/oanda_adapter.py` — Forex (28 Pairs) + 4 Commodities via OANDA v20 API
+- `exchanges/alpaca_adapter.py` — Top 50 US Stocks via Alpaca REST API
+- Asset-spezifische SMC-Profile bereits in `config/default_config.yaml` (Phase 1)
+- Lazy Imports in `exchanges/__init__.py` (kein ImportError wenn v20/alpaca-py nicht installiert)
 
-### Phase 4: Cross-Asset Opportunity Ranker
+### Phase 4: Cross-Asset Opportunity Ranker (NÄCHSTE)
 - `ranker/opportunity_ranker.py` — Z-Score-normalisiertes Ranking über alle Assets
 - `ranker/capital_allocator.py` — Max 5 Positionen, Korrelations-Check (>0.7 = nur den besseren)
 - `ranker/universe_scanner.py` — ~200 Instrumente dynamisch scannen
@@ -120,10 +165,10 @@ Neue Filter-Module, 13-Komponenten-Scoring, Tier-Umbau, RL-Brain-Erweiterung.
 
 | Asset-Klasse | Exchange/Broker | Status |
 |---|---|---|
-| Crypto | Binance USDT-M Futures (CCXT) | ✅ Aktiv (Testnet) |
-| Forex | OANDA v20 API | 📋 Geplant (Phase 3) |
-| Stocks | Alpaca REST + WebSocket | 📋 Geplant (Phase 3) |
-| Commodities | OANDA (XAU/USD, XAG/USD, WTICO/USD) | 📋 Geplant (Phase 3) |
+| Crypto | Binance USDT-M Futures (CCXT) | ✅ Adapter fertig, aktiv (Testnet) |
+| Forex | OANDA v20 API | ✅ Adapter fertig (28 Pairs), braucht `pip install v20` |
+| Stocks | Alpaca REST API | ✅ Adapter fertig (Top 50), braucht `pip install alpaca-py` |
+| Commodities | OANDA (XAU, XAG, WTI, BCO) | ✅ Adapter fertig (via OandaAdapter) |
 
 ## Commands
 
@@ -169,6 +214,12 @@ bot/
 │   └── optuna_backtester.py       # Walk-Forward Optimizer
 ├── utils/
 │   └── data_downloader.py         # CCXT Daten-Download
-├── exchanges/                     # (Phase 2 — noch nicht erstellt)
+├── exchanges/                     # Exchange-Abstraktionsschicht (Phase 2+3 ✅)
+│   ├── __init__.py                # Package-Exports (lazy imports für optionale Adapter)
+│   ├── models.py                  # InstrumentMeta, OrderResult, PositionInfo, BalanceInfo
+│   ├── base.py                    # Abstract ExchangeAdapter Interface
+│   ├── binance_adapter.py         # BinanceAdapter — Crypto (ccxt.pro + ccxt sync)
+│   ├── oanda_adapter.py           # OandaAdapter — Forex (28 Pairs) + Commodities (4)
+│   └── alpaca_adapter.py          # AlpacaAdapter — US Stocks (Top 50)
 └── ranker/                        # (Phase 4 — noch nicht erstellt)
 ```

@@ -77,6 +77,7 @@ from filters.trend_strength import compute_adx, check_momentum_confluence, multi
 from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
+from exchanges import BinanceAdapter
 
 # ── ccxt (sync) for history loading ───────────────────────────────
 import ccxt as ccxt_sync
@@ -2567,18 +2568,38 @@ class PaperBot:
 # ═══════════════════════════════════════════════════════════════════
 
 def create_exchange(api_key: str, api_secret: str) -> Any:
-    """Create a ccxt.pro Binance USDT-M Futures exchange (testnet)."""
-    exchange = ccxtpro.binanceusdm({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "future",
-        },
-    })
-    exchange.enable_demo_trading(True)
-    logger.info("Exchange created: %s (demo trading)", exchange.id)
-    return exchange
+    """Create a BinanceAdapter and return the raw ccxt.pro exchange.
+
+    Returns the raw ccxt.pro exchange object for backward compatibility.
+    The BinanceAdapter instance is stored as ``_adapter`` attribute on the
+    returned exchange so it can be accessed during the migration period.
+    """
+    import asyncio
+
+    adapter = BinanceAdapter(
+        api_key=api_key,
+        api_secret=api_secret,
+        testnet=True,
+    )
+    # Connect synchronously (creates the ccxt.pro exchange internally)
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # If already in an async context, just create inline
+        adapter._exchange = ccxtpro.binanceusdm({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        })
+        adapter._exchange.enable_demo_trading(True)
+    else:
+        loop.run_until_complete(adapter.connect())
+
+    # Attach adapter to the raw exchange for future access
+    raw = adapter.raw
+    raw._adapter = adapter
+    logger.info("Exchange created via BinanceAdapter: %s (demo trading)", raw.id)
+    return raw
 
 
 # ═══════════════════════════════════════════════════════════════════
