@@ -1,0 +1,278 @@
+"""
+Circuit Breaker
+===============
+Portfolio-level risk management that halts or reduces trading
+when drawdown limits are breached.
+
+Rules:
+- Daily loss >= 3%  → Stop ALL trading for 24h
+- Weekly loss >= 5% → Halve all position sizes
+- Asset-class drawdown >= 2% → Pause that asset class for 12h
+- Portfolio heat > 6% → No new positions until heat decreases
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ── Defaults ────────────────────────────────────────────────────────
+
+DAILY_LOSS_LIMIT_PCT = 0.03       # -3% daily → full stop 24h
+WEEKLY_LOSS_LIMIT_PCT = 0.05      # -5% weekly → halve sizes
+ASSET_CLASS_DD_LIMIT_PCT = 0.02   # -2% per asset class → pause 12h
+MAX_PORTFOLIO_HEAT_PCT = 0.06     # 6% total open risk
+DAILY_PAUSE_HOURS = 24
+ASSET_CLASS_PAUSE_HOURS = 12
+
+
+@dataclass
+class PnLRecord:
+    """Single PnL entry for tracking."""
+    timestamp: datetime
+    pnl_pct: float
+    asset_class: str = ""
+    symbol: str = ""
+
+
+@dataclass
+class CircuitBreakerState:
+    """Current state of all circuit breakers."""
+
+    # Trading pauses
+    all_trading_paused_until: datetime | None = None
+    asset_class_paused_until: dict[str, datetime] = field(default_factory=dict)
+
+    # Size reduction
+    size_reduction_factor: float = 1.0  # 1.0 = normal, 0.5 = halved
+
+    # Metrics
+    daily_pnl_pct: float = 0.0
+    weekly_pnl_pct: float = 0.0
+    asset_class_pnl_pct: dict[str, float] = field(default_factory=dict)
+    portfolio_heat_pct: float = 0.0
+
+    # Active breaker flags
+    daily_breaker_active: bool = False
+    weekly_breaker_active: bool = False
+    asset_class_breakers: dict[str, bool] = field(default_factory=dict)
+    heat_breaker_active: bool = False
+
+
+class CircuitBreaker:
+    """
+    Portfolio-level circuit breaker system.
+
+    Tracks realized PnL and open risk, triggers protective actions
+    when limits are breached.
+    """
+
+    def __init__(
+        self,
+        daily_loss_limit: float = DAILY_LOSS_LIMIT_PCT,
+        weekly_loss_limit: float = WEEKLY_LOSS_LIMIT_PCT,
+        asset_class_dd_limit: float = ASSET_CLASS_DD_LIMIT_PCT,
+        max_portfolio_heat: float = MAX_PORTFOLIO_HEAT_PCT,
+    ) -> None:
+        self._daily_limit = daily_loss_limit
+        self._weekly_limit = weekly_loss_limit
+        self._asset_dd_limit = asset_class_dd_limit
+        self._max_heat = max_portfolio_heat
+
+        # PnL history (rolling)
+        self._pnl_history: list[PnLRecord] = []
+        self._max_history = 10_000
+
+        # State
+        self._state = CircuitBreakerState()
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        return self._state
+
+    def record_trade_pnl(
+        self,
+        pnl_pct: float,
+        asset_class: str = "crypto",
+        symbol: str = "",
+        timestamp: datetime | None = None,
+    ) -> None:
+        """Record a closed trade's PnL for circuit breaker tracking."""
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+
+        self._pnl_history.append(PnLRecord(
+            timestamp=timestamp,
+            pnl_pct=pnl_pct,
+            asset_class=asset_class,
+            symbol=symbol,
+        ))
+
+        # Trim history
+        if len(self._pnl_history) > self._max_history:
+            self._pnl_history = self._pnl_history[-self._max_history:]
+
+    def update_portfolio_heat(self, heat_pct: float) -> None:
+        """Update current portfolio heat (sum of all position risk %)."""
+        self._state.portfolio_heat_pct = heat_pct
+
+    def _compute_period_pnl(
+        self,
+        since: datetime,
+        asset_class: str | None = None,
+    ) -> float:
+        """Sum PnL % for trades since a given time, optionally filtered by asset class."""
+        total = 0.0
+        for record in self._pnl_history:
+            if record.timestamp < since:
+                continue
+            if asset_class and record.asset_class != asset_class:
+                continue
+            total += record.pnl_pct
+        return total
+
+    def check(self, utc_now: datetime | None = None) -> CircuitBreakerState:
+        """
+        Evaluate all circuit breaker conditions.
+
+        Call this before each potential trade entry. Returns the
+        current CircuitBreakerState with all flags and limits.
+        """
+        if utc_now is None:
+            utc_now = datetime.now(timezone.utc)
+
+        # ── Daily PnL ──────────────────────────────────────────────
+        day_start = utc_now - timedelta(hours=24)
+        self._state.daily_pnl_pct = self._compute_period_pnl(day_start)
+
+        if self._state.daily_pnl_pct <= -self._daily_limit:
+            if not self._state.daily_breaker_active:
+                logger.warning(
+                    "CIRCUIT BREAKER: Daily loss %.2f%% exceeds -%.1f%% limit. "
+                    "Pausing ALL trading for %dh.",
+                    self._state.daily_pnl_pct * 100,
+                    self._daily_limit * 100,
+                    DAILY_PAUSE_HOURS,
+                )
+            self._state.daily_breaker_active = True
+            self._state.all_trading_paused_until = utc_now + timedelta(
+                hours=DAILY_PAUSE_HOURS
+            )
+        else:
+            # Check if pause has expired
+            if (
+                self._state.all_trading_paused_until
+                and utc_now >= self._state.all_trading_paused_until
+            ):
+                self._state.daily_breaker_active = False
+                self._state.all_trading_paused_until = None
+                logger.info("CIRCUIT BREAKER: Daily pause expired. Trading resumed.")
+
+        # ── Weekly PnL ─────────────────────────────────────────────
+        week_start = utc_now - timedelta(days=7)
+        self._state.weekly_pnl_pct = self._compute_period_pnl(week_start)
+
+        if self._state.weekly_pnl_pct <= -self._weekly_limit:
+            if not self._state.weekly_breaker_active:
+                logger.warning(
+                    "CIRCUIT BREAKER: Weekly loss %.2f%% exceeds -%.1f%% limit. "
+                    "Halving position sizes.",
+                    self._state.weekly_pnl_pct * 100,
+                    self._weekly_limit * 100,
+                )
+            self._state.weekly_breaker_active = True
+            self._state.size_reduction_factor = 0.5
+        else:
+            if self._state.weekly_breaker_active:
+                self._state.weekly_breaker_active = False
+                self._state.size_reduction_factor = 1.0
+                logger.info("CIRCUIT BREAKER: Weekly loss recovered. Normal sizing.")
+
+        # ── Per-Asset-Class Drawdown ───────────────────────────────
+        for asset_class in ("crypto", "forex", "stocks", "commodities"):
+            class_pnl = self._compute_period_pnl(day_start, asset_class)
+            self._state.asset_class_pnl_pct[asset_class] = class_pnl
+
+            if class_pnl <= -self._asset_dd_limit:
+                if not self._state.asset_class_breakers.get(asset_class):
+                    logger.warning(
+                        "CIRCUIT BREAKER: %s loss %.2f%% exceeds -%.1f%%. "
+                        "Pausing %s for %dh.",
+                        asset_class, class_pnl * 100,
+                        self._asset_dd_limit * 100,
+                        asset_class, ASSET_CLASS_PAUSE_HOURS,
+                    )
+                self._state.asset_class_breakers[asset_class] = True
+                self._state.asset_class_paused_until[asset_class] = (
+                    utc_now + timedelta(hours=ASSET_CLASS_PAUSE_HOURS)
+                )
+            else:
+                # Check if class pause expired
+                paused_until = self._state.asset_class_paused_until.get(asset_class)
+                if paused_until and utc_now >= paused_until:
+                    self._state.asset_class_breakers[asset_class] = False
+                    del self._state.asset_class_paused_until[asset_class]
+                    logger.info(
+                        "CIRCUIT BREAKER: %s pause expired. Trading resumed.",
+                        asset_class,
+                    )
+
+        # ── Portfolio Heat ─────────────────────────────────────────
+        self._state.heat_breaker_active = (
+            self._state.portfolio_heat_pct >= self._max_heat
+        )
+
+        return self._state
+
+    def can_trade(
+        self,
+        asset_class: str = "crypto",
+        utc_now: datetime | None = None,
+    ) -> tuple[bool, str]:
+        """
+        Quick check: is trading allowed right now for this asset class?
+
+        Returns (allowed, reason).
+        """
+        if utc_now is None:
+            utc_now = datetime.now(timezone.utc)
+
+        state = self.check(utc_now)
+
+        # Full trading pause
+        if state.all_trading_paused_until and utc_now < state.all_trading_paused_until:
+            remaining = state.all_trading_paused_until - utc_now
+            return False, (
+                f"All trading paused (daily loss {state.daily_pnl_pct:.2%}). "
+                f"Resumes in {remaining.total_seconds() / 3600:.1f}h"
+            )
+
+        # Asset class pause
+        class_paused = state.asset_class_paused_until.get(asset_class)
+        if class_paused and utc_now < class_paused:
+            remaining = class_paused - utc_now
+            return False, (
+                f"{asset_class} paused (class loss "
+                f"{state.asset_class_pnl_pct.get(asset_class, 0):.2%}). "
+                f"Resumes in {remaining.total_seconds() / 3600:.1f}h"
+            )
+
+        # Portfolio heat
+        if state.heat_breaker_active:
+            return False, (
+                f"Portfolio heat {state.portfolio_heat_pct:.2%} exceeds "
+                f"limit {self._max_heat:.2%}"
+            )
+
+        return True, ""
+
+    def get_size_factor(self) -> float:
+        """
+        Returns the position size multiplier.
+
+        1.0 = normal, 0.5 = halved (weekly breaker active).
+        """
+        return self._state.size_reduction_factor

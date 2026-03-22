@@ -1,5 +1,9 @@
 # CLAUDE.md – SMC Multi-Asset AAA++ Trading Bot
 
+## WICHTIG: CLAUDE.md immer aktuell halten!
+
+**Diese Datei MUSS nach jeder abgeschlossenen Phase, jedem neuen Modul, und jeder Architekturentscheidung sofort aktualisiert werden.** Da der Kontext regelmässig komprimiert wird, ist CLAUDE.md die einzige zuverlässige Quelle für den aktuellen Projektstand. Ohne aktuelle CLAUDE.md gehen kritische Details bei der Komprimierung verloren. Bei jeder Änderung: Dateistruktur, Roadmap-Status, Architektur-Sections und Konstanten prüfen und updaten.
+
 ## Projektübersicht
 
 Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur die absolut besten Trades (AAA++) über Crypto, Forex, Stocks und Commodities nimmt. Sniper-Ansatz: weniger Trades, höhere Qualität, maximale Profitabilität.
@@ -14,7 +18,9 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 | `strategies/smc_multi_style.py` | SMC-Indikatoren (BOS, CHoCH, FVG, OB, Liquidity), Entry-Zone-Erkennung |
 | `rl_brain.py` | Zentrales PPO RL-Gehirn (24-dim Input, shared across alle Instrumente) |
 | `filters/` | AAA++ Filter-Module (trend_strength, volume_liquidity, session_filter, zone_quality) |
-| `exchanges/` | Exchange-Abstraktionsschicht (ExchangeAdapter Interface + BinanceAdapter) |
+| `exchanges/` | Exchange-Abstraktionsschicht (Binance, OANDA, Alpaca) |
+| `ranker/` | Cross-Asset Opportunity Ranker (Scanner, Ranker, Allocator) |
+| `risk/` | Circuit Breakers (Daily/Weekly Loss, Asset-Class Pause, Heat) |
 | `config/default_config.yaml` | Alle konfigurierbaren Parameter |
 
 ### Signal-Flow (Top-Down)
@@ -115,6 +121,31 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 - Regular Trading Hours only (13:30-21:00 UTC, DST-aware)
 - Position Sizing in Shares (nicht Lots)
 
+### Cross-Asset Ranker (`ranker/`)
+
+**Pipeline**: `UniverseScanner` → `OpportunityRanker` → `CapitalAllocator` → Execution
+
+**`UniverseScanner`**:
+- Hält Referenzen zu allen `ExchangeAdapter`-Instanzen
+- Scannt alle Instrumente in Batches (10 parallel, rate-limit-aware)
+- Pre-Filter: ATR ≥ 0.4%, Volume ≥ 0.5x 20-bar avg, Market open
+- OHLCV-Cache mit 5min TTL (verhindert API-Overload)
+- Lightweight Scores: EMA-Trend, RSI-Momentum, Volume-Ratio, Session
+- Ergebnis: `UniverseState` mit allen `ScanResult`-Objekten
+
+**`OpportunityRanker`**:
+- Gruppiert Ergebnisse nach Asset-Klasse
+- Z-Score-Normalisierung pro Komponente innerhalb jeder Klasse (Sigmoid-Mapping)
+- Gewichteter Composite: alignment 35% + volume 20% + trend 15% + session 10% + zone_quality 10% + RR 10%
+- 20% Bonus für Instrumente mit aktivem Trade-Signal
+- Filtert auf min_opportunity_score (default 0.5)
+
+**`CapitalAllocator`**:
+- 5 sequentielle Checks: (1) Already in position, (2) Max total positions (5), (3) Max per class (3), (4) Portfolio heat (6%), (5) Correlation (Pearson > 0.7)
+- Risk-Sizing: AAA++ 1-2%, AAA+ 0.5-1%, skaliert mit opportunity_score
+- `PortfolioState` trackt positions, equity, return_series für Korrelation
+- Ergebnis: `AllocationDecision` pro Opportunity (approved/rejected mit Grund)
+
 **Datenmodelle (`models.py`)**:
 - `InstrumentMeta` — symbol, exchange_symbol, asset_class, tick/lot_size, min/max_qty, max_leverage, trading_hours, commission_pct
 - `OrderResult` — order_id, symbol, side, type, qty, price, status
@@ -139,17 +170,22 @@ Neue Filter-Module, 13-Komponenten-Scoring, Tier-Umbau, RL-Brain-Erweiterung.
 - Asset-spezifische SMC-Profile bereits in `config/default_config.yaml` (Phase 1)
 - Lazy Imports in `exchanges/__init__.py` (kein ImportError wenn v20/alpaca-py nicht installiert)
 
-### Phase 4: Cross-Asset Opportunity Ranker (NÄCHSTE)
-- `ranker/opportunity_ranker.py` — Z-Score-normalisiertes Ranking über alle Assets
-- `ranker/capital_allocator.py` — Max 5 Positionen, Korrelations-Check (>0.7 = nur den besseren)
-- `ranker/universe_scanner.py` — ~200 Instrumente dynamisch scannen
-- 100 fixe Bots → Pool von InstrumentScanner-Objekten
+### Phase 4: Cross-Asset Opportunity Ranker (✅ FERTIG)
+- `ranker/universe_scanner.py` — `UniverseScanner`: Scannt ~200 Instrumente über alle Adapter, OHLCV-Caching (5min TTL), ATR + Volume Pre-Filter, Batch-Scanning (10 parallel), `ScanResult` + `UniverseState` Dataclasses
+- `ranker/opportunity_ranker.py` — `OpportunityRanker`: Z-Score-Normalisierung pro Asset-Klasse (Sigmoid-Mapping), gewichteter Composite-Score (alignment 35%, volume 20%, trend 15%, session 10%, zone_quality 10%, RR 10%), 20% Bonus für aktive Signale, min_opportunity_score Filter
+- `ranker/capital_allocator.py` — `CapitalAllocator`: Max 5 Positionen total, max 3 pro Asset-Klasse, Pearson-Korrelation > 0.7 → reject, Portfolio Heat max 6%, Tier-basiertes Risk-Sizing (AAA++ 1-2%, AAA+ 0.5-1%), Leverage-Limits per Asset-Klasse (Crypto 20x, Forex 30x, Stocks 4x, Commodities 20x)
+- `ranker/__init__.py` — Package-Exports
+- **Architektur**: UniverseScanner → OpportunityRanker → CapitalAllocator → Trade Execution
 
-### Phase 5: Circuit Breakers
-- Tagesverlust -3% → Stop 24h
-- Wochenverlust -5% → Halbe Positionsgrößen
-- Asset-Class Drawdown -2% → Pause 12h
-- Max Portfolio Heat 6%
+### Phase 5: Circuit Breakers (✅ FERTIG)
+- `risk/circuit_breaker.py` — `CircuitBreaker` + `CircuitBreakerState`
+- Tagesverlust ≥ 3% → Stop ALL Trading für 24h
+- Wochenverlust ≥ 5% → `size_reduction_factor = 0.5` (halbe Positionsgrößen)
+- Asset-Class Drawdown ≥ 2% → Pause diese Klasse für 12h
+- Portfolio Heat > 6% → Keine neuen Positionen
+- `can_trade(asset_class)` → `(bool, reason)` Quick-Check vor jedem Entry
+- `get_size_factor()` → Multiplikator für Position-Sizing (1.0 oder 0.5)
+- Auto-Recovery: Pausen laufen automatisch ab, Size-Reduction hebt sich auf wenn Weekly-PnL erholt
 
 ## Testing & Anti-Overfitting
 
@@ -221,5 +257,12 @@ bot/
 │   ├── binance_adapter.py         # BinanceAdapter — Crypto (ccxt.pro + ccxt sync)
 │   ├── oanda_adapter.py           # OandaAdapter — Forex (28 Pairs) + Commodities (4)
 │   └── alpaca_adapter.py          # AlpacaAdapter — US Stocks (Top 50)
-└── ranker/                        # (Phase 4 — noch nicht erstellt)
+├── ranker/                        # Cross-Asset Opportunity Ranker (Phase 4 ✅)
+│   ├── __init__.py                # Package-Exports
+│   ├── universe_scanner.py        # UniverseScanner — scannt ~200 Instrumente
+│   ├── opportunity_ranker.py      # OpportunityRanker — Z-Score Ranking
+│   └── capital_allocator.py       # CapitalAllocator — Position Limits + Korrelation
+└── risk/                          # Circuit Breakers (Phase 5 ✅)
+    ├── __init__.py
+    └── circuit_breaker.py         # CircuitBreaker — Daily/Weekly/Class Loss Limits
 ```
