@@ -15,7 +15,7 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 | Datei | Zweck |
 |---|---|
 | `live_multi_bot.py` | Haupt-Orchestrator, PaperBot-Klasse, Multi-TF Alignment, Tier-Klassifizierung, Order-Execution |
-| `strategies/smc_multi_style.py` | SMC-Indikatoren (BOS, CHoCH, FVG, OB, Liquidity), Entry-Zone-Erkennung |
+| `strategies/smc_multi_style.py` | SMC-Indikatoren (BOS, CHoCH, FVG, OB, Liquidity), Entry-Zone-Erkennung, Multi-Dir Data Loading |
 | `rl_brain.py` | Zentrales PPO RL-Gehirn (24-dim Input, shared across alle Instrumente) |
 | `filters/` | AAA++ Filter-Module (trend_strength, volume_liquidity, session_filter, zone_quality) |
 | `exchanges/` | Exchange-Abstraktionsschicht (Binance, OANDA, Alpaca) |
@@ -216,9 +216,12 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 **Multi-Asset Backtesting:**
 - Lädt Daten aus `data/crypto/`, `data/forex/`, `data/stocks/`, `data/commodities/`
 - `symbol_to_asset` Mapping für asset-spezifische CB-Klassen und Kommissionen
+- Signals werden per Asset-Klasse gruppiert → korrekte Kommissionen pro Klasse
 - Stocks nutzen 5m als Basis-TF (kein 1m verfügbar bei kostenlosen Quellen)
 - Circuit Breaker simuliert pro Asset-Klasse separat (2% Klassen-Drawdown → Pause)
 - Walk-Forward über alle Asset-Klassen gleichzeitig
+- Optuna n_jobs=1 (seriell), Joblib n_jobs=3 (parallel Signals) — verhindert Deadlock auf 4-Core Server
+- n_trials=30 pro Window (reduziert von 500 für 4-Core/8GB Server)
 
 **RL Brain im Backtest: NEIN**
 - RL Brain wird NICHT im Backtest trainiert (Overfitting-Gefahr)
@@ -243,13 +246,13 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 - `exchanges` Section: Binance (testnet), OANDA (practice), Alpaca (paper) mit Env-Var-Referenzen
 - `data` Section: Separate Verzeichnisse pro Asset-Klasse (`data/crypto/`, `data/forex/`, `data/stocks/`, `data/commodities/`)
 
-**Daten-Verzeichnisstruktur:**
+**Daten-Verzeichnisstruktur (✅ ALLE HERUNTERGELADEN):**
 ```
 data/
-├── crypto/       # 120 Coins via CCXT/Binance (1m Basis)
-├── forex/        # 28 Pairs via OANDA (1m Basis)
-├── stocks/       # 50 Stocks via Alpaca (5m Basis)
-└── commodities/  # 4 Instrumente via OANDA (1m Basis)
+├── crypto/       # 100+ Coins via CCXT/Binance (1m Basis) — 601 files ✅
+├── forex/        # 28 Pairs via OANDA (1m Basis) — 168 files ✅
+├── stocks/       # 50 Stocks via Alpaca (5m Basis) — 250 files ✅
+└── commodities/  # 4 Instrumente via OANDA (1m Basis) — 24 files ✅
 ```
 
 **Broker-Accounts:**
@@ -261,8 +264,8 @@ data/
 **Balance-Strategie:** Backtesting immer 100K. Paper-Trading: OANDA/Alpaca auf 100K, Binance 5K — Vergleich über %-basierte Metriken (Win Rate, PF, Sharpe, Avg RR).
 
 ### Nächste Schritte
-1. **Daten-Downloads abwarten**: Crypto (100 Coins, ~4-5h), Forex+Commodities (32, ~1-2h), Stocks ✅ fertig (50)
-2. **Backtester laufen lassen**: Walk-Forward über alle Asset-Klassen mit Monte Carlo + Stability Check
+1. **Daten-Downloads**: ✅ ALLE FERTIG (Crypto 100, Forex 28, Stocks 50, Commodities 4 = 184 Instrumente)
+2. **Backtester läuft**: 🔄 Walk-Forward (5 Windows × 30 Trials) mit Monte Carlo + Stability Check — PID 302546, ~12-15h geschätzt
 3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert hier on-the-fly)
 4. **Live**: Nur wenn Paper-Ergebnisse innerhalb 1σ der Backtests
 
@@ -293,14 +296,20 @@ data/
 python3 live_multi_bot.py [--config config/default_config.yaml]
 
 # Backtesting (Optuna Walk-Forward)
-python3 backtest/optuna_backtester.py
+python3 -m backtest.optuna_backtester --monte-carlo --stability-check
 
 # Daten herunterladen
-python3 -m utils.data_downloader                              # Crypto (Binance)
+python3 -m utils.data_downloader --workers 3                  # Crypto (Binance, parallel)
 python3 -m utils.forex_data_downloader                        # Forex + Commodities (OANDA)
 python3 -m utils.forex_data_downloader --commodities-only     # Nur Commodities
 python3 -m utils.stock_data_downloader                        # US Stocks (Alpaca)
 python3 -m utils.stock_data_downloader --symbols AAPL MSFT    # Einzelne Stocks
+
+# Status-Monitoring
+bash check_downloads.sh                                        # Download-Fortschritt
+bash check_backtest.sh                                         # Backtest-Fortschritt
+watch -n 30 bash check_backtest.sh                             # Live-Monitor
+tail -f backtest/results/backtest.log                          # Detaillierter Log
 ```
 
 ## Wichtige Konstanten
@@ -323,6 +332,8 @@ WARMUP_TRADES = 100              # Trades ohne RL Gate
 bot/
 ├── .env                           # API Keys (NICHT in Git!)
 ├── .env.example                   # Template für .env
+├── check_downloads.sh             # Status-Script für Daten-Downloads
+├── check_backtest.sh              # Status-Script für Backtest-Fortschritt
 ├── live_multi_bot.py              # Haupt-Orchestrator (PaperBot + Runner)
 ├── rl_brain.py                    # PPO RL Brain (24-dim, shaped rewards)
 ├── strategies/
@@ -338,7 +349,7 @@ bot/
 ├── backtest/
 │   └── optuna_backtester.py       # Walk-Forward Optimizer
 ├── utils/
-│   ├── data_downloader.py         # Crypto OHLCV Download (CCXT/Binance)
+│   ├── data_downloader.py         # Crypto OHLCV Download (CCXT/Binance, 3 parallel workers)
 │   ├── forex_data_downloader.py   # Forex+Commodities OHLCV Download (OANDA v20)
 │   └── stock_data_downloader.py   # US Stocks OHLCV Download (Alpaca)
 ├── exchanges/                     # Exchange-Abstraktionsschicht (Phase 2+3 ✅)

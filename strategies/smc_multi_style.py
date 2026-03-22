@@ -493,20 +493,29 @@ class SMCMultiStyleStrategy:
         self.style_weight: float = sw.get("day", config["styles"]["day"]["weight"])
 
         self.data_dir = Path(config["data"]["data_dir"])
+        self.data_dirs: list[Path] = [self.data_dir]
+        # Multi-asset: add all per-class data directories
+        for key in ("crypto_dir", "forex_dir", "stocks_dir", "commodities_dir"):
+            d = config["data"].get(key)
+            if d:
+                p = Path(d)
+                if p.exists() and p not in self.data_dirs:
+                    self.data_dirs.append(p)
         self.commission_pct: float = config["backtest"].get("commission_pct", 0.0004)
 
     # ── Data loading ──────────────────────────────────────────────
 
     def _load_tf(self, symbol: str, tf: str) -> pd.DataFrame:
-        """Load a timeframe Parquet file for *symbol*."""
+        """Load a timeframe Parquet file for *symbol*, searching all data dirs."""
         safe = symbol.replace("/", "_").replace(":", "_")
-        path = self.data_dir / f"{safe}_{tf}.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Data file not found: {path}")
-        return pd.read_parquet(path)
+        for d in self.data_dirs:
+            path = d / f"{safe}_{tf}.parquet"
+            if path.exists():
+                return pd.read_parquet(path)
+        raise FileNotFoundError(f"Data file not found for {safe}_{tf} in {self.data_dirs}")
 
     def _load_all_timeframes(self, symbol: str) -> dict[str, pd.DataFrame]:
-        """Load or resample all required timeframes from 1 m base."""
+        """Load or resample all required timeframes from 1m (or 5m) base."""
         tfs_needed = {"1m", "5m", "15m", "1h", "4h", "1d"}
         frames: dict[str, pd.DataFrame] = {}
 
@@ -517,10 +526,14 @@ class SMCMultiStyleStrategy:
             except FileNotFoundError:
                 pass
 
-        # If only 1 m is present, resample the rest
+        # If only 1m is present, resample the rest
         if "1m" in frames and len(frames) < len(tfs_needed):
             for tf in tfs_needed - set(frames.keys()):
                 frames[tf] = resample_ohlcv(frames["1m"], tf)
+        # Stocks: no 1m available, use 5m as base for higher TFs
+        elif "5m" in frames and "1m" not in frames and len(frames) < len(tfs_needed):
+            for tf in tfs_needed - set(frames.keys()) - {"1m"}:
+                frames[tf] = resample_ohlcv(frames["5m"], tf)
 
         return frames
 

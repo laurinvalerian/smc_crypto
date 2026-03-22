@@ -139,7 +139,7 @@ data:
 backtest:
   train_months: 2          # Walk-forward training window
   test_months: 1           # Walk-forward test window
-  n_trials: 500            # Optuna trials per window
+  n_trials: 30             # Optuna trials per window (reduced for 4-core server)
   top_percent: 0.20        # Extract top 20 % parameter sets
   study_name: "smc_wfo"
   storage: "sqlite:///backtest/results/optuna_study.db"

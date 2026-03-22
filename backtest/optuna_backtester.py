@@ -558,7 +558,7 @@ def _build_objective(
                 logger.debug("Signal gen failed for %s: %s", sym, exc)
                 return []
 
-        all_signals_list = Parallel(n_jobs=-1)(
+        all_signals_list = Parallel(n_jobs=3)(
             delayed(_gen_signals)(sym) for sym in symbols
         )
         all_signals: list[TradeSignal] = [
@@ -568,14 +568,29 @@ def _build_objective(
         if not all_signals:
             return 0.0
 
-        trades = simulate_trades(
-            all_signals,
-            commission_pct=config["backtest"]["commission_pct"],
-            slippage_pct=config["backtest"]["slippage_pct"],
-            account_size=config["account"]["size"],
-            use_circuit_breaker=True,
-            aaa_only=True,
-        )
+        # Group signals by asset class for correct commissions
+        signals_by_class: dict[str, list[TradeSignal]] = {}
+        for sig in all_signals:
+            ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
+            signals_by_class.setdefault(ac, []).append(sig)
+
+        all_trades: list[pd.DataFrame] = []
+        for ac, sigs in signals_by_class.items():
+            t = simulate_trades(
+                sigs,
+                commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
+                slippage_pct=config["backtest"]["slippage_pct"],
+                account_size=config["account"]["size"],
+                use_circuit_breaker=True,
+                aaa_only=True,
+                asset_class=ac,
+            )
+            if not t.empty:
+                all_trades.append(t)
+
+        trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+        if not trades.empty:
+            trades = trades.sort_values("timestamp").reset_index(drop=True)
         metrics = compute_metrics(trades, account_size=config["account"]["size"])
 
         # Save trades for this trial (only first 10 trials to save disk)
@@ -694,7 +709,7 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
     data_cfg = cfg["data"]
     result: dict[str, list[str]] = {}
 
-    # Crypto: data/crypto/ → 1m parquets → CCXT format
+    # Crypto: data/crypto/ → 1m parquets → keep raw filename format (BTCUSDT)
     crypto_dir = Path(data_cfg.get("crypto_dir", "data/crypto"))
     if crypto_dir.exists():
         parquets = sorted(crypto_dir.glob("*_1m.parquet"))
@@ -702,9 +717,7 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
         for p in parquets:
             raw = p.stem.replace("_1m", "")
             if "USDT" in raw and raw != "volume":
-                # Convert BTCUSDT → BTC/USDT:USDT for CCXT
-                base = raw.replace("USDT", "")
-                crypto_syms.append(f"{base}/USDT:USDT")
+                crypto_syms.append(raw)
         if crypto_syms:
             result["crypto"] = crypto_syms
 
@@ -901,7 +914,7 @@ def run(
             window_index=wi, results_dir=results_dir,
             symbol_to_asset=symbol_to_asset,
         )
-        study.optimize(objective, n_trials=n_trials, n_jobs=-1, show_progress_bar=True)
+        study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
 
         # ── Out-of-sample test with best params ──────────────────
         best_params = study.best_trial.params
@@ -920,21 +933,36 @@ def run(
                 logger.debug("OOS signal gen failed for %s: %s", sym, exc)
                 return []
 
-        oos_signals_list = Parallel(n_jobs=-1)(
+        oos_signals_list = Parallel(n_jobs=3)(
             delayed(_gen_oos_signals)(sym) for sym in symbols
         )
         oos_signals: list[TradeSignal] = [
             s for sublist in oos_signals_list for s in sublist
         ]
 
-        oos_trades = simulate_trades(
-            oos_signals,
-            commission_pct=cfg["backtest"]["commission_pct"],
-            slippage_pct=cfg["backtest"]["slippage_pct"],
-            account_size=account_size,
-            use_circuit_breaker=True,
-            aaa_only=True,
-        )
+        # Group OOS signals by asset class for correct commissions
+        oos_by_class: dict[str, list[TradeSignal]] = {}
+        for sig in oos_signals:
+            ac = symbol_to_asset.get(sig.symbol, "crypto")
+            oos_by_class.setdefault(ac, []).append(sig)
+
+        oos_parts: list[pd.DataFrame] = []
+        for ac, sigs in oos_by_class.items():
+            t = simulate_trades(
+                sigs,
+                commission_pct=ASSET_COMMISSION.get(ac, cfg["backtest"]["commission_pct"]),
+                slippage_pct=cfg["backtest"]["slippage_pct"],
+                account_size=account_size,
+                use_circuit_breaker=True,
+                aaa_only=True,
+                asset_class=ac,
+            )
+            if not t.empty:
+                oos_parts.append(t)
+
+        oos_trades = pd.concat(oos_parts, ignore_index=True) if oos_parts else pd.DataFrame()
+        if not oos_trades.empty:
+            oos_trades = oos_trades.sort_values("timestamp").reset_index(drop=True)
         oos_metrics = compute_metrics(oos_trades, account_size=account_size)
 
         # Save OOS trades
