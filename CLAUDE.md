@@ -210,6 +210,20 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 - `monte_carlo_check()` — 1000x Trade-Reihenfolge shufflen, 95%-KI berechnen, robust wenn untere Grenze > 0
 - `validate_oos_results()` — 4 Gates: PF≥1.5, min 100 Trades, Sharpe≥0.5, Monte Carlo robust
 - `check_parameter_stability()` — ±10% Parameter-Perturbation, prüft ob PF-Änderung <50%
+- `get_multi_asset_symbols()` — Erkennt automatisch Symbole aus allen 4 Asset-Klassen-Verzeichnissen
+- `ASSET_COMMISSION` — Asset-spezifische Kommissionen (Crypto 0.04%, Forex ~0.5 pip, Stocks 0%, Commodities ~1 pip)
+
+**Multi-Asset Backtesting:**
+- Lädt Daten aus `data/crypto/`, `data/forex/`, `data/stocks/`, `data/commodities/`
+- `symbol_to_asset` Mapping für asset-spezifische CB-Klassen und Kommissionen
+- Stocks nutzen 5m als Basis-TF (kein 1m verfügbar bei kostenlosen Quellen)
+- Circuit Breaker simuliert pro Asset-Klasse separat (2% Klassen-Drawdown → Pause)
+- Walk-Forward über alle Asset-Klassen gleichzeitig
+
+**RL Brain im Backtest: NEIN**
+- RL Brain wird NICHT im Backtest trainiert (Overfitting-Gefahr)
+- Backtest validiert nur die regelbasierten Filter (SMC + AAA++)
+- RL Brain trainiert erst im Paper-Trading on-the-fly (nach 100 Warmup-Trades)
 
 **Trade-Outcome-Modell:**
 - Win-Probability: `alignment_score × 0.60 - RR_penalty` (jeder RR-Punkt >3.0 reduziert um 2%)
@@ -247,9 +261,9 @@ data/
 **Balance-Strategie:** Backtesting immer 100K. Paper-Trading: OANDA/Alpaca auf 100K, Binance 5K — Vergleich über %-basierte Metriken (Win Rate, PF, Sharpe, Avg RR).
 
 ### Nächste Schritte
-1. **Daten herunterladen**: Alle 3 Downloader laufen lassen (Crypto, Forex/Commodities, Stocks)
-2. **RL Brain Neutraining**: Alten Checkpoint löschen, 24-dim Architektur
-3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen
+1. **Daten-Downloads abwarten**: Crypto (100 Coins, ~4-5h), Forex+Commodities (32, ~1-2h), Stocks ✅ fertig (50)
+2. **Backtester laufen lassen**: Walk-Forward über alle Asset-Klassen mit Monte Carlo + Stability Check
+3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert hier on-the-fly)
 4. **Live**: Nur wenn Paper-Ergebnisse innerhalb 1σ der Backtests
 
 ## Testing & Anti-Overfitting

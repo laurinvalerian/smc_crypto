@@ -116,23 +116,42 @@ def download_ohlcv_oanda(
             current_from + timedelta(seconds=step_seconds), to_dt
         ).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
 
-        try:
-            response = ctx.instrument.candles(
-                instrument,
-                granularity=granularity,
-                fromTime=from_rfc,
-                toTime=to_rfc,
-                price="M",  # Midpoint
-                count=MAX_CANDLES_PER_REQUEST,
-            )
-        except Exception as exc:
-            logger.warning("Error fetching %s %s: %s — retrying", instrument, granularity, exc)
-            time.sleep(2)
+        max_retries = 5
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response = ctx.instrument.candles(
+                    instrument,
+                    granularity=granularity,
+                    fromTime=from_rfc,
+                    toTime=to_rfc,
+                    price="M",  # Midpoint
+                    # Note: count + from + to together is invalid in OANDA API
+                )
+                break
+            except Exception as exc:
+                wait = 2 * (attempt + 1)
+                logger.warning("Error fetching %s %s (attempt %d/%d): %s — retrying in %ds",
+                               instrument, granularity, attempt + 1, max_retries, exc, wait)
+                time.sleep(wait)
+
+        if response is None:
+            logger.error("Failed to fetch %s after %d retries — skipping chunk", instrument, max_retries)
+            current_from += timedelta(seconds=step_seconds)
             continue
 
-        candles = response.get("candles", [])
+        # v20 Response object: status 200 → candles in body
+        if response.status != 200:
+            logger.warning("OANDA returned %s for %s — skipping chunk", response.status, instrument)
+            current_from += timedelta(seconds=step_seconds)
+            time.sleep(RATE_LIMIT_SLEEP)
+            continue
+
+        candles = response.body.get("candles", [])
         if not candles:
-            break
+            # No more data in this range — advance cursor
+            current_from += timedelta(seconds=step_seconds)
+            continue
 
         for c in candles:
             if not c.complete:

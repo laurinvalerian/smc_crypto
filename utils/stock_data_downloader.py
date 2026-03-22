@@ -113,24 +113,37 @@ def download_ohlcv_alpaca(
 
     all_rows: list[dict] = []
     current_from = from_dt
+    max_retries = 3
 
     # Chunk by date to avoid hitting limits
     chunk_delta = timedelta(days=CHUNK_DAYS_5M)
 
     while current_from < to_dt:
         chunk_to = min(current_from + chunk_delta, to_dt)
+        retries = 0
 
-        try:
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=current_from,
-                end=chunk_to,
-            )
-            bars = client.get_stock_bars(request)
-        except Exception as exc:
-            logger.warning("Error fetching %s: %s — retrying", symbol, exc)
-            time.sleep(2)
+        while retries < max_retries:
+            try:
+                request = StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=tf,
+                    start=current_from,
+                    end=chunk_to,
+                    feed="iex",  # Free tier uses IEX feed (SIP requires paid plan)
+                )
+                bars = client.get_stock_bars(request)
+                break
+            except Exception as exc:
+                retries += 1
+                if retries >= max_retries:
+                    logger.error("Failed fetching %s after %d retries: %s — skipping chunk", symbol, max_retries, exc)
+                    bars = None
+                    break
+                logger.warning("Error fetching %s: %s — retry %d/%d", symbol, exc, retries, max_retries)
+                time.sleep(2)
+
+        if bars is None:
+            current_from = chunk_to
             continue
 
         # bars[symbol] is a list of Bar objects

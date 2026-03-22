@@ -260,16 +260,26 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     logger.info("Connecting to exchange ...")
     exchange = create_exchange(cfg)
 
-    # === KORRIGIERTE TOP 20 COINS – alle Futures-Namen 100 % korrekt (März 2026) ===
-    symbols = [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "TONUSDT",
-        "ADAUSDT", "AVAXUSDT", "1000SHIBUSDT", "LINKUSDT", "DOTUSDT", "TRXUSDT", "BCHUSDT",
-        "NEARUSDT", "LTCUSDT", "1000PEPEUSDT", "SUIUSDT", "UNIUSDT", "HBARUSDT"
-    ]
-    
-    logger.info(f"✅ Korrigierte 20 Top-Coins (keine Fehler mehr)")
+    # Fetch all USDT-M perpetual symbols and take top N by volume rank
+    all_symbols = get_usdt_perp_symbols(exchange)
+    rank_threshold = cfg["volume_filter"].get("rank_threshold", 100)
 
-    logger.info(f"🚀 Schneller Test-Modus: Nur {len(symbols)} Top Coins + letzte 12 Monate")
+    # Sort by 24h quote volume (descending) to get top coins
+    vol_ranked = []
+    for sym in all_symbols:
+        mkt = exchange.markets.get(sym, {})
+        info = mkt.get("info", {})
+        qvol = float(info.get("quoteVolume", 0) or 0)
+        vol_ranked.append((sym, qvol))
+    vol_ranked.sort(key=lambda x: x[1], reverse=True)
+
+    # Take top N and convert to Binance format (remove / and :)
+    symbols = []
+    for sym, _vol in vol_ranked[:rank_threshold]:
+        safe = sym.replace("/", "").replace(":USDT", "")
+        symbols.append(safe)
+
+    logger.info(f"Top {len(symbols)} USDT-M Futures coins by volume")
 
     # ── 2. Download 1 m candles per symbol ────────────────────────
     for symbol in tqdm(symbols, desc="Downloading 1m data"):

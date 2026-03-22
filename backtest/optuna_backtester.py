@@ -175,6 +175,7 @@ def simulate_trades(
     account_size: float = 100_000,
     use_circuit_breaker: bool = True,
     aaa_only: bool = True,
+    asset_class: str = "crypto",
 ) -> pd.DataFrame:
     """
     Simulate PnL with AAA++ tier filtering and circuit breaker.
@@ -216,7 +217,7 @@ def simulate_trades(
             trade_time = sig.timestamp.to_pydatetime()
             if hasattr(trade_time, 'tzinfo') and trade_time.tzinfo is None:
                 trade_time = trade_time.replace(tzinfo=timezone.utc)
-            can_trade, reason = cb.can_trade("crypto", trade_time)
+            can_trade, reason = cb.can_trade(asset_class, trade_time)
             if not can_trade:
                 rejected_count += 1
                 continue
@@ -264,7 +265,7 @@ def simulate_trades(
             trade_time = sig.timestamp.to_pydatetime()
             if hasattr(trade_time, 'tzinfo') and trade_time.tzinfo is None:
                 trade_time = trade_time.replace(tzinfo=timezone.utc)
-            cb.record_trade_pnl(pnl_pct, "crypto", sig.symbol, trade_time)
+            cb.record_trade_pnl(pnl_pct, asset_class, sig.symbol, trade_time)
 
         rows.append(
             {
@@ -503,6 +504,7 @@ def _build_objective(
     train_end: pd.Timestamp,
     window_index: int = 0,
     results_dir: Path | None = None,
+    symbol_to_asset: dict[str, str] | None = None,
 ):
     """Return an Optuna objective function closed over the training window."""
 
@@ -672,13 +674,74 @@ def compute_param_importance(study: optuna.Study, results_dir: Path) -> pd.DataF
 # ═══════════════════════════════════════════════════════════════════
 
 def get_available_symbols(data_dir: Path) -> list[str]:
-    """Return all symbols with a 1m Parquet file in data_dir."""
+    """Return all symbols with a 1m Parquet file in data_dir (legacy single-dir)."""
     parquets = sorted(data_dir.glob("*_1m.parquet"))
     symbols = [
         p.stem.replace("_1m", "").replace("_", "/").replace("/USDT/USDT", "/USDT:USDT")
         for p in parquets
     ]
     return symbols
+
+
+def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
+    """
+    Return symbols grouped by asset class from all data directories.
+
+    Returns dict like:
+      {"crypto": ["BTC/USDT:USDT", ...], "forex": ["EUR_USD", ...],
+       "stocks": ["AAPL", ...], "commodities": ["XAU_USD", ...]}
+    """
+    data_cfg = cfg["data"]
+    result: dict[str, list[str]] = {}
+
+    # Crypto: data/crypto/ → 1m parquets → CCXT format
+    crypto_dir = Path(data_cfg.get("crypto_dir", "data/crypto"))
+    if crypto_dir.exists():
+        parquets = sorted(crypto_dir.glob("*_1m.parquet"))
+        crypto_syms = []
+        for p in parquets:
+            raw = p.stem.replace("_1m", "")
+            if "USDT" in raw and raw != "volume":
+                # Convert BTCUSDT → BTC/USDT:USDT for CCXT
+                base = raw.replace("USDT", "")
+                crypto_syms.append(f"{base}/USDT:USDT")
+        if crypto_syms:
+            result["crypto"] = crypto_syms
+
+    # Forex: data/forex/ → 1m parquets → OANDA format (EUR_USD)
+    forex_dir = Path(data_cfg.get("forex_dir", "data/forex"))
+    if forex_dir.exists():
+        parquets = sorted(forex_dir.glob("*_1m.parquet"))
+        forex_syms = [p.stem.replace("_1m", "") for p in parquets]
+        if forex_syms:
+            result["forex"] = forex_syms
+
+    # Stocks: data/stocks/ → 5m parquets (no 1m!) → plain symbols
+    stocks_dir = Path(data_cfg.get("stocks_dir", "data/stocks"))
+    if stocks_dir.exists():
+        parquets = sorted(stocks_dir.glob("*_5m.parquet"))
+        stock_syms = [p.stem.replace("_5m", "").replace("_", ".") for p in parquets]
+        if stock_syms:
+            result["stocks"] = stock_syms
+
+    # Commodities: data/commodities/ → 1m parquets → OANDA format
+    comm_dir = Path(data_cfg.get("commodities_dir", "data/commodities"))
+    if comm_dir.exists():
+        parquets = sorted(comm_dir.glob("*_1m.parquet"))
+        comm_syms = [p.stem.replace("_1m", "") for p in parquets]
+        if comm_syms:
+            result["commodities"] = comm_syms
+
+    return result
+
+
+# Asset-class specific commission rates
+ASSET_COMMISSION: dict[str, float] = {
+    "crypto": 0.0004,       # 0.04% taker (Binance Futures)
+    "forex": 0.00005,       # ~0.5 pip spread equivalent
+    "stocks": 0.0,          # Commission-free (Alpaca)
+    "commodities": 0.0001,  # ~1 pip spread equivalent
+}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -779,6 +842,31 @@ def run(
     start = pd.Timestamp(cfg["data"]["start_date"], tz="UTC")
     end = pd.Timestamp(datetime.now(timezone.utc))
 
+    # Multi-asset: discover symbols from all asset-class directories
+    multi_assets = get_multi_asset_symbols(cfg)
+    all_symbols_flat: list[str] = []
+    symbol_to_asset: dict[str, str] = {}
+    for ac, syms in multi_assets.items():
+        for s in syms:
+            all_symbols_flat.append(s)
+            symbol_to_asset[s] = ac
+
+    total_instruments = sum(len(v) for v in multi_assets.values())
+    logger.info(
+        "Multi-asset universe: %d instruments (crypto=%d, forex=%d, stocks=%d, commodities=%d)",
+        total_instruments,
+        len(multi_assets.get("crypto", [])),
+        len(multi_assets.get("forex", [])),
+        len(multi_assets.get("stocks", [])),
+        len(multi_assets.get("commodities", [])),
+    )
+
+    # Fallback: legacy single data_dir if no multi-asset dirs
+    if not all_symbols_flat:
+        all_symbols_flat = get_available_symbols(data_dir)
+        for s in all_symbols_flat:
+            symbol_to_asset[s] = "crypto"
+
     windows = generate_wf_windows(start, end, train_months, test_months)
     logger.info("Walk-forward windows: %d", len(windows))
 
@@ -795,7 +883,7 @@ def run(
             window["test_end"].date(),
         )
 
-        symbols = get_available_symbols(data_dir)
+        symbols = all_symbols_flat
         if not symbols:
             logger.warning("No symbols for window %d – skipping", wi)
             continue
@@ -811,6 +899,7 @@ def run(
         objective = _build_objective(
             cfg, symbols, window["train_start"], window["train_end"],
             window_index=wi, results_dir=results_dir,
+            symbol_to_asset=symbol_to_asset,
         )
         study.optimize(objective, n_trials=n_trials, n_jobs=-1, show_progress_bar=True)
 
