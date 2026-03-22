@@ -22,6 +22,9 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 | `ranker/` | Cross-Asset Opportunity Ranker (Scanner, Ranker, Allocator) |
 | `risk/` | Circuit Breakers (Daily/Weekly Loss, Asset-Class Pause, Heat) |
 | `config/default_config.yaml` | Alle konfigurierbaren Parameter |
+| `utils/forex_data_downloader.py` | OANDA Forex+Commodities OHLCV Download |
+| `utils/stock_data_downloader.py` | Alpaca US Stocks OHLCV Download |
+| `.env` / `.env.example` | API Keys für alle Broker (nicht committed) |
 
 ### Signal-Flow (Top-Down)
 
@@ -215,8 +218,36 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 
 **CLI-Flags:** `--monte-carlo`, `--stability-check`
 
+### Daten-Downloader & Broker-Setup (✅ FERTIG)
+
+**Neue Dateien:**
+- `utils/forex_data_downloader.py` — OANDA v20 API: 28 Forex-Pairs + 4 Commodities, 1m-1d, Resume-Support, Parquet
+- `utils/stock_data_downloader.py` — Alpaca Data API: Top 50 US Stocks, 5m Basis-TF (1m History zu kurz), Parquet
+- `.env.example` — Template für alle API Keys (Binance, OANDA, Alpaca)
+
+**Config-Erweiterung (`default_config.yaml`):**
+- `exchanges` Section: Binance (testnet), OANDA (practice), Alpaca (paper) mit Env-Var-Referenzen
+- `data` Section: Separate Verzeichnisse pro Asset-Klasse (`data/crypto/`, `data/forex/`, `data/stocks/`, `data/commodities/`)
+
+**Daten-Verzeichnisstruktur:**
+```
+data/
+├── crypto/       # 120 Coins via CCXT/Binance (1m Basis)
+├── forex/        # 28 Pairs via OANDA (1m Basis)
+├── stocks/       # 50 Stocks via Alpaca (5m Basis)
+└── commodities/  # 4 Instrumente via OANDA (1m Basis)
+```
+
+**Broker-Accounts:**
+- Binance Testnet: ~5000 USDT (nicht änderbar), PnL in % tracken
+- OANDA Practice: 100K USD (einstellbar), Live-Preise
+- Alpaca Paper: 100K USD (einstellbar), IEX-Feed gratis
+- Alle API Keys in `.env` (via `python-dotenv`)
+
+**Balance-Strategie:** Backtesting immer 100K. Paper-Trading: OANDA/Alpaca auf 100K, Binance 5K — Vergleich über %-basierte Metriken (Win Rate, PF, Sharpe, Avg RR).
+
 ### Nächste Schritte
-1. **Datenquellen + Broker-Setup planen** (API Keys, Testnet/Paper, Account Balances)
+1. **Daten herunterladen**: Alle 3 Downloader laufen lassen (Crypto, Forex/Commodities, Stocks)
 2. **RL Brain Neutraining**: Alten Checkpoint löschen, 24-dim Architektur
 3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen
 4. **Live**: Nur wenn Paper-Ergebnisse innerhalb 1σ der Backtests
@@ -249,6 +280,13 @@ python3 live_multi_bot.py [--config config/default_config.yaml]
 
 # Backtesting (Optuna Walk-Forward)
 python3 backtest/optuna_backtester.py
+
+# Daten herunterladen
+python3 -m utils.data_downloader                              # Crypto (Binance)
+python3 -m utils.forex_data_downloader                        # Forex + Commodities (OANDA)
+python3 -m utils.forex_data_downloader --commodities-only     # Nur Commodities
+python3 -m utils.stock_data_downloader                        # US Stocks (Alpaca)
+python3 -m utils.stock_data_downloader --symbols AAPL MSFT    # Einzelne Stocks
 ```
 
 ## Wichtige Konstanten
@@ -269,6 +307,8 @@ WARMUP_TRADES = 100              # Trades ohne RL Gate
 
 ```
 bot/
+├── .env                           # API Keys (NICHT in Git!)
+├── .env.example                   # Template für .env
 ├── live_multi_bot.py              # Haupt-Orchestrator (PaperBot + Runner)
 ├── rl_brain.py                    # PPO RL Brain (24-dim, shaped rewards)
 ├── strategies/
@@ -284,7 +324,9 @@ bot/
 ├── backtest/
 │   └── optuna_backtester.py       # Walk-Forward Optimizer
 ├── utils/
-│   └── data_downloader.py         # CCXT Daten-Download
+│   ├── data_downloader.py         # Crypto OHLCV Download (CCXT/Binance)
+│   ├── forex_data_downloader.py   # Forex+Commodities OHLCV Download (OANDA v20)
+│   └── stock_data_downloader.py   # US Stocks OHLCV Download (Alpaca)
 ├── exchanges/                     # Exchange-Abstraktionsschicht (Phase 2+3 ✅)
 │   ├── __init__.py                # Package-Exports (lazy imports für optionale Adapter)
 │   ├── models.py                  # InstrumentMeta, OrderResult, PositionInfo, BalanceInfo

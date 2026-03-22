@@ -129,6 +129,11 @@ data:
   resample_tfs: ["5m", "15m", "1h", "4h", "1d"]
   start_date: "2025-03-01" # letzte 12 Monate
   data_dir: "data"         # Where Parquet files are stored
+  # Per-asset-class data directories
+  crypto_dir: "data/crypto"
+  forex_dir: "data/forex"
+  stocks_dir: "data/stocks"
+  commodities_dir: "data/commodities"
 
 # ── Backtest / Optuna ────────────────────────────────────────────
 backtest:
@@ -142,7 +147,27 @@ backtest:
   commission_pct: 0.0004   # 0.04 % taker fee (Binance Futures)
   slippage_pct: 0.0001     # 0.01 % estimated slippage
 
-# ── Live / Paper Trading (Phase 2) ───────────────────────────────
+# ── Exchange / Broker Configuration ─────────────────────────────
+# API keys are loaded from .env (never store keys in this file!)
+exchanges:
+  binance:
+    enabled: true
+    testnet: true            # Use Binance Futures Testnet
+    env_key: "BINANCE_API_KEY"
+    env_secret: "BINANCE_SECRET"
+  oanda:
+    enabled: true
+    practice: true           # Use OANDA Practice (demo) account
+    env_token: "OANDA_ACCESS_TOKEN"
+    env_account: "OANDA_ACCOUNT_ID"
+  alpaca:
+    enabled: true
+    paper: true              # Use Alpaca Paper Trading
+    env_key: "ALPACA_API_KEY"
+    env_secret: "ALPACA_API_SECRET"
+    base_url: "https://paper-api.alpaca.markets/v2"
+
+# ── Live / Paper Trading ────────────────────────────────────────
 live:
   testnet: true            # Start on Binance Futures Testnet
   poll_interval_sec: 5     # Order-book polling interval

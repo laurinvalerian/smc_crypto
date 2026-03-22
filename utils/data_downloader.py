@@ -242,7 +242,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     4. Compute historical 30-day volume rankings.
     """
     cfg = load_config(config_path)
-    data_dir = Path(cfg["data"]["data_dir"])
+    data_dir = Path(cfg["data"].get("crypto_dir", cfg["data"]["data_dir"]))
     data_dir.mkdir(parents=True, exist_ok=True)
 
     start_date = cfg["data"]["start_date"]
