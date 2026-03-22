@@ -101,6 +101,7 @@ OUTPUT_DIR = Path("live_results")
 
 DASHBOARD_REFRESH_SEC = 10         # Dashboard refresh interval
 POSITION_POLL_SEC = 5             # Interval (seconds) for polling exchange positions
+ZOMBIE_SWEEP_SEC = 60             # Interval (seconds) for periodic zombie order sweep
 WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
 WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
 WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
@@ -1208,8 +1209,11 @@ class PaperBot:
             return
         if sig["symbol"] != symbol:
             return
-        # ── Duplicate zone check (replaces cooldown timer) ─────────
-        if self._active_trades:
+        # ── Duplicate style check ─────────────────────────────────
+        # Allow one trade per style (scalp / day / swing) simultaneously,
+        # but never two trades of the same style on the same coin.
+        pending_style = sig.get("style", STYLE_DAY)
+        if any(t["style"] == pending_style for t in self._active_trades):
             self._pending_signal = None
             return
 
@@ -2874,7 +2878,19 @@ class LiveMultiBotRunner:
             # This catches zombie orders when ID-based cancels fail (e.g. the
             # triggered order already filled and its ID was re-used, or the
             # stored ID was wrong).
+            # IMPORTANT: protect orders belonging to OTHER active trades
+            # (different style) on the same coin — only cancel orders that
+            # match the closed trade's SL/TP prices.
             if self.exchange is not None:
+                # Collect order IDs of other still-active trades to protect them
+                protected_ids: set[str] = set()
+                for other in bot._active_trades:
+                    if other is trade:
+                        continue
+                    for k in ("order_id", "sl_order_id", "tp_order_id"):
+                        oid = other.get(k)
+                        if oid:
+                            protected_ids.add(str(oid))
                 try:
                     open_orders = await self.exchange.fetch_open_orders(bot.symbol)
                     trade_sl = trade.get("sl")
@@ -2882,6 +2898,9 @@ class LiveMultiBotRunner:
                     for o in open_orders:
                         o_id = str(o.get("id") or "")
                         if not o_id:
+                            continue
+                        # Never cancel orders belonging to other active trades
+                        if o_id in protected_ids:
                             continue
                         # Skip orders we already successfully cancelled above
                         if o_id in cancel_targets:
@@ -2910,8 +2929,9 @@ class LiveMultiBotRunner:
                                 await self.exchange.cancel_order(o_id, bot.symbol)
                                 bot.logger.info(
                                     "Zombie order cancelled (price-match) %s"
-                                    " stopPrice=%.6f for %s",
+                                    " stopPrice=%.6f for %s [style=%s]",
                                     o_id, o_stop, bot.symbol,
+                                    trade.get("style", "?"),
                                 )
                             except Exception as ce:
                                 bot.logger.warning(
@@ -3066,6 +3086,132 @@ class LiveMultiBotRunner:
             except asyncio.TimeoutError:
                 pass
 
+    # ── Periodic zombie order sweep ────────────────────────────────
+
+    async def _sweep_zombie_orders(self) -> None:
+        """
+        Periodically scan ALL open orders on the exchange and cancel any
+        that do not belong to a currently active trade.
+
+        This is the last line of defence against zombie orders that slip
+        through the per-trade cleanup in _record_close (e.g. due to race
+        conditions, network errors, or exchange quirks).
+
+        IMPORTANT: style-aware — orders belonging to active trades of any
+        style (scalp/day/swing) on the same coin are protected.
+        """
+        while not self._shutdown.is_set():
+            try:
+                # Build a set of ALL known order IDs across ALL active trades
+                known_order_ids: set[str] = set()
+                symbols_with_trades: set[str] = set()
+                for bot in self.bots:
+                    for trade in bot._active_trades:
+                        for k in ("order_id", "sl_order_id", "tp_order_id"):
+                            oid = trade.get(k)
+                            if oid:
+                                known_order_ids.add(str(oid))
+                        symbols_with_trades.add(bot.symbol)
+
+                # For every bot that has NO active trades, any open
+                # SL/TP order is definitely a zombie — cancel it.
+                for bot in self.bots:
+                    if bot._active_trades:
+                        continue  # has active trades – handled per-trade
+                    if self.exchange is None:
+                        continue
+                    try:
+                        open_orders = await self.exchange.fetch_open_orders(bot.symbol)
+                    except Exception:
+                        continue
+                    for o in open_orders:
+                        o_id = str(o.get("id") or "")
+                        if not o_id:
+                            continue
+                        o_type = (o.get("type", "") or "").lower()
+                        is_exit_type = any(
+                            k in o_type for k in ("stop", "take_profit")
+                        )
+                        if not is_exit_type:
+                            continue
+                        # This coin has zero active trades → any exit order is zombie
+                        try:
+                            await self.exchange.cancel_order(o_id, bot.symbol)
+                            bot.logger.warning(
+                                "ZOMBIE SWEEP: cancelled orphan order %s "
+                                "type=%s for %s (no active trades)",
+                                o_id, o.get("type", "?"), bot.symbol,
+                            )
+                        except Exception as ce:
+                            exc_str = str(ce)
+                            if "-2011" not in exc_str and "Unknown order" not in exc_str:
+                                bot.logger.warning(
+                                    "ZOMBIE SWEEP: cancel failed %s for %s: %s",
+                                    o_id, bot.symbol, ce,
+                                )
+
+                # For bots WITH active trades, verify each open order belongs
+                # to one of them.  Cancel if it doesn't match any known ID.
+                for bot in self.bots:
+                    if not bot._active_trades:
+                        continue
+                    if self.exchange is None:
+                        continue
+                    try:
+                        open_orders = await self.exchange.fetch_open_orders(bot.symbol)
+                    except Exception:
+                        continue
+
+                    # Collect order IDs for THIS bot's active trades
+                    bot_order_ids: set[str] = set()
+                    for trade in bot._active_trades:
+                        for k in ("order_id", "sl_order_id", "tp_order_id"):
+                            oid = trade.get(k)
+                            if oid:
+                                bot_order_ids.add(str(oid))
+
+                    for o in open_orders:
+                        o_id = str(o.get("id") or "")
+                        if not o_id:
+                            continue
+                        o_type = (o.get("type", "") or "").lower()
+                        is_exit_type = any(
+                            k in o_type for k in ("stop", "take_profit")
+                        )
+                        if not is_exit_type:
+                            continue
+                        # If this order ID is NOT in any of this bot's active trades → zombie
+                        if o_id not in bot_order_ids:
+                            try:
+                                await self.exchange.cancel_order(o_id, bot.symbol)
+                                bot.logger.warning(
+                                    "ZOMBIE SWEEP: cancelled unmatched order %s "
+                                    "type=%s for %s (not in any active trade)",
+                                    o_id, o.get("type", "?"), bot.symbol,
+                                )
+                            except Exception as ce:
+                                exc_str = str(ce)
+                                if "-2011" not in exc_str and "Unknown order" not in exc_str:
+                                    bot.logger.warning(
+                                        "ZOMBIE SWEEP: cancel failed %s for %s: %s",
+                                        o_id, bot.symbol, ce,
+                                    )
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error("Zombie sweep error: %s", exc)
+
+            # Sleep until next sweep (or shutdown)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown.wait(),
+                    timeout=ZOMBIE_SWEEP_SEC,
+                )
+                return  # shutdown requested
+            except asyncio.TimeoutError:
+                pass
+
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _fetch_real_total_equity(self) -> float:
@@ -3138,6 +3284,9 @@ class LiveMultiBotRunner:
         # Position poller (detects TP/SL fills on exchange)
         poll_task = asyncio.create_task(self._poll_positions())
 
+        # Periodic zombie order sweep (catches any orphans missed by per-trade cleanup)
+        zombie_task = asyncio.create_task(self._sweep_zombie_orders())
+
         # Rich dashboard
         dashboard_task = asyncio.create_task(self._dashboard_loop())
 
@@ -3148,13 +3297,14 @@ class LiveMultiBotRunner:
         # Cancel all tasks
         dashboard_task.cancel()
         poll_task.cancel()
+        zombie_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
         for t in self._ticker_tasks.values():
             t.cancel()
 
         all_tasks = (
-            [dashboard_task, poll_task]
+            [dashboard_task, poll_task, zombie_task]
             + list(self._watcher_tasks.values())
             + list(self._ticker_tasks.values())
         )
