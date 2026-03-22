@@ -27,6 +27,7 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 
 ```
 5m Candle arrives → _prepare_signal()
+  ├── Circuit Breaker Check (daily/weekly loss, asset-class pause, heat)
   ├── Volatility Gate (Daily ATR ≥ 0.8%, 5m ATR ≥ 0.15%)
   ├── Volume Pre-Check (≥ 0.5x 20-bar avg)
   ├── _multi_tf_alignment_score() → 13-Komponenten-Score (0.0-1.0)
@@ -187,13 +188,47 @@ Neue Filter-Module, 13-Komponenten-Scoring, Tier-Umbau, RL-Brain-Erweiterung.
 - `get_size_factor()` → Multiplikator für Position-Sizing (1.0 oder 0.5)
 - Auto-Recovery: Pausen laufen automatisch ab, Size-Reduction hebt sich auf wenn Weekly-PnL erholt
 
+### Integration in live_multi_bot.py (✅ FERTIG)
+- `create_exchange()` erstellt `BinanceAdapter` intern, gibt `adapter.raw` zurück (backward-compat)
+- `PaperBot.circuit_breaker` — Shared Circuit Breaker, Check in `_prepare_signal()` vor jedem Signal
+- `LiveMultiBotRunner` initialisiert Circuit Breaker, Ranker, Allocator im Konstruktor
+- Circuit Breaker PnL-Recording bei jedem Trade-Close in `_poll_positions()`
+- Portfolio-Heat-Update im Dashboard-Loop (summiert risk_pct aller aktiven Trades)
+- Ranker + Allocator sind initialisiert aber noch nicht trade-driving (bereit für Multi-Asset-Modus)
+
+### Backtester (`backtest/optuna_backtester.py`) (✅ FERTIG)
+
+Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Overfitting-Gates:
+
+**Kernfunktionen:**
+- `classify_signal_tier()` — AAA++ / AAA+ / REJECTED basierend auf Score, RR, Komponenten-Flags
+- `simulate_trades()` — Komplett umgeschrieben: AAA++ Tier-Gate, Circuit Breaker pro Trade, dynamisches Risk-Sizing (AAA++ 1-2%, AAA+ 0.5-1%), Size-Reduction-Faktor von CB
+- `compute_metrics()` — Erweitert: avg_rr, trades pro Tier, pnl_per_trade, expectancy
+- `monte_carlo_check()` — 1000x Trade-Reihenfolge shufflen, 95%-KI berechnen, robust wenn untere Grenze > 0
+- `validate_oos_results()` — 4 Gates: PF≥1.5, min 100 Trades, Sharpe≥0.5, Monte Carlo robust
+- `check_parameter_stability()` — ±10% Parameter-Perturbation, prüft ob PF-Änderung <50%
+
+**Trade-Outcome-Modell:**
+- Win-Probability: `alignment_score × 0.60 - RR_penalty` (jeder RR-Punkt >3.0 reduziert um 2%)
+- Circuit Breaker simuliert Daily/Weekly Loss Limits pro Trade
+- Seeded RNG für reproduzierbare Ergebnisse
+
+**CLI-Flags:** `--monte-carlo`, `--stability-check`
+
+### Nächste Schritte
+1. **Datenquellen + Broker-Setup planen** (API Keys, Testnet/Paper, Account Balances)
+2. **RL Brain Neutraining**: Alten Checkpoint löschen, 24-dim Architektur
+3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen
+4. **Live**: Nur wenn Paper-Ergebnisse innerhalb 1σ der Backtests
+
 ## Testing & Anti-Overfitting
 
 - **Walk-Forward-Validation Pflicht**: 3 Monate Train → 1 Monat Out-of-Sample
 - **Out-of-Sample Profit Factor ≥ 1.5**
 - **Minimum 100 Trades** im OOS für statistische Relevanz
-- **Parameter-Stabilität**: ±10% Änderung darf Performance nicht kippen
-- **Monte-Carlo**: Trade-Reihenfolge 1000x shufflen, 95%-KI muss profitabel sein
+- **Parameter-Stabilität**: ±10% Änderung darf Performance nicht kippen (Backtester: `check_parameter_stability()`)
+- **Monte-Carlo**: Trade-Reihenfolge 1000x shufflen, 95%-KI muss profitabel sein (Backtester: `monte_carlo_check()`)
+- **4-Gate OOS-Validierung**: PF≥1.5, Trades≥100, Sharpe≥0.5, Monte Carlo robust (Backtester: `validate_oos_results()`)
 - **RL Pre-Training**: Nur mit Out-of-Sample Backtest-Trades, Curriculum-basiert
 - **Paper-Trading**: Mindestens 2 Wochen vor Live, innerhalb 1 Std-Abweichung der Backtests
 

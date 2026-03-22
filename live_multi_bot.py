@@ -78,6 +78,10 @@ from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
 from exchanges import BinanceAdapter
+from risk.circuit_breaker import CircuitBreaker
+from ranker.universe_scanner import UniverseScanner, ScanResult
+from ranker.opportunity_ranker import OpportunityRanker, RankedOpportunity
+from ranker.capital_allocator import CapitalAllocator
 
 # ── ccxt (sync) for history loading ───────────────────────────────
 import ccxt as ccxt_sync
@@ -448,6 +452,9 @@ class PaperBot:
 
         # Active exchange order ID (for bracket order tracking)
         self._active_order_id: str | None = None
+
+        # Circuit breaker (shared across all bots, set by Runner)
+        self.circuit_breaker: CircuitBreaker | None = None
 
         # Shared RL Brain (central PPO)
         if central_brain is None:
@@ -1110,6 +1117,14 @@ class PaperBot:
         if self._active_trades:
             self._pending_signal = None
             return
+
+        # ── Circuit breaker check ──────────────────────────────────
+        if self.circuit_breaker is not None:
+            can_trade, cb_reason = self.circuit_breaker.can_trade("crypto")
+            if not can_trade:
+                self._pending_signal = None
+                self.logger.info("CIRCUIT BREAKER SKIP %s: %s", symbol, cb_reason)
+                return
 
         # ── Volatility gate (skip coins with too little movement) ─
         tradeable, daily_atr, fivem_atr = self._check_volatility()
@@ -2788,6 +2803,8 @@ class LiveMultiBotRunner:
       - Position polling every 5 s (detects TP/SL fills on exchange)
       - Rich Live Dashboard
       - Central shared RL brain
+      - Circuit breaker for portfolio-level risk management
+      - Cross-asset opportunity ranker (future multi-asset integration)
 
     Each bot trades only its assigned coin.
     """
@@ -2809,6 +2826,18 @@ class LiveMultiBotRunner:
         self.symbols: list[str] = [b.symbol for b in bots]
         self._shutdown = asyncio.Event()
         self._start_time = datetime.now(timezone.utc)
+
+        # ── Circuit Breaker (shared across all bots) ───────────────
+        self.circuit_breaker = CircuitBreaker()
+        for bot in self.bots:
+            bot.circuit_breaker = self.circuit_breaker
+
+        # ── Opportunity Ranker + Capital Allocator (Phase 4) ───────
+        # These are initialized but not yet driving trade selection.
+        # Currently, each bot independently scans its own coin.
+        # In multi-asset mode, the ranker will replace per-bot scanning.
+        self.ranker = OpportunityRanker(max_opportunities=10)
+        self.allocator = CapitalAllocator()
 
         # WebSocket status per symbol: connected | reconnecting_N | disconnected
         self.ws_status: dict[str, str] = {
@@ -2994,6 +3023,15 @@ class LiveMultiBotRunner:
                 bot.peak_equity = bot.equity
 
             bot._append_equity()
+
+            # Record PnL in circuit breaker
+            if bot.circuit_breaker is not None:
+                pnl_pct_frac = net_pnl / bot._account_equity if bot._account_equity > 0 else 0.0
+                bot.circuit_breaker.record_trade_pnl(
+                    pnl_pct=pnl_pct_frac,
+                    asset_class="crypto",
+                    symbol=bot.symbol,
+                )
 
             # Feed shaped reward to central RL brain when the decision was tracked
             if trade.get("rl_tracked") and trade.get("rl_trade_id"):
@@ -3404,6 +3442,16 @@ class LiveMultiBotRunner:
                     total_equity = await self._fetch_real_total_equity()
                     for b in self.bots:
                         b._account_equity = total_equity
+
+                    # Update circuit breaker portfolio heat
+                    total_risk = sum(
+                        t.get("risk_pct", 0.0)
+                        for b in self.bots
+                        for t in b._active_trades
+                    )
+                    self.circuit_breaker.update_portfolio_heat(total_risk)
+                    self.circuit_breaker.check()
+
                     layout = build_dashboard(
                         bots=self.bots,
                         ws_status=self.ws_status,
