@@ -222,6 +222,7 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 - Walk-Forward über alle Asset-Klassen gleichzeitig
 - Optuna n_jobs=1 (seriell), Joblib n_jobs=3 (parallel Signals) — verhindert Deadlock auf 4-Core Server
 - n_trials=30 pro Window (reduziert von 500 für 4-Core/8GB Server)
+- **Signal-Precomputation**: Signale werden EINMAL pro Window mit fixen SMC-Params generiert (alignment_threshold=0, RR=5.0), Optuna tuned nur Filter/Trading-Params (alignment_threshold, risk_reward, leverage, risk_per_trade)
 
 **RL Brain im Backtest: NEIN**
 - RL Brain wird NICHT im Backtest trainiert (Overfitting-Gefahr)
@@ -263,10 +264,37 @@ data/
 
 **Balance-Strategie:** Backtesting immer 100K. Paper-Trading: OANDA/Alpaca auf 100K, Binance 5K — Vergleich über %-basierte Metriken (Win Rate, PF, Sharpe, Avg RR).
 
+### Backtester Bugfixes (2026-03-23)
+- **EMA200-Warmup-Bug**: EMA200 braucht 200 Daily Bars, aber Daten starteten erst 2025-03-01 → zu wenige Bars → "neutral" Bias → 0 Trades
+  - Fix: `start_date` bleibt `2025-03-01` für Walk-Forward, `history_start: 2024-01-01` für Prefetch
+  - `utils/prefetch_history.py` lädt fehlende höhere TFs (1D, 4H, 1H) nach
+  - EMA200 bleibt bei 200 (keine Strategie-Kompromisse!)
+- **Lookback-Buffer-Bug**: `generate_signals()` schnitt historische Bars ab → höhere TFs ohne Warmup
+  - Fix: Lookback-Buffer pro TF (1D: 250, 4H: 100, 1H: 100, 15m: 50), Signals nur innerhalb Window emittiert
+- **Timezone-Bug**: Backtester-Windows waren tz-naive, aber Parquet-Daten tz-aware (UTC) → TypeError bei Vergleich → 0 Signale
+  - Fix: `generate_signals()` normalisiert start/end automatisch zu tz-aware UTC
+- **Alignment-Score-Bug**: Nur 4 von 13 Scoring-Komponenten implementiert → max Score 0.65 → 0 AAA+ Trades
+  - Fix: Vollständige 13-Komponenten-Implementierung (bias_strong, h4_confirms, h4_poi, h1_choch, volume_ok)
+  - Max Score jetzt 0.90 (bias 0.12 + strong 0.08 + h4 0.08 + h4_poi 0.08 + h1 0.08 + choch 0.06 + zone 0.15 + trigger 0.15 + volume 0.10)
+- **Performance-Bug**: 112 Symbole × 30 Trials → 14 min/Trial → 21+ Stunden pro Window
+  - Fix: Signal-Precomputation pro Window (einmal generieren, Optuna tuned nur Filter/Trading-Params)
+  - Geschätzt: ~15 min Signal-Gen + 30 Trials × ~1s = ~15 min pro Window statt 7+ Stunden
+- **Top-30 Crypto**: `get_multi_asset_symbols()` rankt nach 1m-Dateigrösse (Proxy für Liquidität), `max_crypto_symbols: 30`
+- **Train-Window**: 3 Monate Train + 1 Monat OOS
+- **Test-Ergebnis nach Fixes**: BTC 1718 (73 AAA+, 25 AAA++), EUR_USD 456 (21 AAA+), AAPL 356 (10 AAA+), XAU_USD 153 (2 AAA+)
+
+### Auto Data-Prefetching (`utils/prefetch_history.py`) (✅ FERTIG)
+- Prüft alle Instrumente ob genug Higher-TF-Bars VOR `backtest_start` vorhanden (1D: 250, 4H: 500, 1H: 1000)
+- Lädt fehlende historische Bars nach (Crypto via CCXT, Forex/Commodities via OANDA, Stocks via Alpaca)
+- OANDA-Fix: Benutzt `fromTime` + `count=500` (nicht `fromTime+toTime` — gibt 0 Daten zurück)
+- Mergt neue Daten mit bestehenden Parquets (kein Duplikat)
+- Sollte VOR Backtest/Paper/Live einmal laufen: `python3 -m utils.prefetch_history`
+- Ergebnis: Crypto 300+ Daily Bars, Forex 302+, Stocks 291+, Commodities 301+ (alle vor 2025-03-01) ✅
+
 ### Nächste Schritte
-1. **Daten-Downloads**: ✅ ALLE FERTIG (Crypto 100, Forex 28, Stocks 50, Commodities 4 = 184 Instrumente)
-2. **Backtester läuft**: 🔄 Walk-Forward (5 Windows × 30 Trials) mit Monte Carlo + Stability Check — PID 302546, ~12-15h geschätzt
-3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert hier on-the-fly)
+1. **Daten**: ✅ FERTIG + Prefetch komplett (Crypto Top 30, Forex 28, Stocks 50, Commodities 4 — alle mit 250+ Daily Bars Warmup)
+2. **Backtester V5 läuft**: 🔄 Walk-Forward (3 Windows × 30 Trials, März 2025 → ~Dez 2025) mit Signal-Precomputation + Monte Carlo + Stability — PID via `pgrep -f optuna_backtester`
+3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert on-the-fly)
 4. **Live**: Nur wenn Paper-Ergebnisse innerhalb 1σ der Backtests
 
 ## Testing & Anti-Overfitting

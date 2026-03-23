@@ -23,6 +23,7 @@ risk_reward:
 volume_filter:
   enabled: true            # AAA++ mode: strict volume filtering
   rank_threshold: 100      # Only trade coins inside top-100 by 30d volume
+  max_crypto_symbols: 30   # Top 30 crypto coins for backtest/trading (by liquidity)
   lookback_days: 30        # Rolling window for volume ranking
   update_interval_hours: 1 # Live: re-rank every hour
   min_relative_ratio: 1.5  # Current vol must be >= 1.5x 100-bar avg
@@ -127,7 +128,8 @@ data:
   exchange: "binanceusdm"  # CCXT exchange id (Binance USDT-M Futures)
   base_tf: "1m"            # Lowest timeframe to download
   resample_tfs: ["5m", "15m", "1h", "4h", "1d"]
-  start_date: "2025-03-01" # letzte 12 Monate
+  start_date: "2025-03-01" # Walk-Forward-Start (5m Daten verfügbar ab hier)
+  history_start: "2024-01-01" # Higher-TF-History für EMA200 Warmup (via prefetch_history)
   data_dir: "data"         # Where Parquet files are stored
   # Per-asset-class data directories
   crypto_dir: "data/crypto"
@@ -137,7 +139,7 @@ data:
 
 # ── Backtest / Optuna ────────────────────────────────────────────
 backtest:
-  train_months: 2          # Walk-forward training window
+  train_months: 3          # Walk-forward training window (3 months for sufficient signals)
   test_months: 1           # Walk-forward test window
   n_trials: 30             # Optuna trials per window (reduced for 4-core server)
   top_percent: 0.20        # Extract top 20 % parameter sets

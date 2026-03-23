@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 
 # ── Defaults ────────────────────────────────────────────────────────
 
-DAILY_LOSS_LIMIT_PCT = 0.03       # -3% daily → full stop 24h
+DAILY_LOSS_LIMIT_PCT = 0.03       # -3% daily → full stop 24h (funded: -5% limit, 2% buffer)
 WEEKLY_LOSS_LIMIT_PCT = 0.05      # -5% weekly → halve sizes
 ASSET_CLASS_DD_LIMIT_PCT = 0.02   # -2% per asset class → pause 12h
+ALLTIME_DD_LIMIT_PCT = 0.08       # -8% all-time DD → STOP ALL (funded: -10% limit, 2% buffer)
 MAX_PORTFOLIO_HEAT_PCT = 0.06     # 6% total open risk
 DAILY_PAUSE_HOURS = 24
 ASSET_CLASS_PAUSE_HOURS = 12
@@ -55,6 +56,12 @@ class CircuitBreakerState:
     asset_class_pnl_pct: dict[str, float] = field(default_factory=dict)
     portfolio_heat_pct: float = 0.0
 
+    # All-time drawdown tracking
+    alltime_pnl_pct: float = 0.0
+    alltime_peak_pnl_pct: float = 0.0
+    alltime_dd_pct: float = 0.0  # Current drawdown from peak (negative)
+    alltime_breaker_active: bool = False
+
     # Active breaker flags
     daily_breaker_active: bool = False
     weekly_breaker_active: bool = False
@@ -75,11 +82,13 @@ class CircuitBreaker:
         daily_loss_limit: float = DAILY_LOSS_LIMIT_PCT,
         weekly_loss_limit: float = WEEKLY_LOSS_LIMIT_PCT,
         asset_class_dd_limit: float = ASSET_CLASS_DD_LIMIT_PCT,
+        alltime_dd_limit: float = ALLTIME_DD_LIMIT_PCT,
         max_portfolio_heat: float = MAX_PORTFOLIO_HEAT_PCT,
     ) -> None:
         self._daily_limit = daily_loss_limit
         self._weekly_limit = weekly_loss_limit
         self._asset_dd_limit = asset_class_dd_limit
+        self._alltime_dd_limit = alltime_dd_limit
         self._max_heat = max_portfolio_heat
 
         # PnL history (rolling)
@@ -110,6 +119,14 @@ class CircuitBreaker:
             asset_class=asset_class,
             symbol=symbol,
         ))
+
+        # Track all-time PnL and drawdown from peak
+        self._state.alltime_pnl_pct += pnl_pct
+        if self._state.alltime_pnl_pct > self._state.alltime_peak_pnl_pct:
+            self._state.alltime_peak_pnl_pct = self._state.alltime_pnl_pct
+        self._state.alltime_dd_pct = (
+            self._state.alltime_pnl_pct - self._state.alltime_peak_pnl_pct
+        )
 
         # Trim history
         if len(self._pnl_history) > self._max_history:
@@ -220,6 +237,17 @@ class CircuitBreaker:
                         asset_class,
                     )
 
+        # ── All-Time Drawdown (Funded Account Protection) ─────────
+        if self._state.alltime_dd_pct <= -self._alltime_dd_limit:
+            if not self._state.alltime_breaker_active:
+                logger.critical(
+                    "CIRCUIT BREAKER: All-time DD %.2f%% exceeds -%.1f%% limit. "
+                    "STOPPING ALL TRADING PERMANENTLY until manual reset.",
+                    self._state.alltime_dd_pct * 100,
+                    self._alltime_dd_limit * 100,
+                )
+            self._state.alltime_breaker_active = True
+
         # ── Portfolio Heat ─────────────────────────────────────────
         self._state.heat_breaker_active = (
             self._state.portfolio_heat_pct >= self._max_heat
@@ -241,6 +269,13 @@ class CircuitBreaker:
             utc_now = datetime.now(timezone.utc)
 
         state = self.check(utc_now)
+
+        # All-time DD breaker — permanent stop
+        if state.alltime_breaker_active:
+            return False, (
+                f"ALL-TIME DD BREAKER: DD {state.alltime_dd_pct:.2%} exceeds "
+                f"-{self._alltime_dd_limit:.0%} limit. Trading permanently stopped."
+            )
 
         # Full trading pause
         if state.all_trading_paused_until and utc_now < state.all_trading_paused_until:

@@ -176,6 +176,93 @@ def _precompute_running_bias(indicators: dict[str, Any], df_1d: pd.DataFrame) ->
     return running
 
 
+def _precompute_bias_strong(indicators: dict[str, Any], df_1d: pd.DataFrame) -> np.ndarray:
+    """
+    Track whether the daily bias came from BOS/CHoCH (strong=True)
+    or just from EMA fallback (strong=False).
+    Returns a boolean array: True where bias is from BOS/CHoCH.
+    """
+    bos_choch = indicators.get("bos_choch")
+    n = len(df_1d)
+    strong = np.zeros(n, dtype=bool)
+    has_bos_choch = False
+
+    if bos_choch is not None and not bos_choch.empty:
+        for i in range(n):
+            choch = bos_choch["CHOCH"].iat[i]
+            bos = bos_choch["BOS"].iat[i]
+            val = choch if (pd.notna(choch) and choch != 0) else bos
+            if pd.notna(val) and val != 0:
+                has_bos_choch = True
+            strong[i] = has_bos_choch
+
+    return strong
+
+
+def _precompute_h1_choch_mask(indicators: dict[str, Any]) -> np.ndarray:
+    """
+    Track whether there has been a recent 1H CHoCH (stronger than BOS).
+    Returns a boolean running mask: True if the most recent 1H signal was a CHoCH.
+    """
+    bos_choch = indicators.get("bos_choch")
+    if bos_choch is None or bos_choch.empty:
+        return np.zeros(0, dtype=bool)
+
+    n = len(bos_choch)
+    mask = np.zeros(n, dtype=bool)
+    last_was_choch = False
+
+    for i in range(n):
+        choch = bos_choch["CHOCH"].iat[i]
+        bos = bos_choch["BOS"].iat[i]
+        if pd.notna(choch) and choch != 0:
+            last_was_choch = True
+        elif pd.notna(bos) and bos != 0:
+            last_was_choch = False
+        mask[i] = last_was_choch
+
+    return mask
+
+
+def _check_h4_poi(indicators_4h: dict[str, Any], df_4h: pd.DataFrame,
+                   bias: str, valid_len: int) -> bool:
+    """Check if there's a recent 4H FVG or OB aligned with bias (last 6 bars)."""
+    if valid_len <= 0:
+        return False
+    max_lookback = 6
+
+    for data_key in ("fvg", "order_blocks"):
+        data = indicators_4h.get(data_key)
+        if data is None or data.empty:
+            continue
+        end = min(valid_len, len(data))
+        scan_start = max(0, end - max_lookback)
+        for idx in range(end - 1, scan_start - 1, -1):
+            row = data.iloc[idx]
+            dir_key = "FVG" if data_key == "fvg" else "OB"
+            val = row.get(dir_key, 0)
+            if pd.isna(val) or val == 0:
+                continue
+            if bias == "bullish" and val > 0:
+                return True
+            if bias == "bearish" and val < 0:
+                return True
+    return False
+
+
+def _check_volume_ok(decision_df: pd.DataFrame, bar_idx: int,
+                     lookback: int = 20, min_ratio: float = 1.2) -> bool:
+    """Check if current volume is above average (simple volume confirmation)."""
+    start = max(0, bar_idx - lookback)
+    vol_slice = decision_df["volume"].iloc[start:bar_idx + 1]
+    if len(vol_slice) < 5:
+        return False
+    avg_vol = vol_slice.iloc[:-1].mean()
+    if avg_vol <= 0:
+        return False
+    return float(vol_slice.iloc[-1]) >= avg_vol * min_ratio
+
+
 def _precompute_running_structure(indicators: dict[str, Any]) -> np.ndarray:
     """
     For each bar index i, compute the latest BOS/CHoCH direction (+1/-1/0).
@@ -559,19 +646,44 @@ class SMCMultiStyleStrategy:
         symbol : str   e.g. "BTC/USDT:USDT"
         start, end : optional timestamps to restrict the window
         """
+        # Normalize start/end to tz-aware UTC (data is always tz-aware)
+        if start is not None and not isinstance(start, pd.Timestamp):
+            start = pd.Timestamp(start)
+        if start is not None and start.tzinfo is None:
+            start = start.tz_localize("UTC")
+        if end is not None and not isinstance(end, pd.Timestamp):
+            end = pd.Timestamp(end)
+        if end is not None and end.tzinfo is None:
+            end = end.tz_localize("UTC")
+
         frames = self._load_all_timeframes(symbol)
         if not frames:
             logger.warning("[%s] No data available – skipping", symbol)
             return []
 
-        # Slice to window
+        # Slice to window — keep lookback buffer for higher TFs so indicators
+        # have enough history.  Only the decision TF (5m) is hard-sliced later
+        # when emitting signals; higher TFs keep extra bars for warmup.
+        lookback_bars = {
+            "1m": 0, "5m": 0, "15m": 50, "1h": 100, "4h": 100, "1d": 250,
+        }
         for tf in list(frames.keys()):
             df = frames[tf]
-            if start is not None:
-                df = df[df["timestamp"] >= start]
             if end is not None:
                 df = df[df["timestamp"] <= end]
+            if start is not None:
+                buf = lookback_bars.get(tf, 0)
+                if buf > 0:
+                    # Keep extra bars before start for indicator warmup
+                    mask = df["timestamp"] >= start
+                    first_idx = mask.idxmax() if mask.any() else len(df)
+                    keep_from = max(0, first_idx - buf)
+                    df = df.iloc[keep_from:]
+                else:
+                    df = df[df["timestamp"] >= start]
             frames[tf] = df.reset_index(drop=True)
+        # Remember the actual signal window start for filtering output
+        _signal_window_start = start  # already normalized to tz-aware UTC above
 
         signals: list[TradeSignal] = []
 
@@ -601,6 +713,7 @@ class SMCMultiStyleStrategy:
         # Required higher-TF indicators
         ind_1d = indicators.get("1d")
         ind_1h = indicators.get("1h")
+        ind_4h = indicators.get("4h")
         ind_15m = indicators.get("15m")
         ind_5m = indicators.get("5m")
 
@@ -609,13 +722,20 @@ class SMCMultiStyleStrategy:
             return signals
 
         df_1d = frames.get("1d", pd.DataFrame())
+        df_4h = frames.get("4h", pd.DataFrame())
         df_1h = frames.get("1h", pd.DataFrame())
         df_15m = frames.get("15m", pd.DataFrame())
         df_5m = decision_df
 
         # ── Precompute running arrays (O(n) once) ────────────────
         running_bias_1d = _precompute_running_bias(ind_1d, df_1d)
+        running_bias_strong = _precompute_bias_strong(ind_1d, df_1d)
         running_struct_1h = _precompute_running_structure(ind_1h)
+        running_h1_choch = _precompute_h1_choch_mask(ind_1h)
+        running_struct_4h = (
+            _precompute_running_structure(ind_4h)
+            if ind_4h is not None else np.zeros(0, dtype=np.int8)
+        )
         bull_trigger_5m, bear_trigger_5m = (
             _precompute_5m_trigger_mask(ind_5m)
             if ind_5m is not None else (np.zeros(0, dtype=bool), np.zeros(0, dtype=bool))
@@ -633,6 +753,7 @@ class SMCMultiStyleStrategy:
             return np.searchsorted(htf_ts, ts_5m, side="right").astype(np.int64)
 
         vlen_1d = _build_valid_len_map(df_1d)
+        vlen_4h = _build_valid_len_map(df_4h)
         vlen_1h = _build_valid_len_map(df_1h)
         vlen_15m = _build_valid_len_map(df_15m)
 
@@ -659,19 +780,38 @@ class SMCMultiStyleStrategy:
                 n_neutral += 1
                 continue
 
-            # ── Step 2: 1H structure confirmation ─────────────────
-            h1_ok = _structure_confirms_from_running(
-                running_struct_1h, bias, int(vlen_1h[i])
+            # ── Step 1b: Bias strength (BOS/CHoCH vs EMA fallback) ─
+            vl_1d = int(vlen_1d[i])
+            bias_strong = bool(
+                running_bias_strong[min(vl_1d - 1, len(running_bias_strong) - 1)]
+            ) if vl_1d > 0 and len(running_bias_strong) > 0 else False
+
+            # ── Step 2: 4H structure confirmation ─────────────────
+            h4_ok = _structure_confirms_from_running(
+                running_struct_4h, bias, int(vlen_4h[i])
+            )
+            h4_poi = (
+                _check_h4_poi(ind_4h, df_4h, bias, int(vlen_4h[i]))
+                if ind_4h is not None and not df_4h.empty else False
             )
 
-            # ── Step 3: 15m entry zone (FVG / OB) ────────────────
+            # ── Step 3: 1H structure confirmation ─────────────────
+            vl_1h = int(vlen_1h[i])
+            h1_ok = _structure_confirms_from_running(
+                running_struct_1h, bias, vl_1h
+            )
+            h1_choch = bool(
+                running_h1_choch[min(vl_1h - 1, len(running_h1_choch) - 1)]
+            ) if vl_1h > 0 and len(running_h1_choch) > 0 else False
+
+            # ── Step 4: 15m entry zone (FVG / OB) ────────────────
             entry_zone = None
             if ind_15m is not None and not df_15m.empty:
                 entry_zone = _find_entry_zone_at(
                     ind_15m, df_15m, bias, self.fvg_threshold, int(vlen_15m[i]),
                 )
 
-            # ── Step 4: 5m precision trigger ──────────────────────
+            # ── Step 5: 5m precision trigger ──────────────────────
             precision_ok = False
             if i < len(bull_trigger_5m):
                 if bias == "bullish":
@@ -679,9 +819,17 @@ class SMCMultiStyleStrategy:
                 elif bias == "bearish":
                     precision_ok = bool(bear_trigger_5m[i])
 
-            # ── Alignment score ───────────────────────────────────
+            # ── Step 6: Volume confirmation ───────────────────────
+            volume_ok = _check_volume_ok(decision_df, i)
+
+            # ── Alignment score (full 13-component) ──────────────
             score = _compute_alignment_score(
                 bias, h1_ok, entry_zone, precision_ok, self.style_weight,
+                bias_strong=bias_strong,
+                h4_confirms=h4_ok,
+                h4_poi=h4_poi,
+                h1_choch=h1_choch,
+                volume_ok=volume_ok,
             )
 
             if score < self.alignment_threshold:
@@ -741,6 +889,10 @@ class SMCMultiStyleStrategy:
             if qty <= 0:
                 continue
 
+            # Only emit signals within the requested window (not from lookback buffer)
+            if _signal_window_start is not None and ts < _signal_window_start:
+                continue
+
             n_emitted += 1
             signals.append(
                 TradeSignal(
@@ -757,9 +909,14 @@ class SMCMultiStyleStrategy:
                     alignment_score=score,
                     meta={
                         "bias": bias,
+                        "bias_strong": bias_strong,
+                        "h4_confirms": h4_ok,
+                        "h4_poi": h4_poi,
                         "h1_confirm": h1_ok,
+                        "h1_choch": h1_choch,
                         "entry_zone": entry_zone,
                         "precision_trigger": precision_ok,
+                        "volume_ok": volume_ok,
                     },
                 )
             )

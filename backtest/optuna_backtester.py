@@ -222,46 +222,57 @@ def simulate_trades(
                 rejected_count += 1
                 continue
 
-        # ── Dynamic position sizing ──────────────────────────────
-        risk_amount = compute_dynamic_risk(tier, alignment, equity)
-        position_size = risk_amount / sl_dist if sl_dist > 0 else 0
-        if position_size <= 0:
+        # ── Dynamic position sizing (%-based risk on CURRENT equity) ─
+        # Compound growth: risk is always % of current equity
+        # risk_amount = how much $ we're willing to lose on this trade
+        # sl_pct = stop-loss distance as a fraction of entry price
+        sl_pct = sl_dist / sig.entry_price
+        if sl_pct <= 0:
             continue
+
+        risk_amount = compute_dynamic_risk(tier, alignment, equity)
+        # Hard cap: never risk more than 3% of current equity per trade
+        risk_amount = min(risk_amount, equity * 0.03)
+        if risk_amount <= 0 or equity <= 0:
+            continue
+
+        position_notional = risk_amount / sl_pct  # $ notional value
+        position_size = position_notional / sig.entry_price  # quantity in base units
 
         # Size reduction from circuit breaker
         if cb is not None:
             position_size *= cb.get_size_factor()
+            position_notional *= cb.get_size_factor()
 
-        # Slippage + commission cost
+        # Slippage + commission cost (as % of notional)
         cost_pct = commission_pct * 2 + slippage_pct * 2
-        cost = sig.entry_price * position_size * cost_pct
+        cost = position_notional * cost_pct
 
         # ── Deterministic outcome model ──────────────────────────
-        # Uses alignment score + RR to estimate win probability
-        # Higher alignment = higher base win rate
-        # Higher RR = slightly lower win rate (harder to reach TP)
         rng = np.random.RandomState(
             int(sig.timestamp.timestamp()) % (2**31)
         )
-        # Base win prob from alignment (AAA++ scores are 0.78+)
         base_win_prob = alignment * 0.60
-        # RR penalty: each point above 3.0 reduces win prob by 2%
         rr_penalty = max(0, (rr - 3.0) * 0.02)
         win_prob = max(0.10, min(0.80, base_win_prob - rr_penalty))
 
         outcome = "win" if rng.random() < win_prob else "loss"
 
         if outcome == "win":
-            pnl = tp_dist * position_size - cost
+            pnl = risk_amount * rr - cost  # Win = risk × RR
         else:
-            pnl = -(sl_dist * position_size) - cost
+            pnl = -risk_amount - cost  # Loss = risk amount
 
-        # Update equity
-        equity += pnl
+        # Update equity (never go below 0)
+        equity = max(0, equity + pnl)
+
+        # Bankrupt check — stop trading if equity drops below 10% of initial
+        if equity < account_size * 0.10:
+            break
 
         # Record in circuit breaker
         if cb is not None:
-            pnl_pct = pnl / account_size
+            pnl_pct = pnl / account_size  # Always relative to INITIAL account
             trade_time = sig.timestamp.to_pydatetime()
             if hasattr(trade_time, 'tzinfo') and trade_time.tzinfo is None:
                 trade_time = trade_time.replace(tzinfo=timezone.utc)
@@ -497,85 +508,130 @@ def validate_oos_results(
 #  Optuna objective
 # ═══════════════════════════════════════════════════════════════════
 
-def _build_objective(
+def _precompute_window_signals(
     config: dict[str, Any],
     symbols: list[str],
-    train_start: pd.Timestamp,
-    train_end: pd.Timestamp,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    symbol_to_asset: dict[str, str] | None = None,
+) -> list[TradeSignal]:
+    """
+    Generate signals ONCE per window with fixed SMC params (from config defaults).
+    Signals include full alignment scores + meta flags.
+    Optuna trials then only filter/trade these signals with different thresholds.
+    """
+    # Use config defaults for SMC params — these are not tuned per trial
+    smc_cfg = config.get("smc", {})
+    params = {
+        "swing_length": smc_cfg.get("swing_length", 10),
+        "fvg_threshold": smc_cfg.get("fvg_threshold", 0.0004),
+        "order_block_lookback": smc_cfg.get("order_block_lookback", 20),
+        "liquidity_range_percent": smc_cfg.get("liquidity_range_percent", 0.005),
+        "risk_reward": 5.0,  # Max RR — generate widest possible TP
+        "alignment_threshold": 0.0,  # No filtering — let all signals through
+        "style_weights": {"day": 1.0},
+    }
+    strategy = SMCMultiStyleStrategy(config, params)
+
+    def _gen_signals(sym):
+        try:
+            return strategy.generate_signals(sym, start=window_start, end=window_end)
+        except Exception as exc:
+            logger.debug("Signal gen failed for %s: %s", sym, exc)
+            return []
+
+    all_signals_list = Parallel(n_jobs=3)(
+        delayed(_gen_signals)(sym) for sym in symbols
+    )
+    all_signals: list[TradeSignal] = [
+        s for sublist in all_signals_list for s in sublist
+    ]
+
+    logger.info(
+        "Precomputed %d signals for %d instruments (window %s → %s)",
+        len(all_signals), len(symbols),
+        window_start.date(), window_end.date(),
+    )
+    return all_signals
+
+
+def _build_objective(
+    config: dict[str, Any],
+    precomputed_signals: list[TradeSignal],
     window_index: int = 0,
     results_dir: Path | None = None,
     symbol_to_asset: dict[str, str] | None = None,
 ):
-    """Return an Optuna objective function closed over the training window."""
+    """Return an Optuna objective function that filters precomputed signals."""
+
+    # Pre-group signals by asset class (once, not per trial)
+    signals_by_class: dict[str, list[TradeSignal]] = {}
+    for sig in precomputed_signals:
+        ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
+        signals_by_class.setdefault(ac, []).append(sig)
 
     def objective(trial: optuna.Trial) -> float:
+        # Only tune filtering + trading params (signals are precomputed)
         tuning = config.get("tuning", {})
-        params: dict[str, Any] = {
-            "leverage": trial.suggest_int(
-                "leverage", config["leverage"]["min"], config["leverage"]["max"]
-            ),
-            "risk_per_trade": trial.suggest_float(
-                "risk_per_trade",
-                config["risk_per_trade"]["min"],
-                config["risk_per_trade"]["max"],
-                step=0.001,
-            ),
-            "risk_reward": trial.suggest_categorical(
-                "risk_reward", config["risk_reward"]["options"]
-            ),
-            "alignment_threshold": trial.suggest_float(
-                "alignment_threshold",
-                tuning.get("alignment_threshold_min", 0.60),
-                tuning.get("alignment_threshold_max", 0.90),
-                step=0.05,
-            ),
-            "swing_length": trial.suggest_int(
-                "swing_length",
-                tuning.get("swing_length_min", 6),
-                tuning.get("swing_length_max", 14),
-            ),
-            "fvg_threshold": trial.suggest_float(
-                "fvg_threshold",
-                tuning.get("fvg_threshold_min", 0.0002),
-                tuning.get("fvg_threshold_max", 0.0008),
-                step=0.0001,
-            ),
-            "style_weights": {
-                "day": trial.suggest_float("weight_day", 0.5, 1.5, step=0.1),
-            },
-            "order_block_lookback": trial.suggest_int("order_block_lookback", 10, 40),
-            "liquidity_range_percent": trial.suggest_float(
-                "liquidity_range_percent", 0.002, 0.01, step=0.001
-            ),
-        }
-
-        strategy = SMCMultiStyleStrategy(config, params)
-
-        def _gen_signals(sym):
-            try:
-                return strategy.generate_signals(sym, start=train_start, end=train_end)
-            except Exception as exc:
-                logger.debug("Signal gen failed for %s: %s", sym, exc)
-                return []
-
-        all_signals_list = Parallel(n_jobs=3)(
-            delayed(_gen_signals)(sym) for sym in symbols
+        alignment_threshold = trial.suggest_float(
+            "alignment_threshold",
+            tuning.get("alignment_threshold_min", 0.60),
+            tuning.get("alignment_threshold_max", 0.90),
+            step=0.05,
         )
-        all_signals: list[TradeSignal] = [
-            s for sublist in all_signals_list for s in sublist
-        ]
+        risk_reward = trial.suggest_categorical(
+            "risk_reward", config["risk_reward"]["options"]
+        )
+        leverage = trial.suggest_int(
+            "leverage", config["leverage"]["min"], config["leverage"]["max"]
+        )
+        risk_per_trade = trial.suggest_float(
+            "risk_per_trade",
+            config["risk_per_trade"]["min"],
+            config["risk_per_trade"]["max"],
+            step=0.001,
+        )
 
-        if not all_signals:
+        # Filter precomputed signals by alignment threshold and recompute TP
+        # based on trial's risk_reward ratio
+        filtered: list[TradeSignal] = []
+        for sig in precomputed_signals:
+            if sig.alignment_score < alignment_threshold:
+                continue
+            # Recompute TP based on trial's RR ratio
+            sl_dist = abs(sig.entry_price - sig.stop_loss)
+            if sl_dist <= 0:
+                continue
+            if sig.direction == "long":
+                new_tp = sig.entry_price + sl_dist * risk_reward
+            else:
+                new_tp = sig.entry_price - sl_dist * risk_reward
+            filtered.append(TradeSignal(
+                timestamp=sig.timestamp,
+                symbol=sig.symbol,
+                direction=sig.direction,
+                style=sig.style,
+                entry_price=sig.entry_price,
+                stop_loss=sig.stop_loss,
+                take_profit=new_tp,
+                risk_reward=risk_reward,
+                position_size=sig.position_size,
+                leverage=leverage,
+                alignment_score=sig.alignment_score,
+                meta=sig.meta,
+            ))
+
+        if not filtered:
             return 0.0
 
-        # Group signals by asset class for correct commissions
-        signals_by_class: dict[str, list[TradeSignal]] = {}
-        for sig in all_signals:
+        # Re-group filtered signals
+        filt_by_class: dict[str, list[TradeSignal]] = {}
+        for sig in filtered:
             ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
-            signals_by_class.setdefault(ac, []).append(sig)
+            filt_by_class.setdefault(ac, []).append(sig)
 
         all_trades: list[pd.DataFrame] = []
-        for ac, sigs in signals_by_class.items():
+        for ac, sigs in filt_by_class.items():
             t = simulate_trades(
                 sigs,
                 commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
@@ -602,7 +658,6 @@ def _build_objective(
             )
 
         # Multi-objective proxy: PF × (1 − |MaxDD|) × Sharpe × sqrt(trades)
-        # sqrt(trades) rewards strategies with enough trades for significance
         trade_count_bonus = math.sqrt(max(metrics["total_trades"], 1)) / 10.0
         score = (
             metrics["profit_factor"]
@@ -709,15 +764,19 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
     data_cfg = cfg["data"]
     result: dict[str, list[str]] = {}
 
-    # Crypto: data/crypto/ → 1m parquets → keep raw filename format (BTCUSDT)
+    # Crypto: data/crypto/ → Top 30 by 1m file size (proxy for volume/liquidity)
     crypto_dir = Path(data_cfg.get("crypto_dir", "data/crypto"))
+    max_crypto = cfg.get("volume_filter", {}).get("max_crypto_symbols", 30)
     if crypto_dir.exists():
-        parquets = sorted(crypto_dir.glob("*_1m.parquet"))
-        crypto_syms = []
+        parquets = list(crypto_dir.glob("*_1m.parquet"))
+        # Rank by file size (more data = more liquid/actively traded)
+        sized = []
         for p in parquets:
             raw = p.stem.replace("_1m", "")
             if "USDT" in raw and raw != "volume":
-                crypto_syms.append(raw)
+                sized.append((raw, p.stat().st_size))
+        sized.sort(key=lambda x: x[1], reverse=True)
+        crypto_syms = [sym for sym, _ in sized[:max_crypto]]
         if crypto_syms:
             result["crypto"] = crypto_syms
 
@@ -765,29 +824,40 @@ def check_parameter_stability(
     study: optuna.Study,
     best_params: dict[str, Any],
     config: dict[str, Any],
-    symbols: list[str],
-    test_start: pd.Timestamp,
-    test_end: pd.Timestamp,
+    precomputed_signals: list[TradeSignal],
     perturbation_pct: float = 0.10,
     n_perturbations: int = 5,
 ) -> dict[str, Any]:
     """
     Check if small parameter changes (±10%) drastically change performance.
-    If they do → overfitting warning.
+    Uses precomputed signals — only perturbs filtering/trading params.
     """
-    base_strategy = SMCMultiStyleStrategy(config, best_params)
 
     def _run_with_params(params):
-        strategy = SMCMultiStyleStrategy(config, params)
-        all_signals = []
-        for sym in symbols:
-            try:
-                sigs = strategy.generate_signals(sym, start=test_start, end=test_end)
-                all_signals.extend(sigs)
-            except Exception:
-                pass
+        alignment_th = params.get("alignment_threshold", 0.65)
+        rr = params.get("risk_reward", 4.0)
+        filtered = []
+        for sig in precomputed_signals:
+            if sig.alignment_score < alignment_th:
+                continue
+            sl_dist = abs(sig.entry_price - sig.stop_loss)
+            if sl_dist <= 0:
+                continue
+            if sig.direction == "long":
+                new_tp = sig.entry_price + sl_dist * rr
+            else:
+                new_tp = sig.entry_price - sl_dist * rr
+            filtered.append(TradeSignal(
+                timestamp=sig.timestamp, symbol=sig.symbol,
+                direction=sig.direction, style=sig.style,
+                entry_price=sig.entry_price, stop_loss=sig.stop_loss,
+                take_profit=new_tp, risk_reward=rr,
+                position_size=sig.position_size,
+                leverage=params.get("leverage", 10),
+                alignment_score=sig.alignment_score, meta=sig.meta,
+            ))
         trades = simulate_trades(
-            all_signals,
+            filtered,
             commission_pct=config["backtest"]["commission_pct"],
             slippage_pct=config["backtest"]["slippage_pct"],
             account_size=config["account"]["size"],
@@ -901,6 +971,16 @@ def run(
             logger.warning("No symbols for window %d – skipping", wi)
             continue
 
+        # ── Precompute signals once for this window ────────────────
+        train_signals = _precompute_window_signals(
+            cfg, symbols, window["train_start"], window["train_end"],
+            symbol_to_asset=symbol_to_asset,
+        )
+
+        if not train_signals:
+            logger.warning("Window %d: 0 precomputed signals – skipping", wi)
+            continue
+
         # ── Optuna study (training phase) ─────────────────────────
         window_study_name = f"{study_name}_w{wi}"
         study = optuna.create_study(
@@ -910,7 +990,7 @@ def run(
             load_if_exists=True,
         )
         objective = _build_objective(
-            cfg, symbols, window["train_start"], window["train_end"],
+            cfg, train_signals,
             window_index=wi, results_dir=results_dir,
             symbol_to_asset=symbol_to_asset,
         )
@@ -922,23 +1002,35 @@ def run(
             "day": best_params.pop("weight_day", 1.0),
         }
 
-        strategy = SMCMultiStyleStrategy(cfg, best_params)
-
-        def _gen_oos_signals(sym):
-            try:
-                return strategy.generate_signals(
-                    sym, start=window["test_start"], end=window["test_end"]
-                )
-            except Exception as exc:
-                logger.debug("OOS signal gen failed for %s: %s", sym, exc)
-                return []
-
-        oos_signals_list = Parallel(n_jobs=3)(
-            delayed(_gen_oos_signals)(sym) for sym in symbols
+        # ── Precompute OOS signals ──────────────────────────────────
+        oos_all_signals = _precompute_window_signals(
+            cfg, symbols, window["test_start"], window["test_end"],
+            symbol_to_asset=symbol_to_asset,
         )
-        oos_signals: list[TradeSignal] = [
-            s for sublist in oos_signals_list for s in sublist
-        ]
+
+        # Filter OOS signals with best params
+        best_alignment = best_params.get("alignment_threshold", 0.65)
+        best_rr = best_params.get("risk_reward", 4.0)
+        oos_signals: list[TradeSignal] = []
+        for sig in oos_all_signals:
+            if sig.alignment_score < best_alignment:
+                continue
+            sl_dist = abs(sig.entry_price - sig.stop_loss)
+            if sl_dist <= 0:
+                continue
+            if sig.direction == "long":
+                new_tp = sig.entry_price + sl_dist * best_rr
+            else:
+                new_tp = sig.entry_price - sl_dist * best_rr
+            oos_signals.append(TradeSignal(
+                timestamp=sig.timestamp, symbol=sig.symbol,
+                direction=sig.direction, style=sig.style,
+                entry_price=sig.entry_price, stop_loss=sig.stop_loss,
+                take_profit=new_tp, risk_reward=best_rr,
+                position_size=sig.position_size,
+                leverage=best_params.get("leverage", 10),
+                alignment_score=sig.alignment_score, meta=sig.meta,
+            ))
 
         # Group OOS signals by asset class for correct commissions
         oos_by_class: dict[str, list[TradeSignal]] = {}
@@ -989,8 +1081,7 @@ def run(
         stability_result = None
         if run_stability_check:
             stability_result = check_parameter_stability(
-                study, best_params, cfg, symbols,
-                window["test_start"], window["test_end"],
+                study, best_params, cfg, oos_all_signals,
             )
             logger.info(
                 "Stability W%d: stable=%s max_change=%.1f%%",
