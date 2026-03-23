@@ -140,7 +140,7 @@ data:
 # ── Backtest / Optuna ────────────────────────────────────────────
 backtest:
   train_months: 3          # Walk-forward training window (3 months for sufficient signals)
-  test_months: 1           # Walk-forward test window
+  test_months: 2           # Walk-forward OOS window (2 months — SMC sniper needs time for 20+ trades)
   n_trials: 30             # Optuna trials per window (reduced for 4-core server)
   top_percent: 0.20        # Extract top 20 % parameter sets
   study_name: "smc_wfo"

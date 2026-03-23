@@ -217,12 +217,9 @@ def load_price_data_for_symbols(
                 break
 
 
-# Maximum holding periods by style (number of 5m bars)
-_MAX_BARS: dict[str, int] = {
-    "scalp": 48,     # 4 hours
-    "day": 576,      # 48 hours (2 days)
-    "swing": 4032,   # 2 weeks
-}
+# Maximum holding period for day trading (number of 5m bars)
+# Day trade = max 48 hours (2 trading days). All styles map to this.
+_MAX_BARS_DEFAULT = 576  # 48 hours × 12 bars/hour
 
 
 def _resolve_trade_outcome(
@@ -250,7 +247,7 @@ def _resolve_trade_outcome(
     if future_bars.empty:
         return "skip", sig.entry_price
 
-    max_bars = _MAX_BARS.get(sig.style, _MAX_BARS["day"])
+    max_bars = _MAX_BARS_DEFAULT
     future_bars = future_bars.iloc[:max_bars]
 
     is_long = sig.direction == "long"
@@ -636,13 +633,14 @@ def validate_oos_results(
     """
     Check if out-of-sample results pass anti-overfitting gates.
 
-    6 Gates (ALL must pass):
+    7 Gates (ALL must pass):
     1. Profit Factor >= 1.5
-    2. Minimum 100 trades
+    2. Minimum 20 trades (SMC sniper: ~6-7/month over 2-3 month OOS)
     3. Sharpe >= 0.5
     4. Monte Carlo robust (95% CI profitable)
     5. Max Drawdown > -10% (funded account compliance)
     6. Parameter stability (±10% change < 50% PF shift)
+    7. Win Rate > 20% AND Avg RR > 2.0 (quality check)
     """
     gates: dict[str, bool] = {}
     reasons: list[str] = []
@@ -653,11 +651,11 @@ def validate_oos_results(
     if not gates["profit_factor_ok"]:
         reasons.append(f"Profit Factor {pf:.2f} < 1.5")
 
-    # Gate 2: Minimum trades
+    # Gate 2: Minimum trades (SMC sniper = few but high quality)
     n_trades = oos_metrics.get("total_trades", 0)
-    gates["min_trades_ok"] = n_trades >= 100
+    gates["min_trades_ok"] = n_trades >= 20
     if not gates["min_trades_ok"]:
-        reasons.append(f"Only {n_trades} trades (need >= 100)")
+        reasons.append(f"Only {n_trades} trades (need >= 20)")
 
     # Gate 3: Sharpe
     sharpe = oos_metrics.get("sharpe", 0)
@@ -694,6 +692,17 @@ def validate_oos_results(
             )
     else:
         gates["stability_ok"] = True  # Skip if not run
+
+    # Gate 7: Trade quality — Win Rate > 20% AND Avg RR > 2.0
+    wr = oos_metrics.get("winrate", 0)
+    avg_rr = oos_metrics.get("avg_rr", 0)
+    wr_ok = wr > 0.20
+    rr_ok = avg_rr > 2.0
+    gates["quality_ok"] = wr_ok and rr_ok
+    if not wr_ok:
+        reasons.append(f"Win Rate {wr*100:.1f}% <= 20%")
+    if not rr_ok:
+        reasons.append(f"Avg RR {avg_rr:.1f} <= 2.0")
 
     all_passed = all(gates.values())
 
@@ -858,35 +867,21 @@ def _build_objective(
                 index=False,
             )
 
-        # Multi-objective proxy with hard minimum trade count
-        n_trades = metrics["total_trades"]
+        # Objective: PF × (1 − |DD|) × Sharpe — quality over quantity
+        # No trade-count penalty: SMC sniper = few trades, high quality
+        score = (
+            metrics["profit_factor"]
+            * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
+            * max(metrics["sharpe"], 0.01)
+        )
 
-        # Hard penalty: < 100 trades → score penalized heavily
-        # This prevents Optuna from choosing ultra-selective params
-        if n_trades < 30:
-            score = 0.0
-        elif n_trades < 100:
-            # Linear penalty: 30 trades → 0.3x, 100 trades → 1.0x
-            trade_penalty = n_trades / 100.0
-            score = (
-                metrics["profit_factor"]
-                * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
-                * max(metrics["sharpe"], 0.01)
-                * trade_penalty
-            )
-        else:
-            # 100+ trades: gentle sqrt bonus (encourages more trades)
-            trade_bonus = math.sqrt(n_trades / 100.0)  # 100→1.0, 400→2.0
-            score = (
-                metrics["profit_factor"]
-                * (1.0 + metrics["max_drawdown"])
-                * max(metrics["sharpe"], 0.01)
-                * min(trade_bonus, 3.0)
-            )
-
-        # DD hard gate: if DD exceeds -10%, severely penalize
+        # Hard funded-account DD gate: > -10% DD → heavy penalty
         if metrics["max_drawdown"] < -0.10:
             score *= 0.1
+
+        # Quality floor: need at least some trades to evaluate
+        if metrics["total_trades"] < 5:
+            score = 0.0
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
