@@ -183,13 +183,15 @@ Neue Filter-Module, 13-Komponenten-Scoring, Tier-Umbau, RL-Brain-Erweiterung.
 
 ### Phase 5: Circuit Breakers (✅ FERTIG)
 - `risk/circuit_breaker.py` — `CircuitBreaker` + `CircuitBreakerState`
-- Tagesverlust ≥ 3% → Stop ALL Trading für 24h
+- Tagesverlust ≥ 3% → Stop ALL Trading für 24h (funded: -5% Limit, 2% Buffer)
 - Wochenverlust ≥ 5% → `size_reduction_factor = 0.5` (halbe Positionsgrößen)
 - Asset-Class Drawdown ≥ 2% → Pause diese Klasse für 12h
+- **All-Time Drawdown ≥ 8% → PERMANENTER STOPP** (funded: -10% Limit, 2% Buffer)
 - Portfolio Heat > 6% → Keine neuen Positionen
 - `can_trade(asset_class)` → `(bool, reason)` Quick-Check vor jedem Entry
 - `get_size_factor()` → Multiplikator für Position-Sizing (1.0 oder 0.5)
 - Auto-Recovery: Pausen laufen automatisch ab, Size-Reduction hebt sich auf wenn Weekly-PnL erholt
+- All-Time DD tracked kumulativ (Peak → Current), erfordert manuellen Reset nach permanentem Stopp
 
 ### Integration in live_multi_bot.py (✅ FERTIG)
 - `create_exchange()` erstellt `BinanceAdapter` intern, gibt `adapter.raw` zurück (backward-compat)
