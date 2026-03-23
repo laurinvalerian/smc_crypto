@@ -1,3 +1,6 @@
+this readme is OUTDATED
+
+
 # SMC Crypto Trading Bot
 
 Automated **Smart Money Concepts (SMC / ICT)** trading bot for Binance USDT-M Futures.  
