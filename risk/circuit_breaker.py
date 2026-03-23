@@ -165,28 +165,24 @@ class CircuitBreaker:
         day_start = utc_now - timedelta(hours=24)
         self._state.daily_pnl_pct = self._compute_period_pnl(day_start)
 
-        if self._state.daily_pnl_pct <= -self._daily_limit:
-            if not self._state.daily_breaker_active:
-                logger.warning(
-                    "CIRCUIT BREAKER: Daily loss %.2f%% exceeds -%.1f%% limit. "
-                    "Pausing ALL trading for %dh.",
-                    self._state.daily_pnl_pct * 100,
-                    self._daily_limit * 100,
-                    DAILY_PAUSE_HOURS,
-                )
+        # If already paused, only check expiry — don't re-trigger
+        if self._state.all_trading_paused_until is not None:
+            if utc_now >= self._state.all_trading_paused_until:
+                self._state.daily_breaker_active = False
+                self._state.all_trading_paused_until = None
+                logger.info("CIRCUIT BREAKER: Daily pause expired. Trading resumed.")
+        elif self._state.daily_pnl_pct <= -self._daily_limit:
+            logger.warning(
+                "CIRCUIT BREAKER: Daily loss %.2f%% exceeds -%.1f%% limit. "
+                "Pausing ALL trading for %dh.",
+                self._state.daily_pnl_pct * 100,
+                self._daily_limit * 100,
+                DAILY_PAUSE_HOURS,
+            )
             self._state.daily_breaker_active = True
             self._state.all_trading_paused_until = utc_now + timedelta(
                 hours=DAILY_PAUSE_HOURS
             )
-        else:
-            # Check if pause has expired
-            if (
-                self._state.all_trading_paused_until
-                and utc_now >= self._state.all_trading_paused_until
-            ):
-                self._state.daily_breaker_active = False
-                self._state.all_trading_paused_until = None
-                logger.info("CIRCUIT BREAKER: Daily pause expired. Trading resumed.")
 
         # ── Weekly PnL ─────────────────────────────────────────────
         week_start = utc_now - timedelta(days=7)
@@ -200,8 +196,8 @@ class CircuitBreaker:
                     self._state.weekly_pnl_pct * 100,
                     self._weekly_limit * 100,
                 )
-            self._state.weekly_breaker_active = True
-            self._state.size_reduction_factor = 0.5
+                self._state.weekly_breaker_active = True
+                self._state.size_reduction_factor = 0.5
         else:
             if self._state.weekly_breaker_active:
                 self._state.weekly_breaker_active = False
@@ -213,29 +209,29 @@ class CircuitBreaker:
             class_pnl = self._compute_period_pnl(day_start, asset_class)
             self._state.asset_class_pnl_pct[asset_class] = class_pnl
 
-            if class_pnl <= -self._asset_dd_limit:
-                if not self._state.asset_class_breakers.get(asset_class):
-                    logger.warning(
-                        "CIRCUIT BREAKER: %s loss %.2f%% exceeds -%.1f%%. "
-                        "Pausing %s for %dh.",
-                        asset_class, class_pnl * 100,
-                        self._asset_dd_limit * 100,
-                        asset_class, ASSET_CLASS_PAUSE_HOURS,
-                    )
-                self._state.asset_class_breakers[asset_class] = True
-                self._state.asset_class_paused_until[asset_class] = (
-                    utc_now + timedelta(hours=ASSET_CLASS_PAUSE_HOURS)
-                )
-            else:
-                # Check if class pause expired
-                paused_until = self._state.asset_class_paused_until.get(asset_class)
-                if paused_until and utc_now >= paused_until:
+            paused_until = self._state.asset_class_paused_until.get(asset_class)
+
+            # If already paused, only check expiry
+            if paused_until is not None:
+                if utc_now >= paused_until:
                     self._state.asset_class_breakers[asset_class] = False
                     del self._state.asset_class_paused_until[asset_class]
                     logger.info(
                         "CIRCUIT BREAKER: %s pause expired. Trading resumed.",
                         asset_class,
                     )
+            elif class_pnl <= -self._asset_dd_limit:
+                logger.warning(
+                    "CIRCUIT BREAKER: %s loss %.2f%% exceeds -%.1f%%. "
+                    "Pausing %s for %dh.",
+                    asset_class, class_pnl * 100,
+                    self._asset_dd_limit * 100,
+                    asset_class, ASSET_CLASS_PAUSE_HOURS,
+                )
+                self._state.asset_class_breakers[asset_class] = True
+                self._state.asset_class_paused_until[asset_class] = (
+                    utc_now + timedelta(hours=ASSET_CLASS_PAUSE_HOURS)
+                )
 
         # ── All-Time Drawdown (Funded Account Protection) ─────────
         if self._state.alltime_dd_pct <= -self._alltime_dd_limit:

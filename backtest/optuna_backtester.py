@@ -8,12 +8,13 @@
    • Rolling walk-forward windows (configurable train/test months)
    • Optuna Bayesian optimisation (configurable trials per window)
    • AAA++ tier filtering: only AAA++ and AAA+ trades pass
-   • Circuit breaker simulation (daily -3%, weekly -5%, class -2%)
-   • Full 13-component alignment scoring with filters
-   • Monte Carlo robustness check (1000 shuffles, 95% CI)
-   • Anti-overfitting gates (OOS PF >= 1.5, min 100 trades,
-     parameter stability check)
-   • Trades all available coins from data/
+   • Circuit breaker simulation (daily -3%, weekly -5%, class -2%,
+     all-time -8%)
+   • REAL price-path simulation: walks candles forward to check
+     whether SL or TP is hit first (no synthetic win probability)
+   • Monte Carlo with compound equity (not simple PnL sum)
+   • 6-gate OOS validation: PF, trades, Sharpe, Monte Carlo,
+     max DD (-10%), parameter stability
    • Extracts top 20% best parameter sets automatically
    • Generates parameter-importance ranking (plot + CSV)
    • All results stored in /backtest/results
@@ -165,7 +166,120 @@ def compute_dynamic_risk(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Trade simulation with AAA++ filtering + Circuit Breaker
+#  Price-path data cache (for realistic trade simulation)
+# ═══════════════════════════════════════════════════════════════════
+
+# Module-level cache: symbol → sorted DataFrame with columns [open, high, low, close]
+# Indexed by tz-aware UTC DatetimeIndex at 5m (or 1m) resolution.
+_price_cache: dict[str, pd.DataFrame] = {}
+
+
+def load_price_data_for_symbols(
+    symbols: list[str],
+    config: dict[str, Any],
+) -> None:
+    """
+    Pre-load 5m (or 1m) OHLCV data for all symbols into _price_cache.
+    Called once before simulate_trades to avoid repeated disk I/O.
+    """
+    data_dirs: list[Path] = [Path(config["data"]["data_dir"])]
+    for key in ("crypto_dir", "forex_dir", "stocks_dir", "commodities_dir"):
+        d = config["data"].get(key)
+        if d:
+            p = Path(d)
+            if p.exists() and p not in data_dirs:
+                data_dirs.append(p)
+
+    for sym in symbols:
+        if sym in _price_cache:
+            continue
+        safe = sym.replace("/", "_").replace(":", "_")
+        # Prefer 5m, fall back to 1m
+        loaded = False
+        for tf in ("5m", "1m"):
+            for d in data_dirs:
+                path = d / f"{safe}_{tf}.parquet"
+                if path.exists():
+                    try:
+                        df = pd.read_parquet(path)
+                        # Ensure timestamp is the index
+                        if "timestamp" in df.columns:
+                            df = df.set_index("timestamp")
+                        df = df[["open", "high", "low", "close"]]
+                        if df.index.tz is None:
+                            df.index = df.index.tz_localize("UTC")
+                        _price_cache[sym] = df.sort_index()
+                        loaded = True
+                    except Exception as e:
+                        logger.debug("Failed loading %s: %s", path, e)
+                    break
+            if loaded:
+                break
+
+
+# Maximum holding periods by style (number of 5m bars)
+_MAX_BARS: dict[str, int] = {
+    "scalp": 48,     # 4 hours
+    "day": 576,      # 48 hours (2 days)
+    "swing": 4032,   # 2 weeks
+}
+
+
+def _resolve_trade_outcome(
+    sig: TradeSignal,
+) -> tuple[str, float]:
+    """
+    Walk forward through real price bars after entry to determine outcome.
+
+    Returns:
+        (outcome, exit_price) where outcome is "win", "loss", or "timeout"
+    """
+    df = _price_cache.get(sig.symbol)
+    if df is None or df.empty:
+        # No price data → cannot simulate → skip this trade
+        return "skip", sig.entry_price
+
+    entry_ts = sig.timestamp
+    if not hasattr(entry_ts, 'tzinfo') or entry_ts.tzinfo is None:
+        entry_ts = pd.Timestamp(entry_ts, tz="UTC")
+
+    # Find bars AFTER entry
+    mask = df.index > entry_ts
+    future_bars = df.loc[mask]
+
+    if future_bars.empty:
+        return "skip", sig.entry_price
+
+    max_bars = _MAX_BARS.get(sig.style, _MAX_BARS["day"])
+    future_bars = future_bars.iloc[:max_bars]
+
+    is_long = sig.direction == "long"
+    sl = sig.stop_loss
+    tp = sig.take_profit
+
+    for _, bar in future_bars.iterrows():
+        if is_long:
+            # Check SL first (conservative: assume worst case within bar)
+            if bar["low"] <= sl:
+                return "loss", sl
+            if bar["high"] >= tp:
+                return "win", tp
+        else:  # short
+            if bar["high"] >= sl:
+                return "loss", sl
+            if bar["low"] <= tp:
+                return "win", tp
+
+    # Timeout: close at last bar's close price
+    last_close = float(future_bars.iloc[-1]["close"])
+    if is_long:
+        return ("win" if last_close > sig.entry_price else "loss"), last_close
+    else:
+        return ("win" if last_close < sig.entry_price else "loss"), last_close
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Trade simulation with REAL price paths + Circuit Breaker
 # ═══════════════════════════════════════════════════════════════════
 
 def simulate_trades(
@@ -178,13 +292,18 @@ def simulate_trades(
     asset_class: str = "crypto",
 ) -> pd.DataFrame:
     """
-    Simulate PnL with AAA++ tier filtering and circuit breaker.
+    Simulate trades using REAL price-path outcomes.
 
-    Key improvements over old version:
-    - Only AAA++ and AAA+ tier signals are traded (if aaa_only=True)
-    - Dynamic risk sizing based on tier
-    - Circuit breaker halts trading after excessive losses
-    - Deterministic outcome model based on alignment + RR
+    For each signal, walks forward through actual 5m/1m candle data
+    to check whether SL or TP is hit first. No synthetic win probability.
+
+    Features:
+    - Real price-path simulation (SL/TP hit detection on actual candles)
+    - AAA++ / AAA+ tier filtering
+    - Compound position sizing (risk % of current equity)
+    - Circuit breaker (daily -3%, weekly -5%, class -2%, all-time -8%)
+    - Max holding period by style (scalp 4h, day 48h, swing 2w)
+    - Timeout trades closed at market price
     """
     if not signals:
         return pd.DataFrame()
@@ -194,6 +313,7 @@ def simulate_trades(
 
     rows: list[dict[str, Any]] = []
     rejected_count = 0
+    skipped_no_data = 0
 
     for sig in signals:
         sl_dist = abs(sig.entry_price - sig.stop_loss)
@@ -223,9 +343,6 @@ def simulate_trades(
                 continue
 
         # ── Dynamic position sizing (%-based risk on CURRENT equity) ─
-        # Compound growth: risk is always % of current equity
-        # risk_amount = how much $ we're willing to lose on this trade
-        # sl_pct = stop-loss distance as a fraction of entry price
         sl_pct = sl_dist / sig.entry_price
         if sl_pct <= 0:
             continue
@@ -237,46 +354,52 @@ def simulate_trades(
             continue
 
         position_notional = risk_amount / sl_pct  # $ notional value
-        position_size = position_notional / sig.entry_price  # quantity in base units
+        position_size = position_notional / sig.entry_price  # qty in base units
 
         # Size reduction from circuit breaker
         if cb is not None:
-            position_size *= cb.get_size_factor()
-            position_notional *= cb.get_size_factor()
+            size_factor = cb.get_size_factor()
+            position_size *= size_factor
+            position_notional *= size_factor
+            risk_amount *= size_factor
 
-        # Slippage + commission cost (as % of notional)
+        # Slippage + commission cost (as % of notional, entry + exit)
         cost_pct = commission_pct * 2 + slippage_pct * 2
         cost = position_notional * cost_pct
 
-        # ── Deterministic outcome model ──────────────────────────
-        rng = np.random.RandomState(
-            int(sig.timestamp.timestamp()) % (2**31)
-        )
-        base_win_prob = alignment * 0.60
-        rr_penalty = max(0, (rr - 3.0) * 0.02)
-        win_prob = max(0.10, min(0.80, base_win_prob - rr_penalty))
+        # ── REAL price-path outcome ──────────────────────────────
+        outcome, exit_price = _resolve_trade_outcome(sig)
 
-        outcome = "win" if rng.random() < win_prob else "loss"
+        if outcome == "skip":
+            skipped_no_data += 1
+            continue
 
-        if outcome == "win":
-            pnl = risk_amount * rr - cost  # Win = risk × RR
+        # Calculate actual PnL from price movement
+        if sig.direction == "long":
+            price_pnl_pct = (exit_price - sig.entry_price) / sig.entry_price
         else:
-            pnl = -risk_amount - cost  # Loss = risk amount
+            price_pnl_pct = (sig.entry_price - exit_price) / sig.entry_price
+
+        pnl = position_notional * price_pnl_pct - cost
+
+        # Actual realized RR (for logging)
+        actual_rr = price_pnl_pct / sl_pct if sl_pct > 0 else 0.0
 
         # Update equity (never go below 0)
         equity = max(0, equity + pnl)
 
         # Bankrupt check — stop trading if equity drops below 10% of initial
         if equity < account_size * 0.10:
+            logger.warning("BANKRUPT: equity %.0f < 10%% of initial %.0f", equity, account_size)
             break
 
         # Record in circuit breaker
         if cb is not None:
-            pnl_pct = pnl / account_size  # Always relative to INITIAL account
+            pnl_pct_cb = pnl / account_size  # Always relative to INITIAL account
             trade_time = sig.timestamp.to_pydatetime()
             if hasattr(trade_time, 'tzinfo') and trade_time.tzinfo is None:
                 trade_time = trade_time.replace(tzinfo=timezone.utc)
-            cb.record_trade_pnl(pnl_pct, asset_class, sig.symbol, trade_time)
+            cb.record_trade_pnl(pnl_pct_cb, asset_class, sig.symbol, trade_time)
 
         rows.append(
             {
@@ -288,7 +411,9 @@ def simulate_trades(
                 "entry": sig.entry_price,
                 "sl": sig.stop_loss,
                 "tp": sig.take_profit,
+                "exit_price": exit_price,
                 "rr": rr,
+                "actual_rr": actual_rr,
                 "qty": position_size,
                 "leverage": sig.leverage,
                 "alignment": alignment,
@@ -300,10 +425,10 @@ def simulate_trades(
             }
         )
 
-    if rejected_count > 0:
+    if rejected_count > 0 or skipped_no_data > 0:
         logger.info(
-            "Trade simulation: %d executed, %d rejected (tier/CB filter)",
-            len(rows), rejected_count,
+            "Trade simulation: %d executed, %d rejected (tier/CB), %d skipped (no price data)",
+            len(rows), rejected_count, skipped_no_data,
         )
 
     return pd.DataFrame(rows)
@@ -351,8 +476,13 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     max_dd_usd = abs(max_drawdown * account_size) if max_drawdown != 0 else 1e-9
     recovery_factor = total_pnl / max_dd_usd if max_dd_usd > 0 else 0.0
 
-    # Average RR
-    avg_rr = float(trades_df["rr"].mean()) if "rr" in trades_df.columns else 0.0
+    # Average RR (use actual realized RR if available, else target RR)
+    if "actual_rr" in trades_df.columns:
+        avg_rr = float(trades_df["actual_rr"].mean())
+    elif "rr" in trades_df.columns:
+        avg_rr = float(trades_df["rr"].mean())
+    else:
+        avg_rr = 0.0
 
     # Tier breakdown
     trades_aaa_pp = int((trades_df.get("tier") == TIER_AAA_PLUS_PLUS).sum()) if "tier" in trades_df.columns else 0
@@ -390,10 +520,21 @@ def monte_carlo_check(
     confidence: float = 0.95,
 ) -> dict[str, Any]:
     """
-    Shuffle trade order 1000x and check if 95% CI is still profitable.
+    Shuffle trades 1000x using R-multiple compounding.
 
-    This validates that the strategy's edge is not dependent on
-    a lucky sequence of trades.
+    Each trade is expressed as its realized R-multiple (actual_rr):
+    how many risk-units it actually returned based on real price action.
+    Examples: -1.0R = SL hit, +4.0R = TP hit at RR 4, +1.7R = timeout
+    partial win, -0.3R = timeout partial loss. NOT fixed values.
+
+    Each simulation:
+    1. Shuffles the R-multiples
+    2. For each trade: risks a fixed % of current equity (median
+       risk_pct from actual trades), PnL = equity × risk_pct × R
+    3. Compounds equity after each trade
+
+    This produces genuinely different equity curves because early
+    winners compound differently than late winners.
     """
     if trades_df.empty or len(trades_df) < 10:
         return {
@@ -403,33 +544,67 @@ def monte_carlo_check(
             "ci_lower": 0.0,
             "ci_upper": 0.0,
             "pct_profitable": 0.0,
+            "worst_dd_95pct": 0.0,
+            "n_simulations": 0,
         }
 
-    pnl_array = trades_df["pnl"].values
+    # Extract R-multiples from actual trades
+    # actual_rr = realized R-multiple (positive for wins, negative for losses)
+    if "actual_rr" in trades_df.columns:
+        r_multiples = trades_df["actual_rr"].values.copy()
+    else:
+        # Fallback: compute from PnL and risk_pct
+        risk_pct = trades_df["risk_pct"].values
+        pnl = trades_df["pnl"].values
+        equity_after = trades_df["equity"].values
+        r_multiples = np.zeros(len(pnl))
+        for i in range(len(pnl)):
+            eq_before = equity_after[i] - pnl[i]
+            risk_amt = eq_before * risk_pct[i] if eq_before > 0 else 1.0
+            r_multiples[i] = pnl[i] / risk_amt if risk_amt > 0 else 0.0
+
+    # Median risk % per trade (used for compound sizing in simulation)
+    if "risk_pct" in trades_df.columns:
+        median_risk_pct = float(trades_df["risk_pct"].median())
+    else:
+        median_risk_pct = 0.01  # 1% default
+
+    # Cap extreme R-multiples to prevent single-trade distortion
+    r_multiples = np.clip(r_multiples, -2.0, 15.0)
+
     rng = np.random.RandomState(42)
 
-    final_pnls: list[float] = []
+    final_equities: list[float] = []
     max_dds: list[float] = []
 
     for _ in range(n_simulations):
-        shuffled = rng.permutation(pnl_array)
-        cum_pnl = np.cumsum(shuffled)
-        final_pnls.append(float(cum_pnl[-1]))
+        shuffled = rng.permutation(r_multiples)
 
-        # Max drawdown of shuffled sequence
-        equity = account_size + cum_pnl
-        running_max = np.maximum.accumulate(equity)
-        dd = (equity - running_max) / running_max
+        # Compound equity through shuffled R-multiples
+        equity = account_size
+        equity_curve = np.empty(len(shuffled))
+        for i, r in enumerate(shuffled):
+            risk_amount = equity * median_risk_pct
+            trade_pnl = risk_amount * r
+            equity = max(equity + trade_pnl, 0.0)
+            equity_curve[i] = equity
+
+        final_equities.append(equity)
+
+        # Max drawdown of compounded equity curve
+        running_max = np.maximum.accumulate(equity_curve)
+        dd = np.where(running_max > 0, (equity_curve - running_max) / running_max, 0.0)
         max_dds.append(float(np.min(dd)))
 
-    final_pnls_arr = np.array(final_pnls)
+    final_arr = np.array(final_equities)
+    final_pnls = final_arr - account_size
     max_dds_arr = np.array(max_dds)
 
     alpha = 1 - confidence
-    ci_lower = float(np.percentile(final_pnls_arr, alpha / 2 * 100))
-    ci_upper = float(np.percentile(final_pnls_arr, (1 - alpha / 2) * 100))
-    median_pnl = float(np.median(final_pnls_arr))
-    pct_profitable = float(np.mean(final_pnls_arr > 0))
+    ci_lower = float(np.percentile(final_pnls, alpha / 2 * 100))
+    ci_upper = float(np.percentile(final_pnls, (1 - alpha / 2) * 100))
+    median_pnl = float(np.median(final_pnls))
+    pct_profitable = float(np.mean(final_pnls > 0))
 
     # Robust if 95% CI lower bound is profitable
     robust = ci_lower > 0
@@ -455,15 +630,19 @@ def monte_carlo_check(
 def validate_oos_results(
     oos_metrics: dict[str, float],
     mc_result: dict[str, Any] | None = None,
+    stability_result: dict[str, Any] | None = None,
+    max_dd_limit: float = -0.10,
 ) -> dict[str, Any]:
     """
     Check if out-of-sample results pass anti-overfitting gates.
 
-    Gates:
+    6 Gates (ALL must pass):
     1. Profit Factor >= 1.5
     2. Minimum 100 trades
     3. Sharpe >= 0.5
-    4. Monte Carlo robust (if provided)
+    4. Monte Carlo robust (95% CI profitable)
+    5. Max Drawdown > -10% (funded account compliance)
+    6. Parameter stability (±10% change < 50% PF shift)
     """
     gates: dict[str, bool] = {}
     reasons: list[str] = []
@@ -491,8 +670,30 @@ def validate_oos_results(
         gates["monte_carlo_ok"] = mc_result.get("robust", False)
         if not gates["monte_carlo_ok"]:
             reasons.append(f"Monte Carlo: {mc_result.get('reason', 'failed')}")
+        # Also check Monte Carlo worst-case DD
+        mc_worst_dd = mc_result.get("worst_dd_95pct", 0.0)
+        if mc_worst_dd < max_dd_limit:
+            gates["monte_carlo_ok"] = False
+            reasons.append(f"Monte Carlo worst DD {mc_worst_dd*100:.1f}% exceeds {max_dd_limit*100:.0f}% limit")
     else:
         gates["monte_carlo_ok"] = True  # Skip if not run
+
+    # Gate 5: Max Drawdown (funded account compliance)
+    max_dd = oos_metrics.get("max_drawdown", 0)
+    gates["max_dd_ok"] = max_dd >= max_dd_limit
+    if not gates["max_dd_ok"]:
+        reasons.append(f"Max DD {max_dd*100:.1f}% exceeds {max_dd_limit*100:.0f}% limit (funded account)")
+
+    # Gate 6: Parameter stability (hard fail, not just warning)
+    if stability_result is not None:
+        gates["stability_ok"] = stability_result.get("stable", False)
+        if not gates["stability_ok"]:
+            reasons.append(
+                f"Parameter unstable: ±10% change causes "
+                f"{stability_result.get('max_pf_change_pct', 0):.0f}% PF shift (max 50%)"
+            )
+    else:
+        gates["stability_ok"] = True  # Skip if not run
 
     all_passed = all(gates.values())
 
@@ -657,14 +858,35 @@ def _build_objective(
                 index=False,
             )
 
-        # Multi-objective proxy: PF × (1 − |MaxDD|) × Sharpe × sqrt(trades)
-        trade_count_bonus = math.sqrt(max(metrics["total_trades"], 1)) / 10.0
-        score = (
-            metrics["profit_factor"]
-            * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
-            * max(metrics["sharpe"], 0.01)
-            * min(trade_count_bonus, 2.0)  # Cap bonus at 2x
-        )
+        # Multi-objective proxy with hard minimum trade count
+        n_trades = metrics["total_trades"]
+
+        # Hard penalty: < 100 trades → score penalized heavily
+        # This prevents Optuna from choosing ultra-selective params
+        if n_trades < 30:
+            score = 0.0
+        elif n_trades < 100:
+            # Linear penalty: 30 trades → 0.3x, 100 trades → 1.0x
+            trade_penalty = n_trades / 100.0
+            score = (
+                metrics["profit_factor"]
+                * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
+                * max(metrics["sharpe"], 0.01)
+                * trade_penalty
+            )
+        else:
+            # 100+ trades: gentle sqrt bonus (encourages more trades)
+            trade_bonus = math.sqrt(n_trades / 100.0)  # 100→1.0, 400→2.0
+            score = (
+                metrics["profit_factor"]
+                * (1.0 + metrics["max_drawdown"])
+                * max(metrics["sharpe"], 0.01)
+                * min(trade_bonus, 3.0)
+            )
+
+        # DD hard gate: if DD exceeds -10%, severely penalize
+        if metrics["max_drawdown"] < -0.10:
+            score *= 0.1
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
@@ -903,11 +1125,11 @@ def check_parameter_stability(
 
 def run(
     config_path: str = "config/default_config.yaml",
-    run_monte_carlo: bool = False,
-    run_stability_check: bool = False,
 ) -> None:
     """
     Full walk-forward Optuna backtest pipeline with AAA++ filtering.
+
+    All validation gates (Monte Carlo, stability, max DD) always run.
     """
     cfg = load_config(config_path)
     data_dir = Path(cfg["data"]["data_dir"])
@@ -952,6 +1174,11 @@ def run(
 
     windows = generate_wf_windows(start, end, train_months, test_months)
     logger.info("Walk-forward windows: %d", len(windows))
+
+    # Pre-load 5m/1m price data for all symbols (real price-path simulation)
+    logger.info("Loading price data for %d instruments...", len(all_symbols_flat))
+    load_price_data_for_symbols(all_symbols_flat, cfg)
+    logger.info("Price data loaded for %d instruments", len(_price_cache))
 
     all_window_results: list[pd.DataFrame] = []
     all_validations: list[dict[str, Any]] = []
@@ -1063,34 +1290,37 @@ def run(
                 results_dir / f"oos_trades_w{wi}.csv", index=False,
             )
 
-        # ── Monte Carlo check (optional) ──────────────────────────
+        # ── Monte Carlo check (always — it's a hard gate) ─────────
         mc_result = None
-        if run_monte_carlo and not oos_trades.empty:
+        if not oos_trades.empty:
             mc_result = monte_carlo_check(oos_trades, account_size)
             mc_path = results_dir / f"monte_carlo_w{wi}.json"
             with open(mc_path, "w") as fh:
                 json.dump(mc_result, fh, indent=2, default=str)
             logger.info(
-                "Monte Carlo W%d: robust=%s median_pnl=%.0f CI=[%.0f, %.0f] profitable=%.1f%%",
+                "Monte Carlo W%d: robust=%s median_pnl=%.0f CI=[%.0f, %.0f] profitable=%.1f%% worst_dd_95=%.1f%%",
                 wi, mc_result["robust"], mc_result["median_pnl"],
                 mc_result["ci_lower"], mc_result["ci_upper"],
                 mc_result["pct_profitable"] * 100,
+                mc_result.get("worst_dd_95pct", 0) * 100,
             )
 
-        # ── Parameter stability check (optional) ──────────────────
-        stability_result = None
-        if run_stability_check:
-            stability_result = check_parameter_stability(
-                study, best_params, cfg, oos_all_signals,
-            )
-            logger.info(
-                "Stability W%d: stable=%s max_change=%.1f%%",
-                wi, stability_result["stable"],
-                stability_result["max_pf_change_pct"],
-            )
+        # ── Parameter stability check (always — it's a hard gate) ─
+        stability_result = check_parameter_stability(
+            study, best_params, cfg, oos_all_signals,
+        )
+        logger.info(
+            "Stability W%d: stable=%s max_change=%.1f%%",
+            wi, stability_result["stable"],
+            stability_result["max_pf_change_pct"],
+        )
 
-        # ── Validation gates ──────────────────────────────────────
-        validation = validate_oos_results(oos_metrics, mc_result)
+        # ── Validation gates (6 gates: PF, trades, Sharpe, MC, DD, stability) ──
+        validation = validate_oos_results(
+            oos_metrics, mc_result,
+            stability_result=stability_result,
+            max_dd_limit=-0.10,  # Funded account: max -10% all-time DD
+        )
         validation["window"] = wi
         validation["stability"] = stability_result
         all_validations.append(validation)
@@ -1167,17 +1397,5 @@ if __name__ == "__main__":
         "--config", default="config/default_config.yaml",
         help="Path to YAML config file",
     )
-    parser.add_argument(
-        "--monte-carlo", action="store_true",
-        help="Run Monte Carlo robustness check on each OOS window",
-    )
-    parser.add_argument(
-        "--stability-check", action="store_true",
-        help="Run parameter stability check (±10%% perturbation)",
-    )
     args = parser.parse_args()
-    run(
-        config_path=args.config,
-        run_monte_carlo=args.monte_carlo,
-        run_stability_check=args.stability_check,
-    )
+    run(config_path=args.config)
