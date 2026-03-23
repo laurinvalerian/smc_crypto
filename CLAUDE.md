@@ -207,7 +207,7 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 
 **Kernfunktionen:**
 - `classify_signal_tier()` — AAA++ / AAA+ / REJECTED basierend auf Score, RR, Komponenten-Flags
-- `simulate_trades()` — Komplett umgeschrieben: AAA++ Tier-Gate, Circuit Breaker pro Trade, dynamisches Risk-Sizing (AAA++ 1-2%, AAA+ 0.5-1%), Size-Reduction-Faktor von CB
+- `simulate_trades()` — Komplett umgeschrieben: AAA++ Tier-Gate, Circuit Breaker (inkl. All-Time DD), dynamisches Risk-Sizing (AAA++ 1-2%, AAA+ 0.5-1% von **aktueller Equity** für Zinseszins), Size-Reduction-Faktor von CB, korrekte Position-Sizing (`sl_pct = sl_dist / entry_price`, `position_notional = risk_amount / sl_pct`), Bankrupt-Check bei 10% Equity
 - `compute_metrics()` — Erweitert: avg_rr, trades pro Tier, pnl_per_trade, expectancy
 - `monte_carlo_check()` — 1000x Trade-Reihenfolge shufflen, 95%-KI berechnen, robust wenn untere Grenze > 0
 - `validate_oos_results()` — 4 Gates: PF≥1.5, min 100 Trades, Sharpe≥0.5, Monte Carlo robust
@@ -231,9 +231,17 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 - Backtest validiert nur die regelbasierten Filter (SMC + AAA++)
 - RL Brain trainiert erst im Paper-Trading on-the-fly (nach 100 Warmup-Trades)
 
+**Position Sizing (Compound Growth):**
+- Risk ist immer % der **aktuellen Equity** (nicht initial) → Zinseszins-Effekt
+- `sl_pct = sl_dist / entry_price` (normalisiert auf %-Basis)
+- `position_notional = risk_amount / sl_pct` (korrekte Lots/Shares)
+- Hard Cap: max 3% Equity pro Trade
+- CB `pnl_pct` trackt gegen **initiales Account** (für funded DD-Limits)
+- Bankrupt-Check: Equity < 10% → Trading stoppt
+
 **Trade-Outcome-Modell:**
 - Win-Probability: `alignment_score × 0.60 - RR_penalty` (jeder RR-Punkt >3.0 reduziert um 2%)
-- Circuit Breaker simuliert Daily/Weekly Loss Limits pro Trade
+- Circuit Breaker simuliert Daily/Weekly/All-Time DD Limits pro Trade
 - Seeded RNG für reproduzierbare Ergebnisse
 
 **CLI-Flags:** `--monte-carlo`, `--stability-check`
@@ -266,6 +274,12 @@ data/
 
 **Balance-Strategie:** Backtesting immer 100K. Paper-Trading: OANDA/Alpaca auf 100K, Binance 5K — Vergleich über %-basierte Metriken (Win Rate, PF, Sharpe, Avg RR).
 
+**Funded Account Ziel (Zukunft):**
+- 3× Funded Accounts à 100K: Binance (Crypto), OANDA (Forex+Commodities), Alpaca (Stocks)
+- **Max Daily DD: -5%** → Circuit Breaker Limit bei -3% (2% Buffer)
+- **Max All-Time DD: -10%** → Circuit Breaker Limit bei -8% (2% Buffer)
+- Risk ist **prozentual auf aktuelle Equity** → Zinseszins bei Gewinnen, automatische Reduktion bei Verlusten
+
 ### Backtester Bugfixes (2026-03-23)
 - **EMA200-Warmup-Bug**: EMA200 braucht 200 Daily Bars, aber Daten starteten erst 2025-03-01 → zu wenige Bars → "neutral" Bias → 0 Trades
   - Fix: `start_date` bleibt `2025-03-01` für Walk-Forward, `history_start: 2024-01-01` für Prefetch
@@ -293,11 +307,18 @@ data/
 - Sollte VOR Backtest/Paper/Live einmal laufen: `python3 -m utils.prefetch_history`
 - Ergebnis: Crypto 300+ Daily Bars, Forex 302+, Stocks 291+, Commodities 301+ (alle vor 2025-03-01) ✅
 
+### Backtester Bugfixes V6 (2026-03-23)
+- **Position-Sizing-Bug**: `position_size = risk_amount / sl_dist` normalisierte nicht auf Entry-Preis → Forex SL-Distanzen (0.0050) erzeugten riesige Positionen → -552161% DD
+  - Fix: `sl_pct = sl_dist / entry_price`, `position_notional = risk_amount / sl_pct`, PnL als `risk_amount * rr` (Win) bzw. `-risk_amount` (Loss)
+- **All-Time DD Breaker**: Neuer permanenter Stopp bei -8% all-time DD (2% Buffer vor funded -10% Limit)
+- **Compound Risk**: Risk-Amount basiert auf aktueller Equity (nicht initial) für Zinseszins-Wachstum
+- **CB pnl_pct**: Trackt gegen initiales Account-Size (korrekt für funded DD-Limits)
+
 ### Nächste Schritte
 1. **Daten**: ✅ FERTIG + Prefetch komplett (Crypto Top 30, Forex 28, Stocks 50, Commodities 4 — alle mit 250+ Daily Bars Warmup)
-2. **Backtester V5 läuft**: 🔄 Walk-Forward (3 Windows × 30 Trials, März 2025 → ~Dez 2025) mit Signal-Precomputation + Monte Carlo + Stability — PID via `pgrep -f optuna_backtester`
+2. **Backtester V6 läuft**: 🔄 Walk-Forward (3 Windows × 30 Trials) mit korrektem Position-Sizing + All-Time DD + Compound Risk — PID via `pgrep -f optuna_backtester`
 3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert on-the-fly)
-4. **Live**: Nur wenn Paper-Ergebnisse innerhalb 1σ der Backtests
+4. **Live → Funded**: 3× Funded Accounts geplant (Binance 100K, OANDA 100K, Alpaca 100K) — max -5% daily DD, max -10% all-time DD
 
 ## Testing & Anti-Overfitting
 
@@ -354,6 +375,14 @@ MIN_SL_ATR_MULT = 2.5            # SL mindestens 2.5× ATR
 BASE_OBS_DIM = 24                # RL Feature-Dimension
 HIDDEN_DIM = 128                 # RL Network Hidden Layer
 WARMUP_TRADES = 100              # Trades ohne RL Gate
+
+# Circuit Breaker Limits (funded account safe)
+DAILY_LOSS_LIMIT_PCT = 0.03      # -3% daily → full stop 24h (funded: -5%, 2% buffer)
+WEEKLY_LOSS_LIMIT_PCT = 0.05     # -5% weekly → halve sizes
+ASSET_CLASS_DD_LIMIT = 0.02      # -2% per class → pause 12h
+ALLTIME_DD_LIMIT_PCT = 0.08      # -8% all-time → PERMANENT STOP (funded: -10%, 2% buffer)
+MAX_PORTFOLIO_HEAT = 0.06        # 6% total open risk
+MAX_RISK_PER_TRADE = 0.03        # 3% hard cap per trade
 ```
 
 ## Dateistruktur
