@@ -250,6 +250,142 @@ def _check_h4_poi(indicators_4h: dict[str, Any], df_4h: pd.DataFrame,
     return False
 
 
+def _find_structure_tp(
+    indicators: dict[str, dict[str, Any]],
+    entry_price: float,
+    bias: str,
+    sl_dist: float,
+    vlen_4h: int,
+    vlen_1h: int,
+    min_rr: float = 1.5,
+) -> tuple[float, str]:
+    """
+    Find take-profit from market structure (Liquidity → FVG → OB).
+
+    Searches 4H then 1H for the nearest opposing structure level.
+    Like a real SMC trader: TP at the next liquidity pool, FVG, or OB.
+
+    Returns (tp_price, tp_source) or (0.0, "none") if nothing found.
+    """
+    is_long = bias == "bullish"
+    min_tp_dist = sl_dist * min_rr  # minimum TP distance for acceptable RR
+
+    # Search order: Liquidity 4H → 1H → FVG 4H → 1H → OB 4H → 1H
+    search_plan: list[tuple[str, str, str]] = [
+        ("4h", "liquidity", "liq_4h"),
+        ("1h", "liquidity", "liq_1h"),
+        ("4h", "fvg", "fvg_4h"),
+        ("1h", "fvg", "fvg_1h"),
+        ("4h", "order_blocks", "ob_4h"),
+        ("1h", "order_blocks", "ob_1h"),
+    ]
+
+    for tf, ind_key, source_label in search_plan:
+        ind = indicators.get(tf)
+        if ind is None:
+            continue
+
+        vlen = vlen_4h if tf == "4h" else vlen_1h
+        if vlen <= 0:
+            continue
+
+        data = ind.get(ind_key)
+        if data is None or data.empty:
+            continue
+
+        # Only look at bars we can see (no future peek)
+        visible = data.iloc[:vlen]
+
+        if ind_key == "liquidity":
+            # Liquidity has: Liquidity (direction), Level (price), Swept
+            levels = visible.dropna(subset=["Level"])
+            if levels.empty:
+                continue
+            # Filter unswiped liquidity
+            if "Swept" in levels.columns:
+                levels = levels[levels["Swept"] != True]  # noqa: E712
+            if levels.empty:
+                continue
+
+            if is_long:
+                # Find nearest liquidity ABOVE entry
+                candidates = levels[levels["Level"] > entry_price + min_tp_dist]
+            else:
+                candidates = levels[levels["Level"] < entry_price - min_tp_dist]
+
+            if candidates.empty:
+                continue
+
+            # Nearest level
+            if is_long:
+                tp = float(candidates["Level"].min())
+            else:
+                tp = float(candidates["Level"].max())
+            return tp, source_label
+
+        elif ind_key == "fvg":
+            # FVG has: FVG (+1 bullish, -1 bearish), Top, Bottom, MitigatedIndex
+            fvgs = visible.dropna(subset=["FVG"])
+            if fvgs.empty:
+                continue
+
+            # For long TP: find bearish FVG (-1) above entry (resistance)
+            # For short TP: find bullish FVG (+1) below entry (support)
+            if is_long:
+                opposing = fvgs[fvgs["FVG"] == -1]  # bearish FVG = resistance
+                opposing = opposing[opposing["Bottom"] > entry_price + min_tp_dist]
+                # Prefer unmitigated
+                if "MitigatedIndex" in opposing.columns:
+                    unmitigated = opposing[opposing["MitigatedIndex"].isna()]
+                    if not unmitigated.empty:
+                        opposing = unmitigated
+                if opposing.empty:
+                    continue
+                tp = float(opposing["Bottom"].min())  # nearest bottom of bearish FVG
+            else:
+                opposing = fvgs[fvgs["FVG"] == 1]  # bullish FVG = support
+                opposing = opposing[opposing["Top"] < entry_price - min_tp_dist]
+                if "MitigatedIndex" in opposing.columns:
+                    unmitigated = opposing[opposing["MitigatedIndex"].isna()]
+                    if not unmitigated.empty:
+                        opposing = unmitigated
+                if opposing.empty:
+                    continue
+                tp = float(opposing["Top"].max())  # nearest top of bullish FVG
+            return tp, source_label
+
+        elif ind_key == "order_blocks":
+            # OB has: OB (+1 bullish, -1 bearish), Top, Bottom, MitigatedIndex
+            obs = visible.dropna(subset=["OB"])
+            if obs.empty:
+                continue
+
+            if is_long:
+                opposing = obs[obs["OB"] == -1]  # bearish OB = resistance
+                opposing = opposing[opposing["Bottom"] > entry_price + min_tp_dist]
+                if "MitigatedIndex" in opposing.columns:
+                    unmitigated = opposing[opposing["MitigatedIndex"].isna()]
+                    if not unmitigated.empty:
+                        opposing = unmitigated
+                if opposing.empty:
+                    continue
+                tp = float(opposing["Bottom"].min())
+            else:
+                opposing = obs[obs["OB"] == 1]  # bullish OB = support
+                opposing = opposing[opposing["Top"] < entry_price - min_tp_dist]
+                if "MitigatedIndex" in opposing.columns:
+                    unmitigated = opposing[opposing["MitigatedIndex"].isna()]
+                    if not unmitigated.empty:
+                        opposing = unmitigated
+                if opposing.empty:
+                    continue
+                tp = float(opposing["Top"].max())
+            return tp, source_label
+
+    # Nothing found
+    return 0.0, "none"
+
+
 def _check_volume_ok(decision_df: pd.DataFrame, bar_idx: int,
                      lookback: int = 20, min_ratio: float = 1.2) -> bool:
     """Check if current volume is above average (simple volume confirmation)."""
@@ -765,6 +901,7 @@ class SMCMultiStyleStrategy:
         n_low_score = 0
         n_sl_too_small = 0
         n_emitted = 0
+        tp_source_counts: dict[str, int] = {}
 
         min_start = self.swing_length * 2
         total_bars = len(decision_df)
@@ -871,12 +1008,30 @@ class SMCMultiStyleStrategy:
                 n_sl_too_small += 1
                 continue
 
-            if bias == "bullish":
-                take_profit = entry_price + sl_dist * self.rr_ratio
-                direction = "long"
+            direction = "long" if bias == "bullish" else "short"
+
+            # ── Structure-based TP (like a real SMC trader) ──────
+            tp_price, tp_source = _find_structure_tp(
+                indicators, entry_price, bias, sl_dist,
+                vlen_4h=int(vlen_4h[i]),
+                vlen_1h=int(vlen_1h[i]),
+                min_rr=2.0,
+            )
+            if tp_price > 0:
+                take_profit = tp_price
             else:
-                take_profit = entry_price - sl_dist * self.rr_ratio
-                direction = "short"
+                # Fallback: fixed 3.0 RR (only when no structure found)
+                tp_source = "fallback"
+                if bias == "bullish":
+                    take_profit = entry_price + sl_dist * 3.0
+                else:
+                    take_profit = entry_price - sl_dist * 3.0
+
+            # Derive actual RR from structure levels
+            tp_dist = abs(take_profit - entry_price)
+            actual_rr = tp_dist / sl_dist if sl_dist > 0 else 0
+            if actual_rr < 2.0:
+                continue  # RR too low even with structure TP
 
             # ── Position sizing ───────────────────────────────────
             qty = compute_position_size(
@@ -894,6 +1049,7 @@ class SMCMultiStyleStrategy:
                 continue
 
             n_emitted += 1
+            tp_source_counts[tp_source] = tp_source_counts.get(tp_source, 0) + 1
             signals.append(
                 TradeSignal(
                     timestamp=ts,
@@ -903,7 +1059,7 @@ class SMCMultiStyleStrategy:
                     entry_price=entry_price,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
-                    risk_reward=self.rr_ratio,
+                    risk_reward=actual_rr,
                     position_size=qty,
                     leverage=self.leverage,
                     alignment_score=score,
@@ -917,15 +1073,17 @@ class SMCMultiStyleStrategy:
                         "entry_zone": entry_zone,
                         "precision_trigger": precision_ok,
                         "volume_ok": volume_ok,
+                        "tp_source": tp_source,
                     },
                 )
             )
 
         # ── Summary statistics ────────────────────────────────────
         avg_score = np.mean([s.alignment_score for s in signals]) if signals else 0
+        avg_rr = np.mean([s.risk_reward for s in signals]) if signals else 0
         logger.info(
-            "[%s] FINAL SIGNALS: %d | avg_score=%.2f",
-            symbol, len(signals), avg_score,
+            "[%s] FINAL SIGNALS: %d | avg_score=%.2f | avg_rr=%.1f | tp_sources=%s",
+            symbol, len(signals), avg_score, avg_rr, tp_source_counts,
         )
 
         # Save signals for debugging

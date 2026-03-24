@@ -73,8 +73,8 @@ TIER_AAA_PLUS_PLUS = "AAA++"
 TIER_AAA_PLUS = "AAA+"
 
 TIER_THRESHOLDS = {
-    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 5.0},
-    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 4.0},
+    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 3.0},
+    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 2.0},
 }
 
 TIER_RISK = {
@@ -785,7 +785,7 @@ def _precompute_window_signals(
         "fvg_threshold": smc_cfg.get("fvg_threshold", 0.0004),
         "order_block_lookback": smc_cfg.get("order_block_lookback", 20),
         "liquidity_range_percent": smc_cfg.get("liquidity_range_percent", 0.005),
-        "risk_reward": 5.0,  # Max RR — generate widest possible TP
+        "risk_reward": 3.0,  # Fallback RR (only used when no structure TP found)
         "alignment_threshold": 0.0,  # No filtering — let all signals through
         "style_weights": {"day": 1.0},
     }
@@ -837,7 +837,7 @@ def _build_objective(
             tuning.get("alignment_threshold_max", 0.90),
             step=0.05,
         )
-        risk_reward = trial.suggest_categorical(
+        min_rr = trial.suggest_categorical(
             "risk_reward", config["risk_reward"]["options"]
         )
         leverage = trial.suggest_int(
@@ -850,20 +850,15 @@ def _build_objective(
             step=0.001,
         )
 
-        # Filter precomputed signals by alignment threshold and recompute TP
-        # based on trial's risk_reward ratio
+        # Filter precomputed signals by alignment threshold and min RR
+        # TP is structure-based (from signal generation) — NOT overridden
         filtered: list[TradeSignal] = []
         for sig in precomputed_signals:
             if sig.alignment_score < alignment_threshold:
                 continue
-            # Recompute TP based on trial's RR ratio
-            sl_dist = abs(sig.entry_price - sig.stop_loss)
-            if sl_dist <= 0:
+            if sig.risk_reward < min_rr:
                 continue
-            if sig.direction == "long":
-                new_tp = sig.entry_price + sl_dist * risk_reward
-            else:
-                new_tp = sig.entry_price - sl_dist * risk_reward
+            # Keep original structure-based TP, only override leverage
             filtered.append(TradeSignal(
                 timestamp=sig.timestamp,
                 symbol=sig.symbol,
@@ -871,8 +866,8 @@ def _build_objective(
                 style=sig.style,
                 entry_price=sig.entry_price,
                 stop_loss=sig.stop_loss,
-                take_profit=new_tp,
-                risk_reward=risk_reward,
+                take_profit=sig.take_profit,
+                risk_reward=sig.risk_reward,
                 position_size=sig.position_size,
                 leverage=leverage,
                 alignment_score=sig.alignment_score,
@@ -1100,23 +1095,18 @@ def check_parameter_stability(
 
     def _run_with_params(params):
         alignment_th = params.get("alignment_threshold", 0.65)
-        rr = params.get("risk_reward", 4.0)
+        min_rr = params.get("risk_reward", 2.0)
         filtered = []
         for sig in precomputed_signals:
             if sig.alignment_score < alignment_th:
                 continue
-            sl_dist = abs(sig.entry_price - sig.stop_loss)
-            if sl_dist <= 0:
+            if sig.risk_reward < min_rr:
                 continue
-            if sig.direction == "long":
-                new_tp = sig.entry_price + sl_dist * rr
-            else:
-                new_tp = sig.entry_price - sl_dist * rr
             filtered.append(TradeSignal(
                 timestamp=sig.timestamp, symbol=sig.symbol,
                 direction=sig.direction, style=sig.style,
                 entry_price=sig.entry_price, stop_loss=sig.stop_loss,
-                take_profit=new_tp, risk_reward=rr,
+                take_profit=sig.take_profit, risk_reward=sig.risk_reward,
                 position_size=sig.position_size,
                 leverage=params.get("leverage", 10),
                 alignment_score=sig.alignment_score, meta=sig.meta,
@@ -1138,7 +1128,7 @@ def check_parameter_stability(
     for _ in range(n_perturbations):
         perturbed = dict(best_params)
         for key, val in perturbed.items():
-            if isinstance(val, (int, float)) and key != "risk_reward":
+            if isinstance(val, (int, float)):
                 factor = 1.0 + rng.uniform(-perturbation_pct, perturbation_pct)
                 if isinstance(val, int):
                     perturbed[key] = max(1, int(val * factor))
@@ -1278,25 +1268,20 @@ def run(
             symbol_to_asset=symbol_to_asset,
         )
 
-        # Filter OOS signals with best params
+        # Filter OOS signals with best params (structure TP preserved)
         best_alignment = best_params.get("alignment_threshold", 0.65)
-        best_rr = best_params.get("risk_reward", 4.0)
+        best_min_rr = best_params.get("risk_reward", 2.0)
         oos_signals: list[TradeSignal] = []
         for sig in oos_all_signals:
             if sig.alignment_score < best_alignment:
                 continue
-            sl_dist = abs(sig.entry_price - sig.stop_loss)
-            if sl_dist <= 0:
+            if sig.risk_reward < best_min_rr:
                 continue
-            if sig.direction == "long":
-                new_tp = sig.entry_price + sl_dist * best_rr
-            else:
-                new_tp = sig.entry_price - sl_dist * best_rr
             oos_signals.append(TradeSignal(
                 timestamp=sig.timestamp, symbol=sig.symbol,
                 direction=sig.direction, style=sig.style,
                 entry_price=sig.entry_price, stop_loss=sig.stop_loss,
-                take_profit=new_tp, risk_reward=best_rr,
+                take_profit=sig.take_profit, risk_reward=sig.risk_reward,
                 position_size=sig.position_size,
                 leverage=best_params.get("leverage", 10),
                 alignment_score=sig.alignment_score, meta=sig.meta,

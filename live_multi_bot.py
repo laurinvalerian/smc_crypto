@@ -310,8 +310,8 @@ TIER_AAA_PLUS_PLUS = "AAA++"
 TIER_AAA_PLUS = "AAA+"
 
 TIER_THRESHOLDS: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 5.0},
-    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 4.0},
+    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 3.0},
+    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 2.0},
 }
 
 TIER_RISK: dict[str, dict[str, float]] = {
