@@ -5,7 +5,7 @@
 
 RESULTS="/root/bot/backtest/results"
 LOG="$RESULTS/backtest.log"
-STDOUT="$RESULTS/backtester_stdout.log"
+STDOUT="$RESULTS/backtest_v11.log"
 
 echo "═══════════════════════════════════════════"
 echo "  Backtest Status ($(date '+%H:%M:%S'))"
