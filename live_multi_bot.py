@@ -315,7 +315,7 @@ TIER_THRESHOLDS: dict[str, dict[str, float]] = {
 }
 
 TIER_RISK: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.020},  # 1.0%–2.0%
+    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.015},  # 1.0%–1.5%
     TIER_AAA_PLUS:      {"base_risk": 0.005, "max_risk": 0.010},  # 0.5%–1.0%
 }
 
@@ -663,6 +663,7 @@ class PaperBot:
 
         # ═══ STEP 2: 4H – Structure + POI (0.08 + 0.08) ═════════
         htf_zones = []
+        ind_4h = None
         if len(self.buffer_4h) >= swing_len * 2:
             try:
                 ind_4h = compute_smc_indicators(
@@ -684,6 +685,30 @@ class PaperBot:
                     htf_zones.append(h4_poi)
             except Exception as exc:
                 self.logger.debug("4H computation failed: %s", exc)
+
+        # ═══ STEP 2b: Discount/Premium Filter (4H swing range) ═══
+        if ind_4h is not None:
+            try:
+                swing_hl = ind_4h.get("swing_highs_lows")
+                if swing_hl is not None and not swing_hl.empty:
+                    _sh, _sl = None, None
+                    for j in range(len(swing_hl)):
+                        hl = swing_hl["HighLow"].iat[j]
+                        lvl = swing_hl["Level"].iat[j]
+                        if pd.notna(hl) and pd.notna(lvl):
+                            if hl > 0:
+                                _sh = float(lvl)
+                            elif hl < 0:
+                                _sl = float(lvl)
+                    if _sh is not None and _sl is not None and _sh > _sl:
+                        _mid = (_sh + _sl) / 2.0
+                        _cur = float(self.buffer_5m["close"].iloc[-1])
+                        if daily_bias == "bullish" and _cur > _mid:
+                            return 0.0, direction, comp  # Long in premium
+                        if daily_bias == "bearish" and _cur < _mid:
+                            return 0.0, direction, comp  # Short in discount
+            except Exception as exc:
+                self.logger.debug("D/P filter failed: %s", exc)
 
         # ═══ STEP 3: 1H – Structure + CHoCH (0.08 + 0.06) ═══════
         if len(self.buffer_1h) >= swing_len * 2:

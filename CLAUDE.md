@@ -33,6 +33,7 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
   ├── Circuit Breaker Check (daily/weekly loss, asset-class pause, heat)
   ├── Volatility Gate (Daily ATR ≥ 0.8%, 5m ATR ≥ 0.15%)
   ├── Volume Pre-Check (≥ 0.5x 20-bar avg)
+  ├── Discount/Premium Filter (4H swing range: long only in discount, short only in premium)
   ├── _multi_tf_alignment_score() → 13-Komponenten-Score (0.0-1.0)
   │   ├── 1D: Daily Bias via BOS/CHoCH (0.10)
   │   ├── 4H: Structure + POI (0.08 + 0.08)
@@ -46,17 +47,17 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
   │   ├── TF Agreement: EMA20/50 auf 4 TFs (0.05)
   │   └── Zone Freshness: Decay-Faktor (0.05)
   ├── Score < 0.65 → REJECT
-  ├── SL/TP Berechnung + Style-Klassifizierung (scalp/day/swing)
+  ├── Structure-based SL/TP (Liquidity → FVG → OB zones, min RR 2.0)
   ├── Tier-Klassifizierung:
-  │   ├── AAA++ (score ≥ 0.88, RR ≥ 5.0, ALLE Komponenten True) → 1-2% Risk
-  │   └── AAA+  (score ≥ 0.78, RR ≥ 4.0, Kern-Komponenten True) → 0.5-1% Risk
+  │   ├── AAA++ (score ≥ 0.88, RR ≥ 3.0, ALLE Komponenten True) → 1-1.5% Risk
+  │   └── AAA+  (score ≥ 0.78, RR ≥ 2.0, Kern-Komponenten True) → 0.5-1% Risk
   ├── RL Brain Gate (nach 100 Warmup-Trades)
   └── Bracket Order Execution (Market + SL + TP)
 ```
 
 ### Tier-System (nur AAA++ und AAA+)
 
-**AAA++ (Sniper)** — Score ≥ 0.88, RR ≥ 5.0, erfordert:
+**AAA++ (Sniper)** — Score ≥ 0.88, RR ≥ 3.0, erfordert:
 - `bias_strong` (BOS/CHoCH-bestätigter Daily Bias)
 - `h4_confirms` + `h4_poi` (4H Struktur + aktiver OB/FVG)
 - `h1_confirms` + `h1_choch` (1H Struktur + CHoCH)
@@ -69,7 +70,7 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 - `momentum_confluent` (RSI + MACD aligned)
 - `tf_agreement` ≥ 4 (alle 4 TFs EMA20/50 aligned)
 
-**AAA+ (Fallback)** — Score ≥ 0.78, RR ≥ 4.0, erfordert:
+**AAA+ (Fallback)** — Score ≥ 0.78, RR ≥ 2.0, erfordert:
 - bias_strong, h4_confirms, h1_confirms, precision_trigger, volume_ok, adx_strong
 
 **Keine A- oder SPEC-Tiers mehr.** Schwache Trades werden komplett abgelehnt.
@@ -224,7 +225,9 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 - Walk-Forward über alle Asset-Klassen gleichzeitig
 - Optuna n_jobs=1 (seriell), Joblib n_jobs=3 (parallel Signals) — verhindert Deadlock auf 4-Core Server
 - n_trials=30 pro Window (reduziert von 500 für 4-Core/8GB Server)
-- **Signal-Precomputation**: Signale werden EINMAL pro Window mit fixen SMC-Params generiert (alignment_threshold=0, RR=5.0), Optuna tuned nur Filter/Trading-Params (alignment_threshold, risk_reward, leverage, risk_per_trade)
+- **Signal-Precomputation**: Signale werden EINMAL pro Window mit fixen SMC-Params generiert (alignment_threshold=0), Optuna tuned nur Filter/Trading-Params (alignment_threshold, min_rr, leverage, risk_per_trade)
+- **Structure-based TP**: `_find_structure_tp()` findet TP aus Liquidity → FVG → OB Zonen (4H/1H), min RR 2.0, Fallback 3.0R
+- **Discount/Premium Filter**: Long nur in Discount (unter 4H Swing-Range Midpoint), Short nur in Premium
 
 **RL Brain im Backtest: NEIN**
 - RL Brain wird NICHT im Backtest trainiert (Overfitting-Gefahr)
@@ -239,10 +242,12 @@ Erweitert mit AAA++ Filter-Integration, Circuit Breaker Simulation und Anti-Over
 - CB `pnl_pct` trackt gegen **initiales Account** (für funded DD-Limits)
 - Bankrupt-Check: Equity < 10% → Trading stoppt
 
-**Trade-Outcome-Modell:**
-- Win-Probability: `alignment_score × 0.60 - RR_penalty` (jeder RR-Punkt >3.0 reduziert um 2%)
+**Trade-Outcome-Modell (V11 — Real Price Path):**
+- Walks actual 5m candles forward from entry to determine outcome
+- SL/TP hit detection: checks each bar's high/low against current SL and TP
+- **Breakeven-Only Stop**: At +1R, SL moves to net-breakeven (entry + 0.1% fee buffer), NO further trailing
+- If neither SL nor TP hit within `_MAX_BARS_DEFAULT=576` (48h), trade closes at last bar's close
 - Circuit Breaker simuliert Daily/Weekly/All-Time DD Limits pro Trade
-- Seeded RNG für reproduzierbare Ergebnisse
 
 **CLI-Flags:** `--monte-carlo`, `--stability-check`
 
@@ -314,20 +319,59 @@ data/
 - **Compound Risk**: Risk-Amount basiert auf aktueller Equity (nicht initial) für Zinseszins-Wachstum
 - **CB pnl_pct**: Trackt gegen initiales Account-Size (korrekt für funded DD-Limits)
 
+### Backtester V11 Verbesserungen (2026-03-24)
+
+**Grundlegende Änderungen für realistisches SMC-Trading:**
+
+- **Structure-based TP** (`_find_structure_tp()` in `smc_multi_style.py`):
+  - TP wird an nächster Liquidity → FVG → OB Zone gesetzt (4H/1H), nicht fixem RR-Multiplier
+  - Suchkette: Liquidity Levels → FVG Zonen → Order Blocks → Fallback 3.0 RR
+  - Typische Verteilung: ~59% Liquidity, ~28% FVG, ~14% Fallback
+  - Min RR 2.0 Gate nach TP-Berechnung
+
+- **Discount/Premium Zone Filter** (`_compute_discount_premium()` in `smc_multi_style.py`):
+  - 4H Swing Range → Midpoint berechnen (kein Future-Peek via vlen_4h)
+  - Long nur im Discount (unter Midpoint), Short nur im Premium (über Midpoint)
+  - Filtert ~30-50% der falschen Signale, fundamentaler SMC/ICT-Grundsatz
+
+- **Breakeven-Only Stop** (kein Trailing mehr):
+  - Bei +1R: SL → Net-Breakeven (Entry + 0.1% Fee-Buffer für Fees/Slippage)
+  - Danach KEIN weiteres Trailing — Preis hat Raum zum struktur-basierten TP zu laufen
+  - Vorher: 1R-Trail → 90% Trailing-Exits, nur 5-10% TP-Hits, avg RR 1.1
+
+- **Max Risk gesenkt**: AAA++ 2.0% → 1.5% (verhindert >10% DD bei schlechtem Timing)
+
+- **Tier-Thresholds gesenkt** (angepasst an Struktur-TPs statt fixem RR):
+  - AAA++: min_rr 5.0 → 3.0 (Struktur-TPs geben typisch 2-4 RR)
+  - AAA+: min_rr 4.0 → 2.0
+
+- **RR-Parameter**: Optuna tuned `risk_reward` als **min_rr Filter**, nicht als TP-Multiplier
+
+- **Nur Daytrading**: Kein Scalp/Swing, max 48h Holding (576 × 5m Bars)
+
+- **OOS-Validation Gates** (7 Gates):
+  1. PF ≥ 1.5
+  2. Min 20 Trades (Sniper-Approach: ~6/Monat realistisch)
+  3. Sharpe ≥ 0.5
+  4. Monte Carlo robust (95%-KI > 0)
+  5. Max DD > -10% (funded account safe)
+  6. Parameter Stability < 50% PF-Änderung bei ±10%
+  7. WR > 20% + positive Expectancy
+
 ### Nächste Schritte
 1. **Daten**: ✅ FERTIG + Prefetch komplett (Crypto Top 30, Forex 28, Stocks 50, Commodities 4 — alle mit 250+ Daily Bars Warmup)
-2. **Backtester V6 läuft**: 🔄 Walk-Forward (3 Windows × 30 Trials) mit korrektem Position-Sizing + All-Time DD + Compound Risk — PID via `pgrep -f optuna_backtester`
+2. **Backtester V11**: 🔄 Walk-Forward mit Structure-TP + D/P Filter + BE-Only + Risk 1.5%
 3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert on-the-fly)
 4. **Live → Funded**: 3× Funded Accounts geplant (Binance 100K, OANDA 100K, Alpaca 100K) — max -5% daily DD, max -10% all-time DD
 
 ## Testing & Anti-Overfitting
 
-- **Walk-Forward-Validation Pflicht**: 3 Monate Train → 1 Monat Out-of-Sample
+- **Walk-Forward-Validation Pflicht**: 3 Monate Train → 2 Monate Out-of-Sample
 - **Out-of-Sample Profit Factor ≥ 1.5**
-- **Minimum 100 Trades** im OOS für statistische Relevanz
+- **Minimum 20 Trades** im OOS (SMC sniper: ~6-7/Monat)
 - **Parameter-Stabilität**: ±10% Änderung darf Performance nicht kippen (Backtester: `check_parameter_stability()`)
-- **Monte-Carlo**: Trade-Reihenfolge 1000x shufflen, 95%-KI muss profitabel sein (Backtester: `monte_carlo_check()`)
-- **4-Gate OOS-Validierung**: PF≥1.5, Trades≥100, Sharpe≥0.5, Monte Carlo robust (Backtester: `validate_oos_results()`)
+- **Monte-Carlo**: R-multiple compound shuffling, 1000x, 95%-KI > 0 (Backtester: `monte_carlo_check()`)
+- **7-Gate OOS-Validierung**: PF≥1.5, Trades≥20, Sharpe≥0.5, MC robust, DD>-10%, Stability<50%, Quality (WR>20% + positive expectancy)
 - **RL Pre-Training**: Nur mit Out-of-Sample Backtest-Trades, Curriculum-basiert
 - **Paper-Trading**: Mindestens 2 Wochen vor Live, innerhalb 1 Std-Abweichung der Backtests
 
@@ -367,8 +411,8 @@ tail -f backtest/results/backtest.log                          # Detaillierter L
 
 ```
 ALIGNMENT_THRESHOLD = 0.65       # Minimum Score für Trade-Consideration
-TIER_AAA_PLUS_PLUS: score ≥ 0.88, RR ≥ 5.0
-TIER_AAA_PLUS:      score ≥ 0.78, RR ≥ 4.0
+TIER_AAA_PLUS_PLUS: score ≥ 0.88, RR ≥ 3.0, risk 1.0-1.5%
+TIER_AAA_PLUS:      score ≥ 0.78, RR ≥ 2.0, risk 0.5-1.0%
 MIN_DAILY_ATR_PCT = 0.008        # 0.8% Volatility Floor
 MIN_5M_ATR_PCT = 0.0015          # 0.15% per 5m Bar
 MIN_SL_ATR_MULT = 2.5            # SL mindestens 2.5× ATR
@@ -382,7 +426,7 @@ WEEKLY_LOSS_LIMIT_PCT = 0.05     # -5% weekly → halve sizes
 ASSET_CLASS_DD_LIMIT = 0.02      # -2% per class → pause 12h
 ALLTIME_DD_LIMIT_PCT = 0.08      # -8% all-time → PERMANENT STOP (funded: -10%, 2% buffer)
 MAX_PORTFOLIO_HEAT = 0.06        # 6% total open risk
-MAX_RISK_PER_TRADE = 0.03        # 3% hard cap per trade
+MAX_RISK_PER_TRADE = 0.015       # 1.5% max per trade (AAA++)
 ```
 
 ## Dateistruktur

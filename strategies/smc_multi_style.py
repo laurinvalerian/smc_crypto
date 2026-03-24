@@ -250,6 +250,70 @@ def _check_h4_poi(indicators_4h: dict[str, Any], df_4h: pd.DataFrame,
     return False
 
 
+def _compute_discount_premium(
+    ind_4h: dict[str, Any] | None,
+    df_4h: pd.DataFrame,
+    decision_df: pd.DataFrame,
+    vlen_4h: np.ndarray,
+) -> np.ndarray:
+    """
+    Classify each 5m bar as discount (-1), premium (+1), or neutral (0)
+    based on the 4H swing range.
+
+    Logic (no future peek):
+    - Track last confirmed 4H swing high and swing low
+    - Midpoint = (last_swing_high + last_swing_low) / 2
+    - Close > midpoint → premium (+1), close < midpoint → discount (-1)
+    - If no valid range yet → neutral (0)
+    """
+    n = len(decision_df)
+    result = np.zeros(n, dtype=np.int8)
+
+    if ind_4h is None or df_4h.empty:
+        return result
+
+    swing_hl = ind_4h.get("swing_highs_lows")
+    if swing_hl is None or swing_hl.empty:
+        return result
+
+    # Build running last swing high / low from 4H data
+    n_4h = len(swing_hl)
+    last_sh = np.full(n_4h, np.nan)  # last swing high price
+    last_sl = np.full(n_4h, np.nan)  # last swing low price
+    running_sh = np.nan
+    running_sl = np.nan
+
+    for j in range(n_4h):
+        hl = swing_hl["HighLow"].iat[j]
+        lvl = swing_hl["Level"].iat[j]
+        if pd.notna(hl) and pd.notna(lvl):
+            if hl > 0:  # swing high
+                running_sh = lvl
+            elif hl < 0:  # swing low
+                running_sl = lvl
+        last_sh[j] = running_sh
+        last_sl[j] = running_sl
+
+    # Map to 5m bars using vlen_4h (temporal index)
+    for i in range(n):
+        vl = int(vlen_4h[i])
+        if vl <= 0:
+            continue
+        idx = min(vl - 1, n_4h - 1)
+        sh = last_sh[idx]
+        sl = last_sl[idx]
+        if np.isnan(sh) or np.isnan(sl) or sh <= sl:
+            continue
+        midpoint = (sh + sl) / 2.0
+        close_price = float(decision_df["close"].iat[i])
+        if close_price > midpoint:
+            result[i] = 1   # premium
+        elif close_price < midpoint:
+            result[i] = -1  # discount
+
+    return result
+
+
 def _find_structure_tp(
     indicators: dict[str, dict[str, Any]],
     entry_price: float,
@@ -893,6 +957,11 @@ class SMCMultiStyleStrategy:
         vlen_1h = _build_valid_len_map(df_1h)
         vlen_15m = _build_valid_len_map(df_15m)
 
+        # ── Precompute discount/premium zones (4H swing range) ──
+        discount_premium = _compute_discount_premium(
+            ind_4h, df_4h, decision_df, vlen_4h,
+        )
+
         # Debug counters
         n_neutral = 0
         n_no_confirm = 0
@@ -900,6 +969,7 @@ class SMCMultiStyleStrategy:
         n_no_trigger = 0
         n_low_score = 0
         n_sl_too_small = 0
+        n_dp_rejected = 0
         n_emitted = 0
         tp_source_counts: dict[str, int] = {}
 
@@ -916,6 +986,15 @@ class SMCMultiStyleStrategy:
             if bias == "neutral":
                 n_neutral += 1
                 continue
+
+            # ── Step 1a: Discount/Premium filter ─────────────────
+            dp_zone = discount_premium[i]  # +1=premium, -1=discount, 0=neutral
+            if bias == "bullish" and dp_zone == 1:
+                n_dp_rejected += 1
+                continue  # Long in premium → REJECT
+            if bias == "bearish" and dp_zone == -1:
+                n_dp_rejected += 1
+                continue  # Short in discount → REJECT
 
             # ── Step 1b: Bias strength (BOS/CHoCH vs EMA fallback) ─
             vl_1d = int(vlen_1d[i])
@@ -1073,6 +1152,7 @@ class SMCMultiStyleStrategy:
                         "entry_zone": entry_zone,
                         "precision_trigger": precision_ok,
                         "volume_ok": volume_ok,
+                        "dp_zone": int(dp_zone),
                         "tp_source": tp_source,
                     },
                 )
@@ -1082,8 +1162,10 @@ class SMCMultiStyleStrategy:
         avg_score = np.mean([s.alignment_score for s in signals]) if signals else 0
         avg_rr = np.mean([s.risk_reward for s in signals]) if signals else 0
         logger.info(
-            "[%s] FINAL SIGNALS: %d | avg_score=%.2f | avg_rr=%.1f | tp_sources=%s",
-            symbol, len(signals), avg_score, avg_rr, tp_source_counts,
+            "[%s] FINAL SIGNALS: %d | avg_score=%.2f | avg_rr=%.1f | "
+            "dp_rejected=%d | tp_sources=%s",
+            symbol, len(signals), avg_score, avg_rr, n_dp_rejected,
+            tp_source_counts,
         )
 
         # Save signals for debugging

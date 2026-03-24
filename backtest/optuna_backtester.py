@@ -29,9 +29,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import pickle
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,7 +80,7 @@ TIER_THRESHOLDS = {
 }
 
 TIER_RISK = {
-    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.020},
+    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.015},
     TIER_AAA_PLUS:      {"base_risk": 0.005, "max_risk": 0.010},
 }
 
@@ -228,12 +230,13 @@ def _resolve_trade_outcome(
     """
     Walk forward through real price bars after entry to determine outcome.
 
-    Trailing stop logic (like a real SMC trader):
+    Breakeven-only stop logic (like a patient SMC trader):
     - Before +1R: original SL stays
-    - At +1R: SL moves to breakeven (entry price)
-    - After +1R: SL trails 1R behind the peak favorable excursion
+    - At +1R: SL moves to net-breakeven (entry + fees/slippage buffer)
+    - After +1R: SL stays at breakeven — NO further trailing
+    - Price has room to breathe and reach structure-based TP
     - TP hit → full win at target RR
-    - Trailing SL hit → partial win (at trailing SL level)
+    - BE-SL hit → tiny win (covers fees)
     - Timeout → close at last bar close
 
     Returns:
@@ -262,31 +265,26 @@ def _resolve_trade_outcome(
     tp = sig.take_profit
     sl_dist = abs(entry - original_sl)  # 1R in price terms
 
-    # Trailing stop state
+    # Breakeven stop state
     current_sl = original_sl
-    peak_favorable = 0.0  # best R-multiple reached so far
+    reached_1r = False
+    # Net-breakeven buffer: covers round-trip fees + slippage (~0.1%)
+    fee_buffer = entry * 0.001
 
     for _, bar in future_bars.iterrows():
         high = bar["high"]
         low = bar["low"]
 
         if is_long:
-            # Update peak favorable excursion (in R-multiples)
-            bar_best_r = (high - entry) / sl_dist if sl_dist > 0 else 0.0
-            if bar_best_r > peak_favorable:
-                peak_favorable = bar_best_r
-
-            # Update trailing stop once we've reached +1R
-            if peak_favorable >= 1.0:
-                # Trail 1R behind peak: if peak = 3R, SL at 2R from entry
-                trail_r = peak_favorable - 1.0
-                trail_sl = entry + trail_r * sl_dist
-                # Never move SL backwards
-                current_sl = max(current_sl, trail_sl)
+            # Check if we've reached +1R (move to net-breakeven once)
+            if not reached_1r and sl_dist > 0:
+                bar_best_r = (high - entry) / sl_dist
+                if bar_best_r >= 1.0:
+                    reached_1r = True
+                    current_sl = max(current_sl, entry + fee_buffer)
 
             # Check SL first (conservative: worst case within bar)
             if low <= current_sl:
-                # If trailing SL is above entry → partial win, else loss
                 if current_sl >= entry:
                     return "win", current_sl
                 else:
@@ -296,14 +294,11 @@ def _resolve_trade_outcome(
                 return "win", tp
 
         else:  # short
-            bar_best_r = (entry - low) / sl_dist if sl_dist > 0 else 0.0
-            if bar_best_r > peak_favorable:
-                peak_favorable = bar_best_r
-
-            if peak_favorable >= 1.0:
-                trail_r = peak_favorable - 1.0
-                trail_sl = entry - trail_r * sl_dist
-                current_sl = min(current_sl, trail_sl)
+            if not reached_1r and sl_dist > 0:
+                bar_best_r = (entry - low) / sl_dist
+                if bar_best_r >= 1.0:
+                    reached_1r = True
+                    current_sl = min(current_sl, entry - fee_buffer)
 
             if high >= current_sl:
                 if current_sl <= entry:
@@ -766,6 +761,22 @@ def validate_oos_results(
 #  Optuna objective
 # ═══════════════════════════════════════════════════════════════════
 
+def _signal_cache_key(
+    smc_cfg: dict[str, Any],
+    symbols: list[str],
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+) -> str:
+    """Build a deterministic hash for the signal cache."""
+    key_data = json.dumps({
+        "smc": {k: smc_cfg.get(k) for k in sorted(smc_cfg)},
+        "symbols": sorted(symbols),
+        "start": str(window_start),
+        "end": str(window_end),
+    }, sort_keys=True)
+    return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+
 def _precompute_window_signals(
     config: dict[str, Any],
     symbols: list[str],
@@ -777,6 +788,9 @@ def _precompute_window_signals(
     Generate signals ONCE per window with fixed SMC params (from config defaults).
     Signals include full alignment scores + meta flags.
     Optuna trials then only filter/trade these signals with different thresholds.
+
+    Caches signals to disk (pickle) — if the same window + params + symbols
+    are requested again, loads from cache instead of regenerating (~10-15min saved).
     """
     # Use config defaults for SMC params — these are not tuned per trial
     smc_cfg = config.get("smc", {})
@@ -789,6 +803,27 @@ def _precompute_window_signals(
         "alignment_threshold": 0.0,  # No filtering — let all signals through
         "style_weights": {"day": 1.0},
     }
+
+    # ── Check disk cache ──────────────────────────────────────────
+    cache_dir = Path("backtest/results/signal_cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_hash = _signal_cache_key(smc_cfg, symbols, window_start, window_end)
+    cache_file = cache_dir / f"signals_{cache_hash}.pkl"
+
+    if cache_file.exists():
+        try:
+            with open(cache_file, "rb") as f:
+                cached_signals = pickle.load(f)
+            logger.info(
+                "CACHE HIT: Loaded %d signals from %s (window %s → %s)",
+                len(cached_signals), cache_file.name,
+                window_start.date(), window_end.date(),
+            )
+            return cached_signals
+        except Exception as exc:
+            logger.warning("Cache load failed (%s), regenerating: %s", cache_file.name, exc)
+
+    # ── Generate signals (slow path) ──────────────────────────────
     strategy = SMCMultiStyleStrategy(config, params)
 
     def _gen_signals(sym):
@@ -804,6 +839,18 @@ def _precompute_window_signals(
     all_signals: list[TradeSignal] = [
         s for sublist in all_signals_list for s in sublist
     ]
+
+    # ── Save to disk cache ────────────────────────────────────────
+    try:
+        with open(cache_file, "wb") as f:
+            pickle.dump(all_signals, f)
+        logger.info(
+            "CACHE SAVE: %d signals → %s (window %s → %s)",
+            len(all_signals), cache_file.name,
+            window_start.date(), window_end.date(),
+        )
+    except Exception as exc:
+        logger.warning("Cache save failed: %s", exc)
 
     logger.info(
         "Precomputed %d signals for %d instruments (window %s → %s)",
