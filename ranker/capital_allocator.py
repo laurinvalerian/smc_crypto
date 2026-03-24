@@ -41,7 +41,7 @@ LEVERAGE_LIMITS: dict[str, int] = {
 
 # Risk per trade (base) per tier
 TIER_RISK_PCT: dict[str, dict[str, float]] = {
-    "AAA++": {"base": 0.010, "max": 0.020},   # 1.0% - 2.0%
+    "AAA++": {"base": 0.010, "max": 0.015},   # 1.0% - 1.5%
     "AAA+":  {"base": 0.005, "max": 0.010},   # 0.5% - 1.0%
 }
 

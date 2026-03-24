@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import logging
@@ -347,6 +348,11 @@ def simulate_trades(
         return pd.DataFrame()
 
     cb = CircuitBreaker() if use_circuit_breaker else None
+    # Suppress CB logging during simulation — it toggles pause/resume rapidly
+    # which produces thousands of log lines. CB logic still works, just silent.
+    _cb_logger = logging.getLogger("risk.circuit_breaker")
+    _cb_orig_level = _cb_logger.level
+    _cb_logger.setLevel(logging.CRITICAL)
     equity = account_size
 
     rows: list[dict[str, Any]] = []
@@ -462,6 +468,9 @@ def simulate_trades(
                 "risk_pct": risk_amount / account_size,
             }
         )
+
+    # Restore CB logging
+    _cb_logger.setLevel(_cb_orig_level)
 
     if rejected_count > 0 or skipped_no_data > 0:
         logger.info(
@@ -833,12 +842,18 @@ def _precompute_window_signals(
             logger.debug("Signal gen failed for %s: %s", sym, exc)
             return []
 
-    all_signals_list = Parallel(n_jobs=3)(
-        delayed(_gen_signals)(sym) for sym in symbols
-    )
-    all_signals: list[TradeSignal] = [
-        s for sublist in all_signals_list for s in sublist
-    ]
+    # Process in batches of 30 to limit peak memory (8GB server)
+    all_signals: list[TradeSignal] = []
+    batch_size = 30
+    for batch_start in range(0, len(symbols), batch_size):
+        batch = symbols[batch_start:batch_start + batch_size]
+        batch_results = Parallel(n_jobs=2)(
+            delayed(_gen_signals)(sym) for sym in batch
+        )
+        for sublist in batch_results:
+            all_signals.extend(sublist)
+        del batch_results
+        gc.collect()
 
     # ── Save to disk cache ────────────────────────────────────────
     try:
@@ -1419,6 +1434,11 @@ def run(
 
         # ── Parameter importance ───────────────────────────────────
         compute_param_importance(study, results_dir)
+
+        # ── Free memory between windows ──────────────────────────
+        del train_signals, oos_all_signals, oos_signals
+        del oos_by_class, oos_parts, oos_trades, study
+        gc.collect()
 
     # ── Aggregate results ─────────────────────────────────────────
     if all_window_results:

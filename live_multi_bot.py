@@ -247,7 +247,7 @@ COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
 MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
 MIN_DYNAMIC_RISK_PCT = 0.0025  # 0.25 % floor for dynamic sizing
-MAX_DYNAMIC_RISK_PCT = 0.02    # 2.0 % cap for dynamic sizing
+MAX_DYNAMIC_RISK_PCT = 0.015   # 1.5 % cap for dynamic sizing
 RR_DIVISOR = 3.0               # RR contribution scaled down (RR / 3) to avoid aggressive sizing
 RR_CONTRIBUTION_CAP = 2.0      # RR contribution capped at +2.0 to bound boost from extreme RR setups
 EPSILON_SL_DIST = 1e-6         # Minimum SL distance tolerance to avoid divide-by-zero
@@ -1526,7 +1526,7 @@ class PaperBot:
         Execute a bracket order with tier-based risk allocation.
 
         Risk allocation:
-          AAA++ → 1.0%–2.0% (sniper trades, highest conviction)
+          AAA++ → 1.0%–1.5% (sniper trades, highest conviction)
           AAA+  → 0.5%–1.0% (strong fallback trades)
 
         Returns:

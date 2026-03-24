@@ -358,9 +358,20 @@ data/
   6. Parameter Stability < 50% PF-Änderung bei ±10%
   7. WR > 20% + positive Expectancy
 
+### Backtester Bugfixes V11b (2026-03-24)
+- **Circuit Breaker Log Spam**: CB pause→expire→re-trigger logged hundreds of lines per second during simulation.
+  - Fix 1: Dedup-Logging via `_last_log_state` dict in `circuit_breaker.py` — only logs state CHANGES
+  - Fix 2: `simulate_trades()` setzt CB-Logger auf CRITICAL während Simulation — CB funktioniert weiter, nur ohne Log-Spam
+- **OOM Kill on 8GB Server**: Process killed at ~4.8GB during Window 1 signal generation (111 instruments × 6 TFs).
+  - Fix 1: 4GB Swap-File erstellt (`/swapfile`) als Safety-Net
+  - Fix 2: Signal-Generierung in Batches à 30 Instrumente mit `gc.collect()` zwischen Batches
+  - Fix 3: Explicit cleanup von Optuna Study + DataFrames zwischen Windows
+- **Max Risk 1.5%**: Synced across all files — backtester `compute_dynamic_risk()`, `live_multi_bot.py` `MAX_DYNAMIC_RISK_PCT`, `capital_allocator.py` TIER_RISK_PCT, `default_config.yaml`
+- **Discount/Premium Filter**: Already implemented in smc_multi_style.py (`_compute_discount_premium()`) and live_multi_bot.py (`_multi_tf_alignment_score()`)
+
 ### Nächste Schritte
 1. **Daten**: ✅ FERTIG + Prefetch komplett (Crypto Top 30, Forex 28, Stocks 50, Commodities 4 — alle mit 250+ Daily Bars Warmup)
-2. **Backtester V11**: 🔄 Walk-Forward mit Structure-TP + D/P Filter + BE-Only + Risk 1.5%
+2. **Backtester V11b**: 🔄 Walk-Forward mit Structure-TP + D/P Filter + BE-Only + Risk 1.5% + CB-Fix + OOM-Fix
 3. **Paper Trading**: 2 Wochen Demo über alle Asset-Klassen (RL Brain trainiert on-the-fly)
 4. **Live → Funded**: 3× Funded Accounts geplant (Binance 100K, OANDA 100K, Alpaca 100K) — max -5% daily DD, max -10% all-time DD
 
@@ -411,7 +422,7 @@ tail -f backtest/results/backtest.log                          # Detaillierter L
 
 ```
 ALIGNMENT_THRESHOLD = 0.65       # Minimum Score für Trade-Consideration
-TIER_AAA_PLUS_PLUS: score ≥ 0.88, RR ≥ 3.0, risk 1.0-1.5%
+TIER_AAA_PLUS_PLUS: score ≥ 0.88, RR ≥ 3.0, risk 1.0-1.5% (max 1.5%)
 TIER_AAA_PLUS:      score ≥ 0.78, RR ≥ 2.0, risk 0.5-1.0%
 MIN_DAILY_ATR_PCT = 0.008        # 0.8% Volatility Floor
 MIN_5M_ATR_PCT = 0.0015          # 0.15% per 5m Bar
@@ -427,6 +438,7 @@ ASSET_CLASS_DD_LIMIT = 0.02      # -2% per class → pause 12h
 ALLTIME_DD_LIMIT_PCT = 0.08      # -8% all-time → PERMANENT STOP (funded: -10%, 2% buffer)
 MAX_PORTFOLIO_HEAT = 0.06        # 6% total open risk
 MAX_RISK_PER_TRADE = 0.015       # 1.5% max per trade (AAA++)
+MAX_DYNAMIC_RISK_PCT = 0.015     # Hard cap in live_multi_bot.py (synced with backtester)
 ```
 
 ## Dateistruktur

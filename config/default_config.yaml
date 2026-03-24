@@ -74,7 +74,7 @@ aaa_plus_plus:
       min_score: 0.88
       min_rr: 5.0
       base_risk: 0.01       # 1.0%
-      max_risk: 0.02         # 2.0%
+      max_risk: 0.015        # 1.5%
       max_leverage: 50
     "AAA+":
       min_score: 0.78
