@@ -5,7 +5,7 @@
 
 RESULTS="/root/bot/backtest/results"
 LOG="$RESULTS/backtest.log"
-STDOUT="$RESULTS/backtest_v11.log"
+STDOUT="$RESULTS/backtest_v12c.log"
 
 echo "═══════════════════════════════════════════"
 echo "  Backtest Status ($(date '+%H:%M:%S'))"
@@ -58,9 +58,9 @@ if [ -f "$STDOUT" ]; then
 fi
 echo ""
 
-# Signal cache files
-SIG_COUNT=$(ls "$RESULTS"/signals_*.csv 2>/dev/null | wc -l)
-echo "  Signal caches: $SIG_COUNT instruments"
+# Signal cache files (pkl format)
+SIG_COUNT=$(ls "$RESULTS"/signal_cache/signals_*.pkl 2>/dev/null | wc -l)
+echo "  Signal caches: $SIG_COUNT windows"
 
 # Result files
 echo "  Result Files:"
@@ -83,12 +83,15 @@ import json
 with open('$RESULTS/backtest_stats.json') as f:
     s = json.load(f)
 print(f'  Mean PnL:     \${s[\"mean_pnl\"]:,.0f}')
-print(f'  Mean PF:      {s[\"mean_profit_factor\"]:.2f}')
-print(f'  Mean Sharpe:  {s[\"mean_sharpe\"]:.2f}')
-print(f'  Mean WR:      {s[\"mean_winrate\"]*100:.1f}%')
-print(f'  Worst DD:     {s[\"worst_drawdown\"]*100:.1f}%')
-print(f'  Total Trades: {s[\"total_trades_all_windows\"]}')
-print(f'  Validation:   {s[\"validation_passed\"]}/{s[\"validation_total\"]} passed')
+print(f'  Mean PF(real): {s.get(\"mean_pf_real\", s[\"mean_profit_factor\"]):.2f}')
+print(f'  Mean PF(all):  {s[\"mean_profit_factor\"]:.2f}')
+print(f'  Mean Sharpe:   {s[\"mean_sharpe\"]:.2f}')
+print(f'  Mean WR(real): {s.get(\"mean_winrate_real\", s[\"mean_winrate\"])*100:.1f}%')
+print(f'  Mean WR(all):  {s[\"mean_winrate\"]*100:.1f}%')
+print(f'  Mean BE Rate:  {s.get(\"mean_be_rate\", 0)*100:.0f}%')
+print(f'  Worst DD:      {s[\"worst_drawdown\"]*100:.1f}%')
+print(f'  Total Trades:  {s[\"total_trades_all_windows\"]}')
+print(f'  Validation:    {s[\"validation_passed\"]}/{s[\"validation_total\"]} passed')
 " 2>/dev/null
 fi
 echo "═══════════════════════════════════════════"

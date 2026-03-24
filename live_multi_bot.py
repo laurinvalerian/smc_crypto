@@ -82,6 +82,7 @@ from risk.circuit_breaker import CircuitBreaker
 from ranker.universe_scanner import UniverseScanner, ScanResult
 from ranker.opportunity_ranker import OpportunityRanker, RankedOpportunity
 from ranker.capital_allocator import CapitalAllocator
+from paper_grid import PaperGrid
 
 # ── ccxt (sync) for history loading ───────────────────────────────
 import ccxt as ccxt_sync
@@ -455,6 +456,9 @@ class PaperBot:
 
         # Circuit breaker (shared across all bots, set by Runner)
         self.circuit_breaker: CircuitBreaker | None = None
+
+        # Paper Grid (multi-variant A/B testing, set by Runner)
+        self.paper_grid: PaperGrid | None = None
 
         # Shared RL Brain (central PPO)
         if central_brain is None:
@@ -1357,6 +1361,10 @@ class PaperBot:
             tier, style.upper(), direction.upper(), symbol,
             zone_low, zone_high, sl, tp, rr, score, daily_atr * 100,
         )
+
+        # ── Route signal to Paper Grid (A/B testing) ────────────
+        if self.paper_grid is not None:
+            self.paper_grid.evaluate_signal(self._pending_signal, asset_class="crypto")
 
     # ── Real-time tick handler (called from watch_ticker) ─────────
 
@@ -2711,6 +2719,7 @@ def build_dashboard(
     start_time: datetime,
     active_symbols: list[str],
     total_equity: float = 0.0,
+    paper_grid: PaperGrid | None = None,
 ) -> Layout:
     """
     Build the complete Rich Layout for the live dashboard.
@@ -2800,13 +2809,55 @@ def build_dashboard(
         border_style="bright_blue",
     )
 
+    # ── Paper Grid panel ──────────────────────────────────────────
+    grid_panel = None
+    if paper_grid is not None:
+        grid_rows = paper_grid.dashboard_data()
+        grid_table = Table(title="Paper Grid (Top 10 Variants)", expand=True)
+        grid_table.add_column("Variant", style="cyan", no_wrap=True)
+        grid_table.add_column("PnL", justify="right")
+        grid_table.add_column("PnL%", justify="right")
+        grid_table.add_column("DD%", justify="right")
+        grid_table.add_column("Trades", justify="right")
+        grid_table.add_column("WR%", justify="right")
+        grid_table.add_column("PF", justify="right")
+        grid_table.add_column("BE%", justify="right")
+        grid_table.add_column("Open", justify="right")
+        grid_table.add_column("Params", style="dim")
+
+        for row in grid_rows[:10]:
+            pnl_c = "green" if row["pnl"] >= 0 else "red"
+            dd_c = "red" if row["dd_pct"] < -5 else "yellow" if row["dd_pct"] < -2 else "green"
+            grid_table.add_row(
+                row["name"],
+                f"[{pnl_c}]${row['pnl']:+,.0f}[/{pnl_c}]",
+                f"[{pnl_c}]{row['pnl_pct']:+.1f}%[/{pnl_c}]",
+                f"[{dd_c}]{row['dd_pct']:.1f}%[/{dd_c}]",
+                str(row["trades"]),
+                f"{row['wr_real']:.0f}%" if row["trades"] > 0 else "-",
+                f"{row['pf_real']:.1f}" if row["trades"] > 0 else "-",
+                f"{row['be_rate']:.0f}%" if row["trades"] > 0 else "-",
+                str(row["open"]),
+                f"A={row['align']:.2f} RR={row['rr']:.1f} L={row['lev']} R={row['risk']:.1f}%",
+            )
+
+        grid_panel = Panel(grid_table, border_style="bright_magenta")
+
     # ── Compose Layout ────────────────────────────────────────────
     layout = Layout()
-    layout.split_column(
-        Layout(header_panel, name="header", size=6),
-        Layout(name="tables"),
-        Layout(ws_panel, name="status", size=3 + len(groups) + 2),
-    )
+    if grid_panel is not None:
+        layout.split_column(
+            Layout(header_panel, name="header", size=6),
+            Layout(name="tables"),
+            Layout(grid_panel, name="grid", size=14),
+            Layout(ws_panel, name="status", size=3 + len(groups) + 2),
+        )
+    else:
+        layout.split_column(
+            Layout(header_panel, name="header", size=6),
+            Layout(name="tables"),
+            Layout(ws_panel, name="status", size=3 + len(groups) + 2),
+        )
     layout["tables"].split_row(
         Layout(top_table, name="top"),
         Layout(worst_table, name="worst"),
@@ -2863,6 +2914,12 @@ class LiveMultiBotRunner:
         # In multi-asset mode, the ranker will replace per-bot scanning.
         self.ranker = OpportunityRanker(max_opportunities=10)
         self.allocator = CapitalAllocator()
+
+        # ── Paper Grid (Multi-Variant A/B Testing) ───────────────
+        self.paper_grid = PaperGrid()
+        self.paper_grid.load_state()  # resume from crash
+        for bot in self.bots:
+            bot.paper_grid = self.paper_grid
 
         # WebSocket status per symbol: connected | reconnecting_N | disconnected
         self.ws_status: dict[str, str] = {
@@ -3057,6 +3114,10 @@ class LiveMultiBotRunner:
                     asset_class="crypto",
                     symbol=bot.symbol,
                 )
+
+            # Record trade close in Paper Grid (A/B testing)
+            if bot.paper_grid is not None:
+                bot.paper_grid.record_trade_close(exit_price, bot.symbol)
 
             # Feed shaped reward to central RL brain when the decision was tracked
             if trade.get("rl_tracked") and trade.get("rl_trade_id"):
@@ -3477,12 +3538,19 @@ class LiveMultiBotRunner:
                     self.circuit_breaker.update_portfolio_heat(total_risk)
                     self.circuit_breaker.check()
 
+                    # Save paper grid state periodically
+                    try:
+                        self.paper_grid.save_state()
+                    except Exception:
+                        pass
+
                     layout = build_dashboard(
                         bots=self.bots,
                         ws_status=self.ws_status,
                         start_time=self._start_time,
                         active_symbols=self.symbols,
                         total_equity=total_equity,
+                        paper_grid=self.paper_grid,
                     )
                     live.update(layout)
                 except Exception as exc:
@@ -3503,6 +3571,26 @@ class LiveMultiBotRunner:
         logger.info(
             "Starting %d bots on %d symbols …", len(self.bots), len(self.symbols)
         )
+
+        # ── Startup zombie order sweep (cancel ALL open orders) ────
+        # At startup, no trades are active → any open order is a zombie
+        if self.exchange is not None:
+            try:
+                n_cancelled = 0
+                for sym in self.symbols:
+                    try:
+                        open_orders = await self.exchange.fetch_open_orders(sym)
+                        for o in open_orders:
+                            o_id = str(o.get("id", ""))
+                            if o_id:
+                                await self.exchange.cancel_order(o_id, sym)
+                                n_cancelled += 1
+                    except Exception:
+                        pass
+                if n_cancelled > 0:
+                    logger.info("Startup: cancelled %d zombie orders", n_cancelled)
+            except Exception as exc:
+                logger.warning("Startup zombie sweep failed: %s", exc)
 
         # Start one OHLCV watcher task per symbol (5 m candle analysis)
         for sym in self.symbols:
@@ -3561,6 +3649,15 @@ class LiveMultiBotRunner:
                 b._save_state()
             except Exception:
                 pass
+
+        # Save Paper Grid state + export results
+        try:
+            self.paper_grid.save_state()
+            self.paper_grid.export_csv()
+            self.paper_grid.export_summary()
+            logger.info("Paper Grid state saved")
+        except Exception as exc:
+            logger.warning("Paper Grid save failed: %s", exc)
 
         # Close exchange WebSocket connections
         try:

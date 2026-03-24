@@ -1,0 +1,202 @@
+{
+  "Sniper-1.0": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-1.5": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-2.0": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-HiLev": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-LoRisk": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "AAA+-Base": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "AAA+-Conservative": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "W1-Summer": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Ultra-Sniper": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-HiLev-1.5": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "AAA+-1.5": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-RR2.5": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-Lev3": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Sniper-Lev15": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Wild-A85-RR2": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Wild-A78-RR3": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Wild-A88-RR2-L10": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Wild-Max": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Wild-Min": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  },
+  "Wild-Balanced": {
+    "equity": 100000.0,
+    "peak_equity": 100000.0,
+    "total_pnl": 0.0,
+    "n_wins": 0,
+    "n_losses": 0,
+    "n_breakeven": 0,
+    "trades": [],
+    "_trade_counter": 0
+  }
+}

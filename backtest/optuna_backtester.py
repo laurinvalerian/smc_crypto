@@ -286,10 +286,9 @@ def _resolve_trade_outcome(
 
             # Check SL first (conservative: worst case within bar)
             if low <= current_sl:
-                if current_sl >= entry:
-                    return "win", current_sl
-                else:
-                    return "loss", current_sl
+                if reached_1r:
+                    return "breakeven", current_sl
+                return "loss", current_sl
             # Check TP
             if high >= tp:
                 return "win", tp
@@ -302,19 +301,24 @@ def _resolve_trade_outcome(
                     current_sl = min(current_sl, entry - fee_buffer)
 
             if high >= current_sl:
-                if current_sl <= entry:
-                    return "win", current_sl
-                else:
-                    return "loss", current_sl
+                if reached_1r:
+                    return "breakeven", current_sl
+                return "loss", current_sl
             if low <= tp:
                 return "win", tp
 
     # Timeout: close at last bar's close
     last_close = float(future_bars.iloc[-1]["close"])
     if is_long:
-        return ("win" if last_close > entry else "loss"), last_close
+        pnl = last_close - entry
     else:
-        return ("win" if last_close < entry else "loss"), last_close
+        pnl = entry - last_close
+    if pnl > entry * 0.002:  # meaningful profit (>0.2%)
+        return "win", last_close
+    elif pnl < -entry * 0.002:
+        return "loss", last_close
+    else:
+        return "breakeven", last_close
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -329,6 +333,8 @@ def simulate_trades(
     use_circuit_breaker: bool = True,
     aaa_only: bool = True,
     asset_class: str = "crypto",
+    risk_per_trade_override: float | None = None,
+    max_equity_for_sizing: float | None = None,
 ) -> pd.DataFrame:
     """
     Simulate trades using REAL price-path outcomes.
@@ -391,9 +397,15 @@ def simulate_trades(
         if sl_pct <= 0:
             continue
 
-        risk_amount = compute_dynamic_risk(tier, alignment, equity)
-        # Hard cap: never risk more than 3% of current equity per trade
-        risk_amount = min(risk_amount, equity * 0.03)
+        # Equity used for sizing — capped if max_equity_for_sizing is set
+        sizing_equity = equity
+        if max_equity_for_sizing is not None:
+            sizing_equity = min(equity, max_equity_for_sizing)
+
+        risk_amount = compute_dynamic_risk(tier, alignment, sizing_equity)
+        # Optuna-tuned max risk cap (overrides hard 3% default)
+        max_risk_pct = risk_per_trade_override if risk_per_trade_override is not None else 0.03
+        risk_amount = min(risk_amount, sizing_equity * max_risk_pct)
         if risk_amount <= 0 or equity <= 0:
             continue
 
@@ -465,7 +477,7 @@ def simulate_trades(
                 "pnl": pnl,
                 "cost": cost,
                 "equity": equity,
-                "risk_pct": risk_amount / account_size,
+                "risk_pct": risk_amount / equity if equity > 0 else 0,
             }
         )
 
@@ -489,14 +501,18 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     """Compute comprehensive performance metrics."""
     if trades_df.empty:
         return {
-            "total_pnl": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0,
-            "sharpe": 0.0, "winrate": 0.0, "total_trades": 0,
+            "total_pnl": 0.0, "profit_factor": 0.0, "pf_real": 0.0,
+            "max_drawdown": 0.0, "sharpe": 0.0,
+            "winrate": 0.0, "winrate_real": 0.0, "be_rate": 0.0,
+            "total_trades": 0, "n_wins": 0, "n_losses": 0, "n_breakeven": 0,
             "recovery_factor": 0.0, "avg_rr": 0.0,
             "trades_aaa_pp": 0, "trades_aaa_p": 0,
             "pnl_per_trade": 0.0, "expectancy": 0.0,
         }
 
     pnl = trades_df["pnl"]
+    outcomes = trades_df["outcome"] if "outcome" in trades_df.columns else pd.Series()
+
     wins = pnl[pnl > 0]
     losses = pnl[pnl <= 0]
 
@@ -506,6 +522,21 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
 
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else gross_profit
     winrate = len(wins) / len(pnl) if len(pnl) > 0 else 0.0
+
+    # ── Real metrics (excluding breakeven exits) ──────────────────
+    n_be = int((outcomes == "breakeven").sum()) if len(outcomes) > 0 else 0
+    n_real_wins = int((outcomes == "win").sum()) if len(outcomes) > 0 else 0
+    n_real_losses = int((outcomes == "loss").sum()) if len(outcomes) > 0 else 0
+    be_rate = n_be / len(pnl) if len(pnl) > 0 else 0.0
+
+    # Real WR: only TP-hits vs real losses (exclude BE)
+    real_decisions = n_real_wins + n_real_losses
+    winrate_real = n_real_wins / real_decisions if real_decisions > 0 else 0.0
+
+    # Real PF: profit from wins only vs losses only (BE excluded from both)
+    real_win_pnl = float(pnl[outcomes == "win"].sum()) if n_real_wins > 0 else 0.0
+    real_loss_pnl = abs(float(pnl[outcomes == "loss"].sum())) if n_real_losses > 0 else 1e-9
+    pf_real = real_win_pnl / real_loss_pnl if real_loss_pnl > 0 else real_win_pnl
 
     # Cumulative equity & drawdown
     equity = account_size + pnl.cumsum()
@@ -543,10 +574,16 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     return {
         "total_pnl": total_pnl,
         "profit_factor": profit_factor,
+        "pf_real": pf_real,
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
         "winrate": winrate,
+        "winrate_real": winrate_real,
+        "be_rate": be_rate,
         "total_trades": int(len(pnl)),
+        "n_wins": n_real_wins,
+        "n_losses": n_real_losses,
+        "n_breakeven": n_be,
         "recovery_factor": recovery_factor,
         "avg_rr": avg_rr,
         "trades_aaa_pp": trades_aaa_pp,
@@ -695,11 +732,11 @@ def validate_oos_results(
     gates: dict[str, bool] = {}
     reasons: list[str] = []
 
-    # Gate 1: Profit Factor
-    pf = oos_metrics.get("profit_factor", 0)
+    # Gate 1: Profit Factor (use real PF excluding breakeven exits)
+    pf = oos_metrics.get("pf_real", oos_metrics.get("profit_factor", 0))
     gates["profit_factor_ok"] = pf >= 1.5
     if not gates["profit_factor_ok"]:
-        reasons.append(f"Profit Factor {pf:.2f} < 1.5")
+        reasons.append(f"Profit Factor(real) {pf:.2f} < 1.5")
 
     # Gate 2: Minimum trades (SMC sniper = few but high quality)
     n_trades = oos_metrics.get("total_trades", 0)
@@ -744,9 +781,8 @@ def validate_oos_results(
         gates["stability_ok"] = True  # Skip if not run
 
     # Gate 7: Trade quality — Win Rate > 20% AND positive expectancy
-    # Note: Target RR is always ≥ 4.0 (AAA+ tier). Realized RR varies
-    # due to trailing stop and timeouts — that's normal trade management.
-    wr = oos_metrics.get("winrate", 0)
+    # Uses real WR (excluding breakeven exits) for honest assessment
+    wr = oos_metrics.get("winrate_real", oos_metrics.get("winrate", 0))
     expectancy = oos_metrics.get("expectancy", 0)
     wr_ok = wr > 0.20
     exp_ok = expectancy > 0
@@ -770,6 +806,11 @@ def validate_oos_results(
 #  Optuna objective
 # ═══════════════════════════════════════════════════════════════════
 
+# Bump this version whenever signal generation logic changes (TP calc, filters, etc.)
+# Old caches with different versions are automatically ignored.
+SIGNAL_CACHE_VERSION = "v12"
+
+
 def _signal_cache_key(
     smc_cfg: dict[str, Any],
     symbols: list[str],
@@ -778,6 +819,7 @@ def _signal_cache_key(
 ) -> str:
     """Build a deterministic hash for the signal cache."""
     key_data = json.dumps({
+        "version": SIGNAL_CACHE_VERSION,
         "smc": {k: smc_cfg.get(k) for k in sorted(smc_cfg)},
         "symbols": sorted(symbols),
         "start": str(window_start),
@@ -945,6 +987,9 @@ def _build_objective(
             ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
             filt_by_class.setdefault(ac, []).append(sig)
 
+        # Equity cap: 2× initial account prevents unrealistic compound growth
+        max_eq = config["account"]["size"] * 2
+
         all_trades: list[pd.DataFrame] = []
         for ac, sigs in filt_by_class.items():
             t = simulate_trades(
@@ -955,6 +1000,8 @@ def _build_objective(
                 use_circuit_breaker=True,
                 aaa_only=True,
                 asset_class=ac,
+                risk_per_trade_override=risk_per_trade,
+                max_equity_for_sizing=max_eq,
             )
             if not t.empty:
                 all_trades.append(t)
@@ -972,10 +1019,10 @@ def _build_objective(
                 index=False,
             )
 
-        # Objective: PF × (1 − |DD|) × Sharpe — quality over quantity
-        # No trade-count penalty: SMC sniper = few trades, high quality
+        # Objective: PF_real × (1 − |DD|) × Sharpe — quality over quantity
+        # Uses real PF (excluding breakeven exits) to prevent BE-inflation
         score = (
-            metrics["profit_factor"]
+            metrics["pf_real"]
             * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
             * max(metrics["sharpe"], 0.01)
         )
@@ -1158,6 +1205,8 @@ def check_parameter_stability(
     def _run_with_params(params):
         alignment_th = params.get("alignment_threshold", 0.65)
         min_rr = params.get("risk_reward", 2.0)
+        rpt = params.get("risk_per_trade", None)
+        max_eq = config["account"]["size"] * 2
         filtered = []
         for sig in precomputed_signals:
             if sig.alignment_score < alignment_th:
@@ -1178,11 +1227,13 @@ def check_parameter_stability(
             commission_pct=config["backtest"]["commission_pct"],
             slippage_pct=config["backtest"]["slippage_pct"],
             account_size=config["account"]["size"],
+            risk_per_trade_override=rpt,
+            max_equity_for_sizing=max_eq,
         )
         return compute_metrics(trades, account_size=config["account"]["size"])
 
     base_metrics = _run_with_params(best_params)
-    base_pf = base_metrics["profit_factor"]
+    base_pf = base_metrics.get("pf_real", base_metrics["profit_factor"])
 
     perturbed_pfs: list[float] = []
     rng = np.random.RandomState(123)
@@ -1190,15 +1241,19 @@ def check_parameter_stability(
     for _ in range(n_perturbations):
         perturbed = dict(best_params)
         for key, val in perturbed.items():
+            if isinstance(val, dict):
+                continue  # skip nested dicts (style_weights)
             if isinstance(val, (int, float)):
                 factor = 1.0 + rng.uniform(-perturbation_pct, perturbation_pct)
                 if isinstance(val, int):
-                    perturbed[key] = max(1, int(val * factor))
+                    # Use ceil/floor to ensure integer params actually change
+                    new_val = val * factor
+                    perturbed[key] = max(1, int(round(new_val)))
                 else:
                     perturbed[key] = val * factor
 
         metrics = _run_with_params(perturbed)
-        perturbed_pfs.append(metrics["profit_factor"])
+        perturbed_pfs.append(metrics.get("pf_real", metrics["profit_factor"]))
 
     # Check stability: if any perturbation drops PF by >50%, it's unstable
     pf_changes = [abs(pf - base_pf) / max(base_pf, 0.01) for pf in perturbed_pfs]
@@ -1355,6 +1410,9 @@ def run(
             ac = symbol_to_asset.get(sig.symbol, "crypto")
             oos_by_class.setdefault(ac, []).append(sig)
 
+        best_rpt = best_params.get("risk_per_trade", None)
+        max_eq = account_size * 2  # Cap compound growth at 2× initial
+
         oos_parts: list[pd.DataFrame] = []
         for ac, sigs in oos_by_class.items():
             t = simulate_trades(
@@ -1365,6 +1423,8 @@ def run(
                 use_circuit_breaker=True,
                 aaa_only=True,
                 asset_class=ac,
+                risk_per_trade_override=best_rpt,
+                max_equity_for_sizing=max_eq,
             )
             if not t.empty:
                 oos_parts.append(t)
@@ -1416,9 +1476,15 @@ def run(
         all_validations.append(validation)
 
         logger.info(
-            "Window %d OOS: PF=%.2f Sharpe=%.2f WR=%.1f%% Trades=%d DD=%.2f%% | %s",
-            wi, oos_metrics["profit_factor"], oos_metrics["sharpe"],
-            oos_metrics["winrate"] * 100, oos_metrics["total_trades"],
+            "Window %d OOS: PF=%.2f(real) Sharpe=%.2f WR=%.1f%%(real) BE=%.0f%% "
+            "Trades=%d(%dW/%dL/%dBE) DD=%.2f%% | %s",
+            wi, oos_metrics.get("pf_real", oos_metrics["profit_factor"]),
+            oos_metrics["sharpe"],
+            oos_metrics.get("winrate_real", oos_metrics["winrate"]) * 100,
+            oos_metrics.get("be_rate", 0) * 100,
+            oos_metrics["total_trades"],
+            oos_metrics.get("n_wins", 0), oos_metrics.get("n_losses", 0),
+            oos_metrics.get("n_breakeven", 0),
             oos_metrics["max_drawdown"] * 100,
             validation["verdict"],
         )
@@ -1456,7 +1522,10 @@ def run(
             "mean_pnl": float(summary["total_pnl"].mean()),
             "mean_sharpe": float(summary["sharpe"].mean()),
             "mean_winrate": float(summary["winrate"].mean()),
+            "mean_winrate_real": float(summary["winrate_real"].mean()) if "winrate_real" in summary.columns else 0.0,
             "mean_profit_factor": float(summary["profit_factor"].mean()),
+            "mean_pf_real": float(summary["pf_real"].mean()) if "pf_real" in summary.columns else 0.0,
+            "mean_be_rate": float(summary["be_rate"].mean()) if "be_rate" in summary.columns else 0.0,
             "worst_drawdown": float(summary["max_drawdown"].min()),
             "mean_trades_per_window": float(summary["total_trades"].mean()),
             "total_trades_all_windows": int(summary["total_trades"].sum()),

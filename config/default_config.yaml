@@ -17,7 +17,7 @@ risk_per_trade:
   max: 0.015               # 1.5 %
 
 risk_reward:
-  options: [1.5, 2.0, 2.5, 3.0, 3.5]   # min_rr filter (TP is structure-based)
+  options: [2.0, 2.5, 3.0, 3.5]   # min_rr filter (TP is structure-based, min 2.0 aligned with tier gates)
 
 # ── Volume Filter (3-Layer AAA++ Scoring) ────────────────────────
 volume_filter:

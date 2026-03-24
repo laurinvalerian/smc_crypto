@@ -314,7 +314,7 @@ def _compute_discount_premium(
     return result
 
 
-def _find_structure_tp(
+def _find_structure_tp_OLD(
     indicators: dict[str, dict[str, Any]],
     entry_price: float,
     bias: str,
@@ -448,6 +448,428 @@ def _find_structure_tp(
 
     # Nothing found
     return 0.0, "none"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Lookahead-safe structure TP helpers (computed from raw OHLC only)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _find_swing_highs_lows(
+    high: np.ndarray, low: np.ndarray, swing_length: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized left-side-only swing detection. No future bars needed.
+
+    A swing high at bar i: high[i] >= max(high[i-swing_length : i])
+    A swing low  at bar i: low[i]  <= min(low[i-swing_length : i])
+
+    Returns boolean arrays (same length as input) marking swing points.
+    """
+    n = len(high)
+    is_swing_high = np.zeros(n, dtype=np.bool_)
+    is_swing_low = np.zeros(n, dtype=np.bool_)
+
+    if n <= swing_length:
+        return is_swing_high, is_swing_low
+
+    # Rolling max of high over the PREVIOUS swing_length bars (not including current)
+    # Use pandas for efficient rolling, then compare.
+    high_s = pd.Series(high)
+    low_s = pd.Series(low)
+
+    # rolling window=swing_length on SHIFTED series (so window covers [i-swing_length, i-1])
+    roll_max = high_s.shift(1).rolling(window=swing_length, min_periods=swing_length).max()
+    roll_min = low_s.shift(1).rolling(window=swing_length, min_periods=swing_length).min()
+
+    is_swing_high = (high_s >= roll_max).values & ~np.isnan(roll_max.values)
+    is_swing_low = (low_s <= roll_min).values & ~np.isnan(roll_min.values)
+
+    return is_swing_high, is_swing_low
+
+
+def _find_liquidity_tp(
+    visible_high: np.ndarray,
+    visible_low: np.ndarray,
+    entry_price: float,
+    is_long: bool,
+    min_tp_dist: float,
+    swing_highs: np.ndarray,
+    swing_lows: np.ndarray,
+) -> float:
+    """
+    Find TP at nearest unswept swing high (long) or swing low (short).
+
+    Uses pre-computed swing arrays. "Unswept" means no subsequent bar has
+    traded through the swing level.
+
+    Returns TP price, or 0.0 if nothing found.
+    """
+    n = len(visible_high)
+
+    if is_long:
+        # Find swing highs above entry + min_tp_dist
+        sh_indices = np.where(swing_highs)[0]
+        if len(sh_indices) == 0:
+            return 0.0
+
+        sh_levels = visible_high[sh_indices]
+        min_price = entry_price + min_tp_dist
+
+        # Filter: above min price
+        mask = sh_levels > min_price
+        sh_indices = sh_indices[mask]
+        sh_levels = sh_levels[mask]
+        if len(sh_indices) == 0:
+            return 0.0
+
+        # Check unswept: no bar AFTER the swing high has high > swing level
+        best_tp = 0.0
+        best_dist = np.inf
+        for idx, level in zip(sh_indices, sh_levels):
+            dist = level - entry_price
+            if dist >= best_dist:
+                continue  # already have a closer one
+            # Check if swept: any bar after idx has high > level
+            if idx + 1 < n:
+                if np.any(visible_high[idx + 1:] > level):
+                    continue  # swept
+            best_tp = level
+            best_dist = dist
+
+        return best_tp
+
+    else:
+        # Find swing lows below entry - min_tp_dist
+        sl_indices = np.where(swing_lows)[0]
+        if len(sl_indices) == 0:
+            return 0.0
+
+        sl_levels = visible_low[sl_indices]
+        max_price = entry_price - min_tp_dist
+
+        mask = sl_levels < max_price
+        sl_indices = sl_indices[mask]
+        sl_levels = sl_levels[mask]
+        if len(sl_indices) == 0:
+            return 0.0
+
+        best_tp = 0.0
+        best_dist = np.inf
+        for idx, level in zip(sl_indices, sl_levels):
+            dist = entry_price - level
+            if dist >= best_dist:
+                continue
+            if idx + 1 < n:
+                if np.any(visible_low[idx + 1:] < level):
+                    continue  # swept
+            best_tp = level
+            best_dist = dist
+
+        return best_tp
+
+
+def _find_fvg_tp(
+    visible_high: np.ndarray,
+    visible_low: np.ndarray,
+    visible_close: np.ndarray,
+    entry_price: float,
+    is_long: bool,
+    min_tp_dist: float,
+) -> float:
+    """
+    Find TP at nearest unmitigated FVG.
+
+    Bullish FVG: bar[i].low > bar[i-2].high  (gap up)
+    Bearish FVG: bar[i].high < bar[i-2].low  (gap down)
+
+    For long TP: nearest bearish FVG bottom above entry (resistance).
+    For short TP: nearest bullish FVG top below entry (support).
+
+    Returns TP price, or 0.0 if nothing found.
+    """
+    n = len(visible_high)
+    if n < 3:
+        return 0.0
+
+    if is_long:
+        # Bearish FVG: bar[i].high < bar[i-2].low => gap down = resistance zone
+        # The gap zone is [bar[i].high, bar[i-2].low]
+        # TP at the bottom of the gap = bar[i].high (nearest edge for long approaching)
+        # Actually for a long approaching from below, the FVG bottom is the first level hit.
+        gap_top = visible_low[:-2]      # bar[i-2].low  (indices 0..n-3)
+        gap_bottom = visible_high[2:]   # bar[i].high   (indices 2..n-1)
+        is_bearish_fvg = gap_bottom < gap_top  # gap down
+
+        if not np.any(is_bearish_fvg):
+            return 0.0
+
+        fvg_indices = np.where(is_bearish_fvg)[0]  # index into 0-based (maps to bar index + 2)
+        fvg_bottoms = gap_bottom[fvg_indices]  # bar[i].high = bottom of gap
+        fvg_tops = gap_top[fvg_indices]        # bar[i-2].low = top of gap
+
+        min_price = entry_price + min_tp_dist
+        price_mask = fvg_bottoms > min_price
+
+        fvg_indices = fvg_indices[price_mask]
+        fvg_bottoms = fvg_bottoms[price_mask]
+        fvg_tops = fvg_tops[price_mask]
+
+        if len(fvg_indices) == 0:
+            return 0.0
+
+        # Check unmitigated: price hasn't entered the gap zone after formation
+        # The actual bar index of the FVG is fvg_idx + 2
+        best_tp = 0.0
+        best_dist = np.inf
+        for k in range(len(fvg_indices)):
+            bar_idx = fvg_indices[k] + 2
+            bottom = fvg_bottoms[k]
+            top = fvg_tops[k]
+            dist = bottom - entry_price
+            if dist >= best_dist:
+                continue
+            # Check mitigation: any bar after formation with low <= top of gap
+            if bar_idx + 1 < n:
+                if np.any(visible_low[bar_idx + 1:] <= top):
+                    continue  # mitigated
+            best_tp = bottom
+            best_dist = dist
+
+        return best_tp
+
+    else:
+        # Bullish FVG: bar[i].low > bar[i-2].high => gap up = support zone
+        # Gap zone is [bar[i-2].high, bar[i].low]
+        # TP at the top of the gap = bar[i].low (nearest edge for short approaching)
+        gap_bottom = visible_high[:-2]  # bar[i-2].high (indices 0..n-3)
+        gap_top = visible_low[2:]       # bar[i].low    (indices 2..n-1)
+        is_bullish_fvg = gap_top > gap_bottom  # gap up
+
+        if not np.any(is_bullish_fvg):
+            return 0.0
+
+        fvg_indices = np.where(is_bullish_fvg)[0]
+        fvg_tops = gap_top[fvg_indices]       # bar[i].low = top of gap
+        fvg_bottoms = gap_bottom[fvg_indices]  # bar[i-2].high = bottom of gap
+
+        max_price = entry_price - min_tp_dist
+        price_mask = fvg_tops < max_price
+
+        fvg_indices = fvg_indices[price_mask]
+        fvg_tops = fvg_tops[price_mask]
+        fvg_bottoms = fvg_bottoms[price_mask]
+
+        if len(fvg_indices) == 0:
+            return 0.0
+
+        best_tp = 0.0
+        best_dist = np.inf
+        for k in range(len(fvg_indices)):
+            bar_idx = fvg_indices[k] + 2
+            top = fvg_tops[k]
+            bottom = fvg_bottoms[k]
+            dist = entry_price - top
+            if dist >= best_dist:
+                continue
+            # Mitigated if any bar after formation has high >= bottom of gap
+            if bar_idx + 1 < n:
+                if np.any(visible_high[bar_idx + 1:] >= bottom):
+                    continue  # mitigated
+            best_tp = top
+            best_dist = dist
+
+        return best_tp
+
+
+def _find_ob_tp(
+    visible_open: np.ndarray,
+    visible_high: np.ndarray,
+    visible_low: np.ndarray,
+    visible_close: np.ndarray,
+    entry_price: float,
+    is_long: bool,
+    min_tp_dist: float,
+    swing_highs: np.ndarray,
+    swing_lows: np.ndarray,
+) -> float:
+    """
+    Find TP at nearest order block (last opposite candle before a swing break).
+
+    Bearish OB (resistance for long TP): last red candle before a swing high break.
+    Bullish OB (support for short TP): last green candle before a swing low break.
+
+    Returns TP price, or 0.0 if nothing found.
+    """
+    n = len(visible_high)
+    is_red = visible_close < visible_open
+    is_green = visible_close > visible_open
+
+    if is_long:
+        # Find bearish OBs = resistance. These form before swing high breaks.
+        # For each swing high, find the last red candle before it.
+        sh_indices = np.where(swing_highs)[0]
+        if len(sh_indices) == 0:
+            return 0.0
+
+        min_price = entry_price + min_tp_dist
+        best_tp = 0.0
+        best_dist = np.inf
+
+        for sh_idx in sh_indices:
+            # Look backwards from the swing high for the last red candle
+            search_start = max(0, sh_idx - 10)
+            red_before = np.where(is_red[search_start:sh_idx])[0]
+            if len(red_before) == 0:
+                continue
+            ob_idx = search_start + red_before[-1]  # last red candle before swing
+            ob_low = visible_low[ob_idx]
+            ob_high = visible_high[ob_idx]
+
+            # OB zone is [ob_low, ob_high]. For long TP, use ob_low (first level hit)
+            if ob_low <= min_price:
+                continue
+            dist = ob_low - entry_price
+            if dist >= best_dist:
+                continue
+            # Check unmitigated: no bar after OB formation has traded through the OB zone
+            if ob_idx + 1 < n:
+                if np.any(visible_low[ob_idx + 1:] <= ob_low):
+                    continue  # mitigated
+            best_tp = ob_low
+            best_dist = dist
+
+        return best_tp
+
+    else:
+        # Find bullish OBs = support. These form before swing low breaks.
+        sl_indices = np.where(swing_lows)[0]
+        if len(sl_indices) == 0:
+            return 0.0
+
+        max_price = entry_price - min_tp_dist
+        best_tp = 0.0
+        best_dist = np.inf
+
+        for sl_idx in sl_indices:
+            search_start = max(0, sl_idx - 10)
+            green_before = np.where(is_green[search_start:sl_idx])[0]
+            if len(green_before) == 0:
+                continue
+            ob_idx = search_start + green_before[-1]
+            ob_high = visible_high[ob_idx]
+            ob_low = visible_low[ob_idx]
+
+            # For short TP, use ob_high (first level hit from above)
+            if ob_high >= max_price:
+                continue
+            dist = entry_price - ob_high
+            if dist >= best_dist:
+                continue
+            if ob_idx + 1 < n:
+                if np.any(visible_high[ob_idx + 1:] >= ob_high):
+                    continue  # mitigated
+            best_tp = ob_high
+            best_dist = dist
+
+        return best_tp
+
+
+@dataclass
+class _HTFArrays:
+    """Pre-extracted numpy arrays for a higher-timeframe DataFrame.
+    Computed once per generate_signals() call, reused for every signal bar."""
+    high: np.ndarray
+    low: np.ndarray
+    open: np.ndarray
+    close: np.ndarray
+    swing_highs: np.ndarray
+    swing_lows: np.ndarray
+    length: int
+
+
+def _precompute_htf_arrays(
+    df: pd.DataFrame, swing_length: int,
+) -> _HTFArrays | None:
+    """Extract full arrays and swing detection for an HTF DataFrame."""
+    if df.empty:
+        return None
+    h = df["high"].values.astype(np.float64)
+    l = df["low"].values.astype(np.float64)
+    o = df["open"].values.astype(np.float64)
+    c = df["close"].values.astype(np.float64)
+    sh, sl_ = _find_swing_highs_lows(h, l, swing_length)
+    return _HTFArrays(
+        high=h, low=l, open=o, close=c,
+        swing_highs=sh, swing_lows=sl_, length=len(h),
+    )
+
+
+def _find_structure_tp_safe(
+    htf_4h: "_HTFArrays | None",
+    htf_1h: "_HTFArrays | None",
+    vlen_4h: int,
+    vlen_1h: int,
+    entry_price: float,
+    bias: str,
+    sl_dist: float,
+    min_rr: float = 2.0,
+) -> tuple[float, str]:
+    """
+    Lookahead-safe structure TP — uses pre-sliced raw OHLC arrays only.
+
+    Unlike _find_structure_tp_OLD, this does NOT use pre-computed SMC
+    indicators (which may contain future information). Swings, FVGs, and OBs
+    are detected from the visible portion of pre-extracted numpy arrays.
+
+    The _HTFArrays are computed ONCE per generate_signals() call via
+    _precompute_htf_arrays(). Each call here only slices to vlen and
+    searches — no pandas overhead.
+
+    Search order: liq_4h -> liq_1h -> fvg_4h -> fvg_1h -> ob_4h -> ob_1h -> fallback.
+    Returns (tp_price, source_label).
+    """
+    is_long = bias == "bullish"
+    min_tp_dist = sl_dist * min_rr
+
+    # Build search list: (arrays, visible_length, label)
+    search: list[tuple[_HTFArrays, int, str]] = []
+    if htf_4h is not None and vlen_4h > 0:
+        search.append((htf_4h, min(vlen_4h, htf_4h.length), "4h"))
+    if htf_1h is not None and vlen_1h > 0:
+        search.append((htf_1h, min(vlen_1h, htf_1h.length), "1h"))
+
+    # Search: liq -> fvg -> ob across timeframes
+    for arr, vl, tf_label in search:
+        tp = _find_liquidity_tp(
+            arr.high[:vl], arr.low[:vl], entry_price, is_long, min_tp_dist,
+            arr.swing_highs[:vl], arr.swing_lows[:vl],
+        )
+        if tp > 0:
+            return tp, f"liq_{tf_label}"
+
+    for arr, vl, tf_label in search:
+        tp = _find_fvg_tp(
+            arr.high[:vl], arr.low[:vl], arr.close[:vl],
+            entry_price, is_long, min_tp_dist,
+        )
+        if tp > 0:
+            return tp, f"fvg_{tf_label}"
+
+    for arr, vl, tf_label in search:
+        tp = _find_ob_tp(
+            arr.open[:vl], arr.high[:vl], arr.low[:vl], arr.close[:vl],
+            entry_price, is_long, min_tp_dist,
+            arr.swing_highs[:vl], arr.swing_lows[:vl],
+        )
+        if tp > 0:
+            return tp, f"ob_{tf_label}"
+
+    # Fallback: 3.0 RR
+    if is_long:
+        return entry_price + sl_dist * 3.0, "fallback"
+    else:
+        return entry_price - sl_dist * 3.0, "fallback"
 
 
 def _check_volume_ok(decision_df: pd.DataFrame, bar_idx: int,
@@ -957,6 +1379,10 @@ class SMCMultiStyleStrategy:
         vlen_1h = _build_valid_len_map(df_1h)
         vlen_15m = _build_valid_len_map(df_15m)
 
+        # ── Precompute HTF arrays for lookahead-safe structure TP ──
+        _htf_4h = _precompute_htf_arrays(df_4h, self.swing_length)
+        _htf_1h = _precompute_htf_arrays(df_1h, self.swing_length)
+
         # ── Precompute discount/premium zones (4H swing range) ──
         discount_premium = _compute_discount_premium(
             ind_4h, df_4h, decision_df, vlen_4h,
@@ -1089,22 +1515,17 @@ class SMCMultiStyleStrategy:
 
             direction = "long" if bias == "bullish" else "short"
 
-            # ── Structure-based TP (like a real SMC trader) ──────
-            tp_price, tp_source = _find_structure_tp(
-                indicators, entry_price, bias, sl_dist,
+            # ── Structure-based TP (lookahead-safe, from raw OHLC) ──
+            tp_price, tp_source = _find_structure_tp_safe(
+                _htf_4h, _htf_1h,
                 vlen_4h=int(vlen_4h[i]),
                 vlen_1h=int(vlen_1h[i]),
+                entry_price=entry_price,
+                bias=bias,
+                sl_dist=sl_dist,
                 min_rr=2.0,
             )
-            if tp_price > 0:
-                take_profit = tp_price
-            else:
-                # Fallback: fixed 3.0 RR (only when no structure found)
-                tp_source = "fallback"
-                if bias == "bullish":
-                    take_profit = entry_price + sl_dist * 3.0
-                else:
-                    take_profit = entry_price - sl_dist * 3.0
+            take_profit = tp_price
 
             # Derive actual RR from structure levels
             tp_dist = abs(take_profit - entry_price)
