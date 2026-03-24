@@ -1,0 +1,37 @@
+{
+  "asset_class": "forex",
+  "params": {
+    "alignment_threshold": 0.9,
+    "risk_reward": 2.0,
+    "leverage": 13,
+    "risk_per_trade": 0.015
+  },
+  "cross_window_metrics": {
+    "w0": {
+      "pf_real": 29867387748479.17,
+      "winrate_real": 1.0,
+      "trades": 17,
+      "dd": 0.0,
+      "sharpe": 17.232093270436252
+    },
+    "w1": {
+      "pf_real": 6344785874078.307,
+      "winrate_real": 1.0,
+      "trades": 6,
+      "dd": -0.00022563163570082272,
+      "sharpe": 13.725593557538218
+    },
+    "w2": {
+      "pf_real": 26501379926936.7,
+      "winrate_real": 1.0,
+      "trades": 11,
+      "dd": 0.0,
+      "sharpe": 41.461380432857936
+    }
+  },
+  "min_pf": 6344785874078.307,
+  "mean_pf": 20904517849831.395,
+  "is_evergreen": true,
+  "n_candidates_tested": 19,
+  "n_evergreen_found": 19
+}

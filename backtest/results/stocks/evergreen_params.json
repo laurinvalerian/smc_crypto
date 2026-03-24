@@ -1,0 +1,37 @@
+{
+  "asset_class": "stocks",
+  "params": {
+    "alignment_threshold": 0.9,
+    "risk_reward": 2.0,
+    "leverage": 3.0,
+    "risk_per_trade": 0.003
+  },
+  "cross_window_metrics": {
+    "w0": {
+      "pf_real": 40.685180111446385,
+      "winrate_real": 0.9069767441860465,
+      "trades": 54,
+      "dd": -0.004974754307084969,
+      "sharpe": 18.820363201428634
+    },
+    "w1": {
+      "pf_real": 10.53021728766125,
+      "winrate_real": 0.6521739130434783,
+      "trades": 60,
+      "dd": -0.009895648973010112,
+      "sharpe": 11.284539335957408
+    },
+    "w2": {
+      "pf_real": 8.561050963144325,
+      "winrate_real": 0.6764705882352942,
+      "trades": 47,
+      "dd": -0.011045868392867291,
+      "sharpe": 10.976170505770979
+    }
+  },
+  "min_pf": 8.561050963144325,
+  "mean_pf": 19.92548278741732,
+  "is_evergreen": true,
+  "n_candidates_tested": 17,
+  "n_evergreen_found": 17
+}

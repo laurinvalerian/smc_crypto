@@ -1,0 +1,37 @@
+{
+  "asset_class": "crypto",
+  "params": {
+    "alignment_threshold": 0.9,
+    "risk_reward": 3.5,
+    "leverage": 6,
+    "risk_per_trade": 0.015
+  },
+  "cross_window_metrics": {
+    "w0": {
+      "pf_real": 5.8476759373072,
+      "winrate_real": 0.5333333333333333,
+      "trades": 23,
+      "dd": -0.09220833483091131,
+      "sharpe": 7.867348063309622
+    },
+    "w1": {
+      "pf_real": 5.519872021939388,
+      "winrate_real": 0.5476190476190477,
+      "trades": 84,
+      "dd": -0.12849397154900608,
+      "sharpe": 5.715978720599089
+    },
+    "w2": {
+      "pf_real": 6.148563891587353,
+      "winrate_real": 0.5555555555555556,
+      "trades": 38,
+      "dd": -0.054569564837630806,
+      "sharpe": 6.285802960477515
+    }
+  },
+  "min_pf": 5.519872021939388,
+  "mean_pf": 5.8387039502779805,
+  "is_evergreen": true,
+  "n_candidates_tested": 19,
+  "n_evergreen_found": 19
+}
