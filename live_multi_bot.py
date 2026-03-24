@@ -1,38 +1,31 @@
 """
 ═══════════════════════════════════════════════════════════════════
- live_multi_bot.py  –  Final Coin-Specialised 100-Bot Version
+ live_multi_bot.py  –  Multi-Asset SMC Trading Bot
  ──────────────────────────────────────────────────────────────
- Exactly 100 bots, each permanently assigned to one coin from
- the Top 100 Evergreen list.  All bots share identical fixed
- SMC parameters and money-management rules.  A single central
- PPO brain gates trades for every coin.
+ 112 bots across 4 asset classes (30 Crypto + 28 Forex +
+ 50 Stocks + 4 Commodities), matching the backtester universe.
+
+ Each bot is assigned to one instrument with asset-class-specific
+ SMC parameters, commission rates, and leverage caps.
 
  Features:
-   • Fixed 100 bots (no --num-bots parameter)
-   • 1 bot = 1 coin (1:1 mapping, no dynamic volume ranking)
-   • Fixed SMC params & money management for all bots
-   • Central PPO RL brain (rl_brain.py) shared by all coins
-   • Reward = pure PnL change in % (no shaping)
-   • Real Binance Testnet bracket orders (market + SL + TP)
-   • Real-time entry via watch_ticker (no waiting for closed 5m candle)
-   • Risk = 1 % of real account balance (fetch_balance per trade)
-   • Dynamic SL/TP from SMC (OB + Liquidity + FVG), RR ≥ 3.0
-   • Warm-up: first 100 trades per bot always accepted
-   • WebSocket with stable auto-reconnect (max 5 retries)
-   • Rich Live Dashboard:
-       – Header: title + total equity + uptime
-       – TOP 20 / WORST 20 bots tables
-       – WebSocket status panel (global + per group)
-       – Green/Red colour coding for PnL
-   • Each bot: own equity CSV + log file
+   • 112 bots (30 crypto, 28 forex, 50 stocks, 4 commodities)
+   • 3 exchange adapters: Binance, OANDA, Alpaca
+   • Asset-class-specific SMC params, fees, and leverage
+   • WebSocket for crypto, REST polling for forex/stocks/commodities
+   • Central PPO RL brain shared by all instruments
+   • 20-variant Paper Grid A/B testing
+   • Circuit Breaker per asset class
+   • Trading hours enforcement (forex 24/5, stocks regular hours)
+   • Graceful degradation (missing API keys → skip that class)
+   • Rich Live Dashboard with asset-class grouping
 
  Requirements:
    pip install 'ccxt[pro]' pandas numpy python-dotenv pyyaml rich torch
+   Optional: pip install v20 (OANDA), pip install alpaca-py (Alpaca)
 
  Quick Start:
-   1. Copy .env.example → .env and fill in your testnet keys:
-        BINANCE_API_KEY=your_testnet_api_key
-        BINANCE_SECRET=your_testnet_secret
+   1. Copy .env.example → .env and fill in broker API keys
    2. python live_multi_bot.py [--config config/default_config.yaml]
    3. Ctrl+C → graceful shutdown with final summary.
 ═══════════════════════════════════════════════════════════════════
@@ -78,22 +71,20 @@ from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
 from exchanges import BinanceAdapter
+from exchanges.base import ExchangeAdapter
 from risk.circuit_breaker import CircuitBreaker
 from ranker.universe_scanner import UniverseScanner, ScanResult
 from ranker.opportunity_ranker import OpportunityRanker, RankedOpportunity
 from ranker.capital_allocator import CapitalAllocator
 from paper_grid import PaperGrid
 
-# ── ccxt (sync) for history loading ───────────────────────────────
-import ccxt as ccxt_sync
-
-# ── ccxt.pro for WebSocket ────────────────────────────────────────
+# ── ccxt imports (only needed for BinanceAdapter backward-compat) ─
 try:
+    import ccxt as ccxt_sync
     import ccxt.pro as ccxtpro
 except ImportError:
-    sys.exit(
-        "ccxt.pro is required.  Install with:  pip install 'ccxt[pro]'"
-    )
+    ccxt_sync = None  # type: ignore[assignment]
+    ccxtpro = None  # type: ignore[assignment]
 
 # ── PyTorch (hard requirement for RL brain) ──────────────────────
 try:
@@ -116,122 +107,117 @@ WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
 WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
 WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
 
-# ── Fixed Top 100 Evergreen Coins (1 bot = 1 coin) ───────────────
-TOP_100_COINS: list[str] = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "BNB/USDT:USDT",
-    "XRP/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "TON/USDT:USDT",
-    "ADA/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "1000SHIB/USDT:USDT",
-    "LINK/USDT:USDT",
-    "DOT/USDT:USDT",
-    "TRX/USDT:USDT",
-    "BCH/USDT:USDT",
-    "NEAR/USDT:USDT",
-    "LTC/USDT:USDT",
-    "1000PEPE/USDT:USDT",
-    "SUI/USDT:USDT",
-    "UNI/USDT:USDT",
-    "HBAR/USDT:USDT",
-    "APT/USDT:USDT",
-    "ARB/USDT:USDT",
-    "OP/USDT:USDT",
-    "POL/USDT:USDT",
-    "FIL/USDT:USDT",
-    "INJ/USDT:USDT",
-    "RENDER/USDT:USDT",
-    "TIA/USDT:USDT",
-    "SEI/USDT:USDT",
-    "WLD/USDT:USDT",
-    "FET/USDT:USDT",
-    "SAND/USDT:USDT",
-    "MANA/USDT:USDT",
-    "GALA/USDT:USDT",
-    "AXS/USDT:USDT",
-    "EGLD/USDT:USDT",
-    "KAS/USDT:USDT",
-    "XLM/USDT:USDT",
-    "VET/USDT:USDT",
-    "1000CAT/USDT:USDT",
-    "ATOM/USDT:USDT",
-    "FTM/USDT:USDT",
-    "EOS/USDT:USDT",
-    "THETA/USDT:USDT",
-    "AAVE/USDT:USDT",
-    "MKR/USDT:USDT",
-    "LDO/USDT:USDT",
-    "RUNE/USDT:USDT",
-    "GRT/USDT:USDT",
-    "QNT/USDT:USDT",
-    "STX/USDT:USDT",
-    "ALGO/USDT:USDT",
-    "XMR/USDT:USDT",
-    "ZEC/USDT:USDT",
-    "ETC/USDT:USDT",
-    "NEO/USDT:USDT",
-    "IOTA/USDT:USDT",
-    "ONT/USDT:USDT",
-    "WAVES/USDT:USDT",
-    "ZIL/USDT:USDT",
-    "KLAY/USDT:USDT",
-    "FLOW/USDT:USDT",
-    "CRV/USDT:USDT",
-    "DYDX/USDT:USDT",
-    "GMX/USDT:USDT",
-    "APE/USDT:USDT",
-    "CHZ/USDT:USDT",
-    "ENJ/USDT:USDT",
-    "1INCH/USDT:USDT",
-    "SUSHI/USDT:USDT",
-    "COMP/USDT:USDT",
-    "SNX/USDT:USDT",
-    "YFI/USDT:USDT",
-    "1000BONK/USDT:USDT",
-    "JUP/USDT:USDT",
-    "PYTH/USDT:USDT",
-    "ORDI/USDT:USDT",
-    "STRK/USDT:USDT",
-    "IMX/USDT:USDT",
-    "KAVA/USDT:USDT",
-    "CELO/USDT:USDT",
-    "ROSE/USDT:USDT",
-    "1000LUNC/USDT:USDT",
-    "PENDLE/USDT:USDT",
-    "NOT/USDT:USDT",
-    "BRETT/USDT:USDT",
-    "POPCAT/USDT:USDT",
-    "MEW/USDT:USDT",
-    "GIGGLE/USDT:USDT",
-    "TURBO/USDT:USDT",
-    "1000000MOG/USDT:USDT",
-    "1000FLOKI/USDT:USDT",
-    "WIF/USDT:USDT",
-    "BOME/USDT:USDT",
-    "PIXEL/USDT:USDT",
-    "ONDO/USDT:USDT",
-    "TAO/USDT:USDT",
-    "XAI/USDT:USDT",
-    "PEOPLE/USDT:USDT",
-    "BIGTIME/USDT:USDT"
+# ── Top 30 Crypto (ranked by liquidity, same as backtester) ──────
+TOP_30_CRYPTO: list[str] = [
+    "BTC/USDT:USDT",  "ETH/USDT:USDT",  "SOL/USDT:USDT",
+    "BNB/USDT:USDT",  "XRP/USDT:USDT",  "DOGE/USDT:USDT",
+    "TON/USDT:USDT",  "ADA/USDT:USDT",  "AVAX/USDT:USDT",
+    "1000SHIB/USDT:USDT", "LINK/USDT:USDT", "DOT/USDT:USDT",
+    "TRX/USDT:USDT",  "BCH/USDT:USDT",  "NEAR/USDT:USDT",
+    "LTC/USDT:USDT",  "1000PEPE/USDT:USDT", "SUI/USDT:USDT",
+    "UNI/USDT:USDT",  "HBAR/USDT:USDT", "APT/USDT:USDT",
+    "ARB/USDT:USDT",  "OP/USDT:USDT",   "POL/USDT:USDT",
+    "FIL/USDT:USDT",  "INJ/USDT:USDT",  "RENDER/USDT:USDT",
+    "TIA/USDT:USDT",  "SEI/USDT:USDT",  "WLD/USDT:USDT",
 ]
 
-NUM_BOTS = len(TOP_100_COINS)  # exactly 100 (or as many coins as listed)
+# ── 28 Forex Pairs (7 Majors + 21 Crosses) — OANDA format ───────
+FOREX_28: list[str] = [
+    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "NZD_USD", "USD_CAD",
+    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
+    "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
+    "AUD_JPY", "AUD_NZD", "AUD_CAD", "AUD_CHF",
+    "NZD_JPY", "NZD_CAD", "NZD_CHF",
+    "CAD_JPY", "CAD_CHF", "CHF_JPY",
+]
 
-# ── Fixed SMC Parameters (identical for all 100 bots) ────────────
-FIXED_SMC_PARAMS: dict[str, Any] = {
-    "swing_length": 8,
-    "fvg_threshold": 0.0006,
-    "order_block_lookback": 20,
-    "liquidity_range_percent": 0.01,
-    "alignment_threshold": 0.65,
-    "weight_day": 1.25,
-    "bos_choch_filter": "medium",
+# ── Top 50 US Stocks (by market cap) — Alpaca format ────────────
+STOCKS_50: list[str] = [
+    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "AMD", "AMGN", "AMZN", "AVGO",
+    "BAC", "BRK.B", "CMCSA", "COST", "CRM", "CSCO", "CVX",
+    "DHR", "DIS", "GE", "GOOGL", "HD", "IBM", "INTC", "INTU",
+    "JNJ", "JPM", "KO", "LIN", "LLY", "MA", "MCD", "META", "MRK", "MSFT",
+    "NEE", "NFLX", "NVDA", "ORCL", "PEP", "PG", "PM", "QCOM",
+    "TSLA", "TMO", "TXN", "UNH", "V", "VZ", "WMT", "XOM",
+]
+
+# ── 4 Commodities — OANDA format ────────────────────────────────
+COMMODITIES_4: list[str] = ["XAU_USD", "XAG_USD", "WTICO_USD", "BCO_USD"]
+
+# ── Combined instrument universe (112 total, matching backtester) ─
+ALL_INSTRUMENTS: dict[str, list[str]] = {
+    "crypto": TOP_30_CRYPTO,
+    "forex": FOREX_28,
+    "stocks": STOCKS_50,
+    "commodities": COMMODITIES_4,
 }
+NUM_BOTS = sum(len(v) for v in ALL_INSTRUMENTS.values())  # 112
+
+# Backward-compat alias
+TOP_100_COINS = TOP_30_CRYPTO
+
+# ── Asset-Class-Specific Commission Rates ────────────────────────
+ASSET_COMMISSION: dict[str, float] = {
+    "crypto": 0.0004,       # 0.04% taker (Binance Futures)
+    "forex": 0.00005,       # ~0.5 pip spread equivalent
+    "stocks": 0.0,          # commission-free (Alpaca)
+    "commodities": 0.0001,  # ~1 pip spread equivalent
+}
+
+# ── Asset-Class-Specific SMC Parameters (from config smc_profiles) ─
+ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
+    "crypto": {
+        "swing_length": 8, "fvg_threshold": 0.0006,
+        "order_block_lookback": 20, "liquidity_range_percent": 0.01,
+        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "min_daily_atr_pct": 0.008, "min_5m_atr_pct": 0.0015,
+    },
+    "forex": {
+        "swing_length": 12, "fvg_threshold": 0.0002,
+        "order_block_lookback": 25, "liquidity_range_percent": 0.003,
+        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "min_daily_atr_pct": 0.004, "min_5m_atr_pct": 0.0005,
+    },
+    "stocks": {
+        "swing_length": 10, "fvg_threshold": 0.0003,
+        "order_block_lookback": 20, "liquidity_range_percent": 0.005,
+        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "min_daily_atr_pct": 0.010, "min_5m_atr_pct": 0.0010,
+    },
+    "commodities": {
+        "swing_length": 10, "fvg_threshold": 0.0004,
+        "order_block_lookback": 20, "liquidity_range_percent": 0.005,
+        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "min_daily_atr_pct": 0.006, "min_5m_atr_pct": 0.0008,
+    },
+}
+
+# Legacy alias (used by some methods that haven't been migrated yet)
+FIXED_SMC_PARAMS: dict[str, Any] = ASSET_SMC_PARAMS["crypto"]
+
+# ── Asset-Class Leverage Caps ────────────────────────────────────
+ASSET_MAX_LEVERAGE: dict[str, int] = {
+    "crypto": 20, "forex": 30, "stocks": 4, "commodities": 20,
+}
+
+# ── Asset-Class IDs for RL Brain ─────────────────────────────────
+ASSET_CLASS_ID: dict[str, float] = {
+    "crypto": 0.0, "forex": 0.25, "stocks": 0.5, "commodities": 0.75,
+}
+
+# ── REST Polling interval for OANDA/Alpaca (no WebSocket) ────────
+REST_POLL_INTERVAL_SEC = 10
+
+
+def symbol_to_asset_class(symbol: str) -> str:
+    """Determine asset class from symbol format."""
+    if symbol in COMMODITIES_4:
+        return "commodities"
+    if "_" in symbol and "/" not in symbol:
+        return "forex"
+    if "/" in symbol:
+        return "crypto"
+    return "stocks"
 
 # ── Fixed Money Management ────────────────────────────────────────
 FIXED_RISK_PCT = 0.0025     # 0.25 % risk per trade
@@ -326,16 +312,7 @@ TIER_MAX_LEVERAGE: dict[str, int] = {
     TIER_AAA_PLUS: 30,
 }
 
-# ── Shared sync exchange for history fetching (public endpoints) ──
-_history_exchange: Any = None
-
-
-def _get_history_exchange() -> Any:
-    """Return a shared synchronous ccxt exchange for OHLCV history."""
-    global _history_exchange
-    if _history_exchange is None:
-        _history_exchange = ccxt_sync.binanceusdm({"enableRateLimit": True})
-    return _history_exchange
+# (removed: _history_exchange / _get_history_exchange — history now loaded via adapter)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -407,20 +384,35 @@ class PaperBot:
         symbol: str,
         config: dict[str, Any],
         output_dir: Path,
-        exchange: Any = None,
+        asset_class: str = "crypto",
+        adapter: ExchangeAdapter | None = None,
         central_brain: CentralRLBrain | None = None,
     ) -> None:
         self.bot_id = bot_id
         self.tag = f"bot_{bot_id:03d}"
         self.symbol = symbol
-        self.exchange = exchange  # ccxt.pro async exchange for real orders
+        self.asset_class = asset_class
+        self.adapter = adapter
+        # Backward-compat: raw ccxt.pro exchange (only BinanceAdapter has .raw)
+        # Legacy self.exchange removed — all calls go through self.adapter now
 
-        # Fixed strategy parameters
-        self.swing_length: int = FIXED_SMC_PARAMS["swing_length"]
-        self.alignment_threshold: float = FIXED_SMC_PARAMS["alignment_threshold"]
+        # Asset-class-specific SMC parameters
+        smc = ASSET_SMC_PARAMS.get(asset_class, ASSET_SMC_PARAMS["crypto"])
+        self.swing_length: int = smc["swing_length"]
+        self.fvg_threshold: float = smc["fvg_threshold"]
+        self.ob_lookback: int = smc.get("order_block_lookback", 15)
+        self.liq_range: float = smc.get("liquidity_range_percent", 0.005)
+        self.min_daily_atr_pct: float = smc["min_daily_atr_pct"]
+        self.min_5m_atr_pct: float = smc["min_5m_atr_pct"]
+        self.alignment_threshold: float = smc.get("alignment_threshold", 0.65)
+
+        # Asset-class-specific commission & leverage
+        self.commission_rate: float = ASSET_COMMISSION.get(asset_class, 0.0004)
+        self.max_asset_leverage: int = ASSET_MAX_LEVERAGE.get(asset_class, 20)
+
         self.risk_pct: float = FIXED_RISK_PCT
         self.rr_ratio: float = FIXED_RR_MIN
-        self.leverage: int = 10  # default leverage
+        self.leverage: int = min(10, self.max_asset_leverage)  # default, capped by asset class
 
         # Account tracking (for dashboard / RL brain)
         self.equity: float = 0.0  # set later by Runner with real balance
@@ -478,35 +470,37 @@ class PaperBot:
             output_dir / f"{self.tag}.log",
         )
         self.logger.info(
-            "Initialised %s | symbol=%s | equity=%.2f | params=%s",
-            self.tag, symbol, self.equity, json.dumps(FIXED_SMC_PARAMS, default=str),
+            "Initialised %s | symbol=%s | class=%s | equity=%.2f",
+            self.tag, symbol, self.asset_class, self.equity,
         )
 
-        # Multi-TF OHLCV buffers (last 60 days, loaded from exchange)
+        # Multi-TF OHLCV buffers (loaded async via load_history())
         self.buffer_1d: pd.DataFrame = pd.DataFrame()
         self.buffer_4h: pd.DataFrame = pd.DataFrame()
         self.buffer_1h: pd.DataFrame = pd.DataFrame()
         self.buffer_15m: pd.DataFrame = pd.DataFrame()
         self.buffer_5m: pd.DataFrame = pd.DataFrame()
-        self._load_history()
+        # History is loaded async after construction: await bot.load_history()
         self._load_state()
 
-    # ── History loading (multi-TF buffers) ───────────────────────────
+    # ── History loading (multi-TF buffers, async via adapter) ────────
 
-    def _load_history(self) -> None:
-        """Load last 60 days OHLCV for 5 timeframes via ccxt (sync)."""
-        ex = _get_history_exchange()
-        # limits for 60 days: Binance max per request is 1500 candles
+    async def load_history(self) -> None:
+        """Load multi-TF OHLCV history via adapter (250+ bars for EMA200 warmup)."""
+        if self.adapter is None:
+            self.logger.warning("No adapter — skipping history load for %s", self.symbol)
+            return
+        # 250 daily bars for EMA200, proportional for lower TFs
         tf_limits = {
-            "1d": 60,      # 60 days
-            "4h": 360,     # 60 × 6
-            "1h": 1440,    # 60 × 24
-            "15m": 1500,   # 60 × 96 = 5760 → capped at API max
-            "5m": 1500,    # 60 × 288 = 17280 → capped at API max
+            "1d": 250,      # 250 days for EMA200 warmup
+            "4h": 500,      # ~83 days
+            "1h": 1000,     # ~42 days
+            "15m": 1500,    # ~5 days
+            "5m": 1500,     # ~5 days
         }
         for tf, limit in tf_limits.items():
             try:
-                raw = ex.fetch_ohlcv(self.symbol, tf, limit=limit)
+                raw = await self.adapter.fetch_ohlcv(self.symbol, tf, limit=limit)
                 if raw:
                     df = pd.DataFrame(
                         raw,
@@ -822,7 +816,7 @@ class PaperBot:
                     volumes_5m=volumes_5m,
                     price=price,
                     current_volume=current_vol,
-                    asset_class="crypto",
+                    asset_class=self.asset_class,
                     highs_1h=h1h, lows_1h=l1h, closes_1h=c1h, volumes_1h=v1h,
                     direction=direction,
                 )
@@ -851,7 +845,7 @@ class PaperBot:
 
         # ═══ STEP 8: Session Optimality (0.06) ════════════════════
         try:
-            session_sc = compute_session_score(asset_class="crypto")
+            session_sc = compute_session_score(asset_class=self.asset_class)
             comp["session_score"] = session_sc
             comp["session_optimal"] = session_sc >= 0.8
             score += 0.06 * session_sc
@@ -1140,6 +1134,11 @@ class PaperBot:
         4. Setup quality tier classification (AAA+/A/SPEC)
         5. ATR-based minimum SL distance (not just fixed %)
         """
+        # ── Trading hours check (forex/stocks have limited hours) ────
+        if self.adapter is not None and not self.adapter.is_market_open(self.symbol):
+            self._pending_signal = None
+            return
+
         # ── Duplicate zone check (replaces cooldown timer) ─────────
         # Don't prepare a new signal if there's already an active trade
         # on this symbol – prevents double-entries on the same zone
@@ -1149,7 +1148,7 @@ class PaperBot:
 
         # ── Circuit breaker check ──────────────────────────────────
         if self.circuit_breaker is not None:
-            can_trade, cb_reason = self.circuit_breaker.can_trade("crypto")
+            can_trade, cb_reason = self.circuit_breaker.can_trade(self.asset_class)
             if not can_trade:
                 self._pending_signal = None
                 self.logger.info("CIRCUIT BREAKER SKIP %s: %s", symbol, cb_reason)
@@ -1161,8 +1160,8 @@ class PaperBot:
             self._pending_signal = None
             self.logger.debug(
                 "VOLATILITY SKIP %s | daily_atr=%.4f%% (min %.4f%%) 5m_atr=%.4f%% (min %.4f%%)",
-                symbol, daily_atr * 100, MIN_DAILY_ATR_PCT * 100,
-                fivem_atr * 100, MIN_5M_ATR_PCT * 100,
+                symbol, daily_atr * 100, self.min_daily_atr_pct * 100,
+                fivem_atr * 100, self.min_5m_atr_pct * 100,
             )
             return
 
@@ -1349,7 +1348,7 @@ class PaperBot:
                 momentum_score=components.get("momentum_score", 0.0),
                 tf_agreement_score=components.get("tf_agreement_score", 0.0),
                 spread_normalized=0.0,
-                asset_class_id=0.0,  # crypto=0.0
+                asset_class_id=ASSET_CLASS_ID.get(self.asset_class, 0.0),
             ),
             "zone_low": zone_low,
             "zone_high": zone_high,
@@ -1364,7 +1363,7 @@ class PaperBot:
 
         # ── Route signal to Paper Grid (A/B testing) ────────────
         if self.paper_grid is not None:
-            self.paper_grid.evaluate_signal(self._pending_signal, asset_class="crypto")
+            self.paper_grid.evaluate_signal(self._pending_signal, asset_class=self.asset_class)
 
     # ── Real-time tick handler (called from watch_ticker) ─────────
 
@@ -1444,13 +1443,13 @@ class PaperBot:
 
         # ── Fee profitability gate ─────────────────────────────────
         # Skip trade if hitting TP would still be net-negative after fees.
-        # total_fee_pct = COMMISSION_RATE * COMMISSION_MULTIPLIER (entry + exit)
-        min_tp_for_profit = price * COMMISSION_RATE * COMMISSION_MULTIPLIER
+        # total_fee_pct = commission_rate * 2 (entry + exit)
+        min_tp_for_profit = price * self.commission_rate * COMMISSION_MULTIPLIER
         if tp_dist <= min_tp_for_profit:
             self.logger.info(
                 "FEE GATE: skipping %s %s – tp_dist=%.6f <= fee_cost=%.6f (%.4f%%)",
                 direction.upper(), symbol, tp_dist, min_tp_for_profit,
-                COMMISSION_RATE * COMMISSION_MULTIPLIER * 100,
+                self.commission_rate * COMMISSION_MULTIPLIER * 100,
             )
             self._pending_signal = None
             return
@@ -1565,166 +1564,45 @@ class PaperBot:
             rr_factor, score_factor,
         )
 
-        if self.exchange is None:
+        if self.adapter is None:
             return None, None, None, 0.0, dynamic_risk, self.leverage
         ORIGINAL_RISK_PCT = dynamic_risk
 
         # ═══════════════════════════════════════════════════════════
-        #  STEP 1: Load market info FIRST (correct market_id, limits)
+        #  STEP 1: Load instrument info via adapter (exchange-agnostic)
         # ═══════════════════════════════════════════════════════════
-        max_leverage = 20  # raised default – will be overridden if bracket data found
-        leverage_source = "default"
-        max_qty_limit: float | None = None
-        max_notional_limit: float | None = None
-        min_qty_limit: float | None = None
-        qty_step: float | None = None
-        lev_max = None
-        market_id: str | None = None
-        market: dict | None = None
+        meta = self.adapter.get_instrument(symbol)
+        max_qty_limit = meta.max_qty if meta else None
+        min_qty_limit = meta.min_qty if meta else None
+        max_notional_limit: float | None = None  # adapter doesn't track this
 
+        self.logger.info(
+            "Instrument info for %s: max_qty=%s min_qty=%s lot_size=%s max_lev=%s",
+            symbol,
+            max_qty_limit,
+            min_qty_limit,
+            meta.lot_size if meta else None,
+            meta.max_leverage if meta else None,
+        )
+
+        # ═══════════════════════════════════════════════════════════
+        #  STEP 2: Fetch max leverage via adapter
+        # ═══════════════════════════════════════════════════════════
         try:
-            await self.exchange.load_markets()
-            market = self.exchange.market(symbol)
-            if market:
-                # Derive the proper Binance REST API symbol (e.g. "KASUSDT") from base+quote.
-                # market.get("id") often returns CCXT's internal format "KASUSDTUSDT" for
-                # linear perps (base + quote + settle), which is rejected by the Binance API.
-                _base = (market.get("base") or "").upper()
-                _quote = (market.get("quote") or "").upper()
-                if _base and _quote:
-                    market_id = _base + _quote  # "KASUSDT"
-                else:
-                    market_id = market.get("id")
-                    if not market_id:
-                        try:
-                            market_id = self.exchange.market_id(symbol)
-                        except Exception:
-                            pass
-                lev_max = market.get("limits", {}).get("leverage", {}).get("max")
-                limits = market.get("limits", {}) if isinstance(market, dict) else {}
-                amt_limits = limits.get("amount", {}) if isinstance(limits, dict) else {}
-                cost_limits = limits.get("cost", {}) if isinstance(limits, dict) else {}
-                max_qty_limit = float(amt_limits.get("max")) if amt_limits.get("max") else None
-                min_qty_limit = float(amt_limits.get("min")) if amt_limits.get("min") else None
-                max_notional_limit = (
-                    float(cost_limits.get("max")) if cost_limits.get("max") else None
-                )
-                # Also parse raw exchange filters (Binance LOT_SIZE / MARKET_LOT_SIZE)
-                # CCXT doesn't always populate limits.amount.max from these filters.
-                raw_info = market.get("info", {})
-                for _f in (raw_info.get("filters") or []):
-                    if not isinstance(_f, dict):
-                        continue
-                    if _f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                        _raw_max = _f.get("maxQty") or _f.get("maxAmount")
-                        if _raw_max:
-                            try:
-                                _parsed = float(_raw_max)
-                                # Prefer the smaller (more restrictive) of the two
-                                if max_qty_limit is None or _parsed < max_qty_limit:
-                                    max_qty_limit = _parsed
-                            except Exception:
-                                pass
-                        break
-                # Extract quantity step size from precision info
-                prec = market.get("precision", {})
-                if prec.get("amount") is not None:
-                    try:
-                        # ccxt precision can be int (decimals) or float (step)
-                        p = prec["amount"]
-                        if isinstance(p, int):
-                            qty_step = 10 ** (-p)
-                        elif isinstance(p, float) and p < 1:
-                            qty_step = p
-                    except Exception:
-                        pass
-                self.logger.info(
-                    "Market info for %s: id=%s max_qty=%s min_qty=%s max_notional=%s lev_max=%s qty_step=%s",
-                    symbol, market_id, max_qty_limit, min_qty_limit, max_notional_limit, lev_max, qty_step,
-                )
+            max_leverage = await self.adapter.fetch_max_leverage(symbol)
+            leverage_source = "adapter"
         except Exception as exc:
-            self.logger.warning("Could not load market limits for %s: %s", symbol, exc)
-
-        # Fallback market_id if load_markets failed
-        if not market_id:
-            # Derive Binance futures symbol: "KAS/USDT:USDT" -> "KASUSDT"
-            base_quote = symbol.split(":")[0] if ":" in symbol else symbol
-            market_id = base_quote.replace("/", "")
-            self.logger.info("Using derived market_id=%s for %s", market_id, symbol)
-
-        # ═══════════════════════════════════════════════════════════
-        #  STEP 2: Fetch leverage brackets (with correct market_id)
-        # ═══════════════════════════════════════════════════════════
-        leverage_options_with_source: list[tuple[int, str]] = []
-
-        # Method 1: ccxt unified fetch_leverage_tiers (correct method for binanceusdm)
-        for _lev_method in ("fetch_leverage_tiers", "fetch_leverage_bracket"):
-            _method_fn = getattr(self.exchange, _lev_method, None)
-            if _method_fn is None:
-                continue
-            try:
-                tiers = await _method_fn([symbol])
-                # fetch_leverage_tiers returns {symbol: [tier_dicts]}; extract max leverage
-                if isinstance(tiers, dict):
-                    for tier_list in tiers.values():
-                        if isinstance(tier_list, list):
-                            for bracket in tier_list:
-                                if isinstance(bracket, dict):
-                                    lv = bracket.get("maxLeverage") or bracket.get("initialLeverage")
-                                    if lv:
-                                        try:
-                                            leverage_options_with_source.append((int(lv), _lev_method))
-                                        except Exception:
-                                            pass
-                else:
-                    vals = self._extract_initial_leverage(tiers, self.logger)
-                    if vals:
-                        leverage_options_with_source.append((max(vals), _lev_method))
-                if leverage_options_with_source:
-                    break
-            except Exception as exc:
-                self.logger.debug(
-                    "%s not available for %s: %s", _lev_method, symbol, exc,
-                )
-
-        # Method 2: Binance private API with CORRECT market_id
-        if market_id and getattr(self.exchange, "id", "").lower().startswith("binance"):
-            try:
-                raw_brackets = await self.exchange.fapiPrivateGetLeverageBracket({"symbol": market_id})
-                vals = self._extract_initial_leverage(raw_brackets, self.logger)
-                if vals:
-                    leverage_options_with_source.append((max(vals), "fapiPrivateGetLeverageBracket"))
-                    self.logger.info(
-                        "Leverage bracket for %s (market_id=%s): max=%dx",
-                        symbol, market_id, max(vals),
-                    )
-            except Exception as exc:
-                self.logger.debug(
-                    "fapiPrivateGetLeverageBracket failed for %s (market_id=%s): %s",
-                    symbol, market_id, exc,
-                )
-
-        # Method 3: market limits from loaded markets
-        if lev_max:
-            try:
-                leverage_options_with_source.append((int(lev_max), "market limits"))
-            except Exception:
-                pass
-
-        # Determine final leverage
-        used_default_leverage = False
-        if not leverage_options_with_source:
-            leverage_options_with_source.append((max_leverage, leverage_source))
-            used_default_leverage = True
-
-        max_leverage, leverage_source = max(leverage_options_with_source, key=lambda t: t[0])
+            max_leverage = meta.max_leverage if meta else 20
+            leverage_source = "instrument_meta"
+            self.logger.warning(
+                "fetch_max_leverage failed for %s: %s — using %dx from meta",
+                symbol, exc, max_leverage,
+            )
 
         self.logger.info(
             "Max leverage for %s = %dx (source: %s)",
             symbol, max_leverage, leverage_source,
         )
-        if used_default_leverage:
-            self.logger.info("Using default leverage fallback %dx for %s", max_leverage, symbol)
 
         planned_leverage = max(1, int(max_leverage))
 
@@ -1745,24 +1623,18 @@ class PaperBot:
 
         def _round_qty(q: float) -> float:
             """Round qty to exchange precision, and clamp to [min_qty, max_qty]."""
-            # Use exchange's amount_to_precision if available
             try:
-                q = float(self.exchange.amount_to_precision(symbol, q))
+                q = float(self.adapter.amount_to_precision(symbol, q))
             except Exception:
-                # Manual rounding via qty_step
-                if qty_step and qty_step > 0:
-                    q = float(int(q / qty_step) * qty_step)
-            # Clamp to exchange limits
+                pass
             if max_qty_limit and q > max_qty_limit:
                 q = max_qty_limit
-                # Re-round after clamping (max_qty_limit should already be valid)
                 try:
-                    q = float(self.exchange.amount_to_precision(symbol, q))
+                    q = float(self.adapter.amount_to_precision(symbol, q))
                 except Exception:
-                    if qty_step and qty_step > 0:
-                        q = float(int(q / qty_step) * qty_step)
+                    pass
             if min_qty_limit and q < min_qty_limit:
-                q = 0.0  # signal: too small to trade
+                q = 0.0
             return q
 
         def _calc_qty(risk_pct: float) -> tuple[float, float]:
@@ -1903,14 +1775,14 @@ class PaperBot:
             # Ensure cross margin mode (shared margin pool across positions)
             if not leverage_already_set:
                 try:
-                    await self.exchange.set_margin_mode("cross", symbol)
+                    await self.adapter.set_margin_mode("cross", symbol)
                 except Exception:
                     pass  # already set or position open – both fine
 
             # Set leverage (may need to re-set if reduced during retries)
             if not leverage_already_set:
                 try:
-                    await self.exchange.set_leverage(planned_leverage, symbol)
+                    await self.adapter.set_leverage(planned_leverage, symbol)
                     self.leverage = planned_leverage
                     leverage_already_set = True
                 except Exception as exc:
@@ -1969,7 +1841,7 @@ class PaperBot:
                                 expected_margin = new_margin
                                 leverage_retries += 1
                                 try:
-                                    await self.exchange.set_leverage(planned_leverage, symbol)
+                                    await self.adapter.set_leverage(planned_leverage, symbol)
                                     self.leverage = planned_leverage
                                     leverage_already_set = True
                                 except Exception as lev_exc:
@@ -2019,46 +1891,44 @@ class PaperBot:
         qty: float,
     ) -> tuple[str | None, str | None, str | None]:
         """
-        Place a market entry plus separate reduceOnly SL/TP orders on the
-        Binance Testnet via ``create_order``.
+        Place a market entry plus SL/TP orders via the exchange adapter.
 
-        Returns (entry_id, sl_order_id, tp_order_id). Raises Exceptions on placement failures so
-        the caller can handle risk reduction or cleanup.
+        Works for all exchanges (Binance, OANDA, Alpaca) through the
+        unified ExchangeAdapter interface.
+
+        Returns (entry_id, sl_order_id, tp_order_id).
         """
-        if self.exchange is None:
+        if self.adapter is None:
             return None, None, None
 
         side = "buy" if direction == "long" else "sell"
         exit_side = "sell" if direction == "long" else "buy"
 
-        # Round SL/TP to exchange price precision to avoid truncation issues
+        # Round SL/TP to exchange price precision
         try:
-            sl = float(self.exchange.price_to_precision(symbol, sl))
-            tp = float(self.exchange.price_to_precision(symbol, tp))
+            sl = float(self.adapter.price_to_precision(symbol, sl))
+            tp = float(self.adapter.price_to_precision(symbol, tp))
         except Exception:
-            pass  # keep raw values if precision lookup fails
+            pass
 
         async def _close_position(reason: str) -> None:
             try:
-                close = await self.exchange.create_order(
-                    symbol,
-                    "market",
-                    exit_side,
-                    qty,
-                    params={"reduceOnly": True},
+                close = await self.adapter.create_market_order(
+                    symbol, exit_side, qty, {"reduceOnly": True},
                 )
                 self.logger.warning(
                     "Flattened position after %s | close_order=%s",
-                    reason,
-                    close.get("id"),
+                    reason, close.order_id,
                 )
             except Exception as close_exc:
                 self.logger.error(
                     "Failed to flatten position after %s: %s", reason, close_exc,
                 )
+
+        # Entry market order
         try:
-            entry = await self.exchange.create_order(symbol, "market", side, qty)
-            entry_id = entry.get("id")
+            entry = await self.adapter.create_market_order(symbol, side, qty)
+            entry_id = entry.order_id
             self.logger.info(
                 "ENTRY %s %s qty=%.6f | id=%s",
                 side.upper(), symbol, qty, entry_id,
@@ -2067,20 +1937,13 @@ class PaperBot:
             self.logger.error("Entry order FAILED %s %s: %s", side.upper(), symbol, exc)
             raise
 
-        # Place SL (STOP_MARKET reduceOnly)
+        # SL order
         sl_order_id: str | None = None
         try:
-            sl_order = await self.exchange.create_order(
-                symbol,
-                "STOP_MARKET",
-                exit_side,
-                qty,
-                params={
-                    "stopPrice": sl,
-                    "reduceOnly": True,
-                },
+            sl_order = await self.adapter.create_stop_loss(
+                symbol, exit_side, qty, sl,
             )
-            sl_order_id = sl_order.get("id")
+            sl_order_id = sl_order.order_id
             self.logger.info(
                 "SL %s %s qty=%.6f @ %.6f | id=%s",
                 exit_side.upper(), symbol, qty, sl, sl_order_id,
@@ -2092,52 +1955,43 @@ class PaperBot:
             await _close_position("SL placement failure")
             raise
 
-        # Place TP (TAKE_PROFIT_MARKET reduceOnly)
+        # TP order
+        tp_order_id: str | None = None
         try:
-            tp_order = await self.exchange.create_order(
-                symbol,
-                "TAKE_PROFIT_MARKET",
-                exit_side,
-                qty,
-                params={
-                    "stopPrice": tp,
-                    "reduceOnly": True,
-                },
+            tp_order = await self.adapter.create_take_profit(
+                symbol, exit_side, qty, tp,
             )
+            tp_order_id = tp_order.order_id
             self.logger.info(
                 "TP %s %s qty=%.6f @ %.6f | id=%s",
-                exit_side.upper(), symbol, qty, tp, tp_order.get("id"),
+                exit_side.upper(), symbol, qty, tp, tp_order_id,
             )
         except Exception as exc:
             self.logger.error(
                 "TP order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
             )
-            # Cancel SL to avoid dangling reduceOnly without TP
             if sl_order_id:
                 try:
-                    await self.exchange.cancel_order(sl_order_id, symbol)
+                    await self.adapter.cancel_order(sl_order_id, symbol)
                 except Exception as cancel_exc:
                     self.logger.warning(
                         "Failed to cancel SL %s after TP failure: %s",
-                        sl_order_id,
-                        cancel_exc,
+                        sl_order_id, cancel_exc,
                     )
             await _close_position("TP placement failure")
             raise
 
-        return entry_id, sl_order_id, tp_order.get("id")
+        return entry_id, sl_order_id, tp_order_id
 
     # ── Fetch real testnet balance ────────────────────────────────
 
     async def _fetch_balance(self) -> float | None:
-        """Return the free USDT balance from the Binance Testnet account."""
-        if self.exchange is None:
+        """Return the free balance from the exchange adapter."""
+        if self.adapter is None:
             return None
         try:
-            bal = await self.exchange.fetch_balance()
-            usdt = bal.get("USDT", {})
-            free = usdt.get("free", 0.0)
-            return float(free)
+            bal = await self.adapter.fetch_balance()
+            return float(bal.free)
         except Exception as exc:
             self.logger.warning("fetch_balance failed: %s", exc)
             return None
@@ -2201,7 +2055,7 @@ class PaperBot:
         self._daily_atr_pct = daily_atr_pct
         self._5m_atr_pct = fivem_atr_pct
 
-        tradeable = daily_atr_pct >= MIN_DAILY_ATR_PCT and fivem_atr_pct >= MIN_5M_ATR_PCT
+        tradeable = daily_atr_pct >= self.min_daily_atr_pct and fivem_atr_pct >= self.min_5m_atr_pct
         return tradeable, daily_atr_pct, fivem_atr_pct
 
     # ── Find POI (OB/FVG) from pre-computed indicators ───────────
@@ -2602,6 +2456,7 @@ class PaperBot:
         return {
             "bot": self.tag,
             "symbol": self.symbol,
+            "asset_class": self.asset_class,
             "pnl": round(self.total_pnl, 2),
             "return_pct": round(self.return_pct, 2),
             "trades": self.trades,
@@ -2615,39 +2470,69 @@ class PaperBot:
 #  Exchange helper
 # ═══════════════════════════════════════════════════════════════════
 
-def create_exchange(api_key: str, api_secret: str) -> Any:
-    """Create a BinanceAdapter and return the raw ccxt.pro exchange.
+async def create_adapters(config: dict[str, Any]) -> dict[str, ExchangeAdapter]:
+    """Create and connect all available exchange adapters.
 
-    Returns the raw ccxt.pro exchange object for backward compatibility.
-    The BinanceAdapter instance is stored as ``_adapter`` attribute on the
-    returned exchange so it can be accessed during the migration period.
+    Returns dict mapping asset_class → adapter.
+    Skips adapters whose API keys are missing or packages not installed.
+    OANDA handles both 'forex' and 'commodities' (same adapter instance).
     """
-    import asyncio
+    adapters: dict[str, ExchangeAdapter] = {}
 
-    adapter = BinanceAdapter(
-        api_key=api_key,
-        api_secret=api_secret,
-        testnet=True,
-    )
-    # Connect synchronously (creates the ccxt.pro exchange internally)
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        # If already in an async context, just create inline
-        adapter._exchange = ccxtpro.binanceusdm({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"},
-        })
-        adapter._exchange.enable_demo_trading(True)
+    # ── Binance (crypto) ────────────────────────────────────────
+    bk = os.getenv("BINANCE_API_KEY", "")
+    bs = os.getenv("BINANCE_SECRET", "")
+    if bk and bs:
+        try:
+            adapter = BinanceAdapter(api_key=bk, api_secret=bs, testnet=True)
+            await adapter.connect()
+            adapters["crypto"] = adapter
+            logger.info("Binance (crypto): connected ✓")
+        except Exception as exc:
+            logger.warning("Binance connect failed: %s", exc)
     else:
-        loop.run_until_complete(adapter.connect())
+        logger.warning("BINANCE keys missing — crypto disabled")
 
-    # Attach adapter to the raw exchange for future access
-    raw = adapter.raw
-    raw._adapter = adapter
-    logger.info("Exchange created via BinanceAdapter: %s (demo trading)", raw.id)
-    return raw
+    # ── OANDA (forex + commodities) ─────────────────────────────
+    ot = os.getenv("OANDA_ACCESS_TOKEN", "")
+    oa = os.getenv("OANDA_ACCOUNT_ID", "")
+    if ot and oa:
+        try:
+            from exchanges.oanda_adapter import OandaAdapter
+            adapter = OandaAdapter(
+                account_id=oa, access_token=ot, environment="practice",
+            )
+            await adapter.connect()
+            adapters["forex"] = adapter
+            adapters["commodities"] = adapter  # same instance
+            logger.info("OANDA (forex+commodities): connected ✓")
+        except ImportError:
+            logger.warning("v20 not installed — forex/commodities disabled (pip install v20)")
+        except Exception as exc:
+            logger.warning("OANDA connect failed: %s", exc)
+    else:
+        logger.warning("OANDA keys missing — forex/commodities disabled")
+
+    # ── Alpaca (stocks) ─────────────────────────────────────────
+    ak = os.getenv("ALPACA_API_KEY", "")
+    as_ = os.getenv("ALPACA_API_SECRET", "")
+    if ak and as_:
+        try:
+            from exchanges.alpaca_adapter import AlpacaAdapter
+            adapter = AlpacaAdapter(
+                api_key=ak, secret_key=as_, paper=True,
+            )
+            await adapter.connect()
+            adapters["stocks"] = adapter
+            logger.info("Alpaca (stocks): connected ✓")
+        except ImportError:
+            logger.warning("alpaca-py not installed — stocks disabled (pip install alpaca-py)")
+        except Exception as exc:
+            logger.warning("Alpaca connect failed: %s", exc)
+    else:
+        logger.warning("ALPACA keys missing — stocks disabled")
+
+    return adapters
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2687,7 +2572,8 @@ def _build_bot_table(
     )
     table.add_column("#", justify="right", style="dim", width=4)
     table.add_column("Bot-ID", style="cyan", width=9)
-    table.add_column("Coin", style="bright_yellow", width=18)
+    table.add_column("Symbol", style="bright_yellow", width=18)
+    table.add_column("Class", style="dim", width=7)
     table.add_column("PnL", justify="right", width=14)
     table.add_column("Return%", justify="right", width=10)
     table.add_column("Trades", justify="right", width=10)
@@ -2702,6 +2588,7 @@ def _build_bot_table(
             str(i),
             r["bot"],
             r.get("symbol", ""),
+            r.get("asset_class", "crypto")[:6],
             f"[{pnl_c}]{r['pnl']:+,.2f}[/{pnl_c}]",
             f"[{ret_c}]{r['return_pct']:+.2f}%[/{ret_c}]",
             str(r["trades"]),
@@ -2742,14 +2629,19 @@ def build_dashboard(
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # ── Header ────────────────────────────────────────────────────
+    # Per-class bot counts
+    class_counts: dict[str, int] = {}
+    for b in bots:
+        class_counts[b.asset_class] = class_counts.get(b.asset_class, 0) + 1
+    class_str = " | ".join(f"{ac}: {cnt}" for ac, cnt in sorted(class_counts.items()))
+
     eq_color = _pnl_color(total_pnl)
     header_text = Text.from_markup(
-        f"[bold cyan]📊 SMC CRYPTO LIVE MULTI-BOT DASHBOARD[/bold cyan]\n"
+        f"[bold cyan]📊 SMC MULTI-ASSET LIVE TRADING DASHBOARD[/bold cyan]\n"
         f"[dim]{now_str}[/dim]  ·  Uptime: [bold]{uptime}[/bold]  ·  "
-        f"Symbols: [bold]{len(active_symbols)}[/bold]  ·  "
-        f"Bots: [bold]{len(bots)}[/bold]\n"
-        f"Total Equity: [bold]{total_equity:,.2f}[/bold] USDT  ·  "
-        f"Total PnL: [bold {eq_color}]{total_pnl:+,.2f}[/bold {eq_color}] USDT  ·  "
+        f"Bots: [bold]{len(bots)}[/bold] ({class_str})\n"
+        f"Total Equity: [bold]{total_equity:,.2f}[/bold]  ·  "
+        f"Total PnL: [bold {eq_color}]{total_pnl:+,.2f}[/bold {eq_color}]  ·  "
         f"Total Trades: [bold]{total_trades}[/bold]",
     )
     header_panel = Panel(
@@ -2872,30 +2764,33 @@ def build_dashboard(
 
 class LiveMultiBotRunner:
     """
-    Orchestrates 100 coin-specialised PaperBot instances with:
-      - Fixed symbol list (no dynamic volume ranking)
-      - WebSocket auto-reconnect per symbol (OHLCV + ticker)
-      - Real bracket orders on Binance Testnet
-      - Position polling every 5 s (detects TP/SL fills on exchange)
-      - Rich Live Dashboard
+    Orchestrates multi-asset PaperBot instances (112 instruments) with:
+      - 3 exchange adapters: Binance (crypto), OANDA (forex+commodities), Alpaca (stocks)
+      - WebSocket for crypto, REST polling for forex/stocks/commodities
+      - Real bracket orders via adapter interface
+      - Position polling per adapter (detects TP/SL fills)
+      - Rich Live Dashboard grouped by asset class
       - Central shared RL brain
       - Circuit breaker for portfolio-level risk management
-      - Cross-asset opportunity ranker (future multi-asset integration)
+      - Paper Grid multi-variant A/B testing
 
-    Each bot trades only its assigned coin.
+    Each bot trades only its assigned instrument.
     """
 
     def __init__(
         self,
         bots: list[PaperBot],
-        exchange: Any,
+        adapters: dict[str, ExchangeAdapter],
     ) -> None:
         self.bots = bots
-        self.exchange = exchange
+        self.adapters = adapters
+        # Crypto adapter for WebSocket feeds
+        self._crypto_adapter = adapters.get("crypto")
         self.brain: CentralRLBrain | None = None
         if bots:
             self.brain = bots[0].brain
-        # Build a lookup: symbol → bot
+
+        # Build lookups
         self._symbol_to_bot: dict[str, PaperBot] = {
             b.symbol: b for b in bots
         }
@@ -2903,15 +2798,18 @@ class LiveMultiBotRunner:
         self._shutdown = asyncio.Event()
         self._start_time = datetime.now(timezone.utc)
 
+        # Group bots by asset class
+        from collections import defaultdict
+        self._bots_by_class: dict[str, list[PaperBot]] = defaultdict(list)
+        for bot in bots:
+            self._bots_by_class[bot.asset_class].append(bot)
+
         # ── Circuit Breaker (shared across all bots) ───────────────
         self.circuit_breaker = CircuitBreaker()
         for bot in self.bots:
             bot.circuit_breaker = self.circuit_breaker
 
-        # ── Opportunity Ranker + Capital Allocator (Phase 4) ───────
-        # These are initialized but not yet driving trade selection.
-        # Currently, each bot independently scans its own coin.
-        # In multi-asset mode, the ranker will replace per-bot scanning.
+        # ── Opportunity Ranker + Capital Allocator (Phase B) ───────
         self.ranker = OpportunityRanker(max_opportunities=10)
         self.allocator = CapitalAllocator()
 
@@ -2921,10 +2819,10 @@ class LiveMultiBotRunner:
         for bot in self.bots:
             bot.paper_grid = self.paper_grid
 
-        # WebSocket status per symbol: connected | reconnecting_N | disconnected
-        self.ws_status: dict[str, str] = {
-            s: "connecting" for s in self.symbols
-        }
+        # Feed status per symbol: connected | reconnecting_N | disconnected | polling
+        self.ws_status: dict[str, str] = {}
+        for bot in bots:
+            self.ws_status[bot.symbol] = "polling" if bot.asset_class != "crypto" else "connecting"
 
         # Active watcher tasks keyed by symbol
         self._watcher_tasks: dict[str, asyncio.Task[None]] = {}
@@ -2951,7 +2849,7 @@ class LiveMultiBotRunner:
                 reconnect_count = 0  # reset on successful connection
 
                 while not self._shutdown.is_set():
-                    ohlcv_list = await self.exchange.watch_ohlcv(symbol, "5m")
+                    ohlcv_list = await self._crypto_adapter.watch_ohlcv(symbol, "5m")
 
                     if not ohlcv_list:
                         continue
@@ -3029,7 +2927,7 @@ class LiveMultiBotRunner:
             try:
                 reconnect_count = 0
                 while not self._shutdown.is_set():
-                    ticker = await self.exchange.watch_ticker(symbol)
+                    ticker = await self._crypto_adapter.watch_ticker(symbol)
                     if ticker is None:
                         continue
                     last_price = ticker.get("last")
@@ -3070,6 +2968,64 @@ class LiveMultiBotRunner:
                 except asyncio.TimeoutError:
                     pass
 
+    # ── REST polling for non-WebSocket adapters (OANDA, Alpaca) ────
+
+    async def _poll_candles(self, bot: PaperBot) -> None:
+        """REST-based 5m candle polling for OANDA/Alpaca bots."""
+        last_ts: int | None = None
+        while not self._shutdown.is_set():
+            try:
+                candles = await bot.adapter.fetch_ohlcv(bot.symbol, "5m", limit=2)
+                if candles:
+                    for row in candles:
+                        ts = int(row[0])
+                        if last_ts is not None and ts <= last_ts:
+                            continue
+                        last_ts = ts
+                        candle = {
+                            "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
+                            "open": float(row[1]),
+                            "high": float(row[2]),
+                            "low": float(row[3]),
+                            "close": float(row[4]),
+                            "volume": float(row[5]),
+                        }
+                        try:
+                            bot.on_candle(bot.symbol, candle)
+                        except Exception as exc:
+                            bot.logger.error("Poll candle error %s: %s", bot.symbol, exc)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                bot.logger.error("REST candle poll %s: %s", bot.symbol, exc)
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=REST_POLL_INTERVAL_SEC)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+
+    async def _poll_ticker(self, bot: PaperBot) -> None:
+        """REST-based ticker polling for OANDA/Alpaca bots."""
+        while not self._shutdown.is_set():
+            try:
+                ticker = await bot.adapter.watch_ticker(bot.symbol)
+                if ticker:
+                    last_price = ticker.get("last")
+                    if last_price is not None:
+                        try:
+                            await bot.on_tick(bot.symbol, float(last_price))
+                        except Exception as exc:
+                            bot.logger.error("Poll tick error %s: %s", bot.symbol, exc)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                bot.logger.error("REST ticker poll %s: %s", bot.symbol, exc)
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=5)
+                return
+            except asyncio.TimeoutError:
+                pass
+
     # ── Exchange position polling (replaces candle-based exit check) ─
 
     async def _poll_positions(self) -> None:
@@ -3091,7 +3047,7 @@ class LiveMultiBotRunner:
             else:
                 raw_pnl = (entry_price - exit_price) * qty
 
-            commission = qty * entry_price * COMMISSION_RATE * COMMISSION_MULTIPLIER
+            commission = qty * entry_price * bot.commission_rate * COMMISSION_MULTIPLIER
             net_pnl = raw_pnl - commission
 
             pnl_pct = (net_pnl / bot.equity * 100) if bot.equity > 0 else 0.0
@@ -3111,7 +3067,7 @@ class LiveMultiBotRunner:
                 pnl_pct_frac = net_pnl / bot._account_equity if bot._account_equity > 0 else 0.0
                 bot.circuit_breaker.record_trade_pnl(
                     pnl_pct=pnl_pct_frac,
-                    asset_class="crypto",
+                    asset_class=bot.asset_class,
                     symbol=bot.symbol,
                 )
 
@@ -3136,10 +3092,11 @@ class LiveMultiBotRunner:
             tp_order_id = trade.get("tp_order_id")
             cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
 
-            if cancel_targets and self.exchange is not None:
+            _cancel_adapter = bot.adapter if bot.adapter is not None else None
+            if cancel_targets and _cancel_adapter is not None:
                 for cancel_id in cancel_targets:
                     try:
-                        await self.exchange.cancel_order(cancel_id, bot.symbol)
+                        await _cancel_adapter.cancel_order(cancel_id, bot.symbol)
                         bot.logger.info(
                             "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
                         )
@@ -3167,7 +3124,7 @@ class LiveMultiBotRunner:
             # IMPORTANT: protect orders belonging to OTHER active trades
             # (different style) on the same coin — only cancel orders that
             # match the closed trade's SL/TP prices.
-            if self.exchange is not None:
+            if _cancel_adapter is not None:
                 # Collect order IDs of other still-active trades to protect them
                 protected_ids: set[str] = set()
                 for other in bot._active_trades:
@@ -3178,7 +3135,7 @@ class LiveMultiBotRunner:
                         if oid:
                             protected_ids.add(str(oid))
                 try:
-                    open_orders = await self.exchange.fetch_open_orders(bot.symbol)
+                    open_orders = await _cancel_adapter.fetch_open_orders(bot.symbol)
                     trade_sl = trade.get("sl")
                     trade_tp = trade.get("tp")
                     for o in open_orders:
@@ -3212,7 +3169,7 @@ class LiveMultiBotRunner:
                         )
                         if price_matches:
                             try:
-                                await self.exchange.cancel_order(o_id, bot.symbol)
+                                await _cancel_adapter.cancel_order(o_id, bot.symbol)
                                 bot.logger.info(
                                     "Zombie order cancelled (price-match) %s"
                                     " stopPrice=%.6f for %s [style=%s]",
@@ -3245,31 +3202,40 @@ class LiveMultiBotRunner:
 
         while not self._shutdown.is_set():
             try:
-                # Retry fetch_positions up to 3 times on transient errors
-                positions = None
-                for _poll_try in range(3):
-                    try:
-                        positions = await self.exchange.fetch_positions()
-                        break
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as _poll_exc:
-                        if _poll_try < 2:
-                            logger.debug("fetch_positions attempt %d failed: %s", _poll_try + 1, _poll_exc)
-                            await asyncio.sleep(2 * (_poll_try + 1))
-                        else:
-                            raise  # let outer handler log it
-
+                # Fetch positions per adapter (deduplicate OANDA)
                 pos_map: dict[str, Any] = {}
-                if positions:
-                    for p in positions:
-                        sym = p.get("symbol")
-                        contracts = abs(float(p.get("contracts", 0) or 0))
-                        if sym and contracts > 0:
-                            pos_map[sym] = p
+                seen_poll: set[int] = set()
+                for ac, adapter in self.adapters.items():
+                    aid = id(adapter)
+                    if aid in seen_poll:
+                        continue
+                    seen_poll.add(aid)
+                    for _poll_try in range(3):
+                        try:
+                            positions = await adapter.fetch_positions()
+                            if positions:
+                                for p in positions:
+                                    # Support both dict and PositionInfo dataclass
+                                    sym = p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", None)
+                                    qty = abs(float(
+                                        p.get("contracts", 0) or p.get("qty", 0)
+                                        if isinstance(p, dict)
+                                        else getattr(p, "qty", 0)
+                                    ) or 0)
+                                    if sym and qty > 0:
+                                        pos_map[sym] = p
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as _poll_exc:
+                            if _poll_try < 2:
+                                logger.debug("fetch_positions [%s] attempt %d failed: %s", ac, _poll_try + 1, _poll_exc)
+                                await asyncio.sleep(2 * (_poll_try + 1))
 
                 for bot in self.bots:
                     if not bot._active_trades:
+                        continue
+                    if bot.adapter is None:
                         continue
 
                     # Fetch recent trades since earliest entry
@@ -3279,7 +3245,7 @@ class LiveMultiBotRunner:
                             int(t["entry_time"].timestamp() * 1000)
                             for t in bot._active_trades
                         )
-                        recent = await self.exchange.fetch_my_trades(
+                        recent = await bot.adapter.fetch_my_trades(
                             bot.symbol, since=earliest, limit=50,
                         )
                     except Exception as exc:
@@ -3404,10 +3370,10 @@ class LiveMultiBotRunner:
                 for bot in self.bots:
                     if bot._active_trades:
                         continue  # has active trades – handled per-trade
-                    if self.exchange is None:
+                    if bot.adapter is None:
                         continue
                     try:
-                        open_orders = await self.exchange.fetch_open_orders(bot.symbol)
+                        open_orders = await bot.adapter.fetch_open_orders(bot.symbol)
                     except Exception:
                         continue
                     for o in open_orders:
@@ -3422,7 +3388,7 @@ class LiveMultiBotRunner:
                             continue
                         # This coin has zero active trades → any exit order is zombie
                         try:
-                            await self.exchange.cancel_order(o_id, bot.symbol)
+                            await bot.adapter.cancel_order(o_id, bot.symbol)
                             bot.logger.warning(
                                 "ZOMBIE SWEEP: cancelled orphan order %s "
                                 "type=%s for %s (no active trades)",
@@ -3441,10 +3407,10 @@ class LiveMultiBotRunner:
                 for bot in self.bots:
                     if not bot._active_trades:
                         continue
-                    if self.exchange is None:
+                    if bot.adapter is None:
                         continue
                     try:
-                        open_orders = await self.exchange.fetch_open_orders(bot.symbol)
+                        open_orders = await bot.adapter.fetch_open_orders(bot.symbol)
                     except Exception:
                         continue
 
@@ -3469,7 +3435,7 @@ class LiveMultiBotRunner:
                         # If this order ID is NOT in any of this bot's active trades → zombie
                         if o_id not in bot_order_ids:
                             try:
-                                await self.exchange.cancel_order(o_id, bot.symbol)
+                                await bot.adapter.cancel_order(o_id, bot.symbol)
                                 bot.logger.warning(
                                     "ZOMBIE SWEEP: cancelled unmatched order %s "
                                     "type=%s for %s (not in any active trade)",
@@ -3501,22 +3467,20 @@ class LiveMultiBotRunner:
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _fetch_real_total_equity(self) -> float:
-        """Fetch real USDT free balance from Binance demo account."""
-        last_exc = None
-        for _attempt in range(3):
+        """Fetch combined free balance across all adapters."""
+        total = 0.0
+        seen: set[int] = set()
+        for ac, adapter in self.adapters.items():
+            aid = id(adapter)
+            if aid in seen:
+                continue
+            seen.add(aid)
             try:
-                bal = await self.exchange.fetch_balance()
-                usdt = bal.get("USDT", {})
-                free = float(usdt.get("free", 0.0))
-                return free
-            except asyncio.CancelledError:
-                raise
+                bal = await adapter.fetch_balance()
+                total += bal.free
             except Exception as exc:
-                last_exc = exc
-                if _attempt < 2:
-                    await asyncio.sleep(1 * (_attempt + 1))
-        logger.warning("_fetch_real_total_equity failed after 3 attempts: %s", last_exc)
-        return 0.0
+                logger.debug("fetch_balance [%s] failed: %s", ac, exc)
+        return total
 
     async def _dashboard_loop(self) -> None:
         """Render the Rich Live Dashboard every DASHBOARD_REFRESH_SEC."""
@@ -3568,41 +3532,67 @@ class LiveMultiBotRunner:
 
     async def run(self) -> None:
         """Start all watchers (OHLCV + ticker) + position poller + dashboard. Blocks until shutdown."""
+        # Log per-class bot counts
+        class_counts = {ac: len(bots) for ac, bots in self._bots_by_class.items()}
         logger.info(
-            "Starting %d bots on %d symbols …", len(self.bots), len(self.symbols)
+            "Starting %d bots: %s", len(self.bots),
+            ", ".join(f"{cnt} {ac}" for ac, cnt in class_counts.items()),
         )
 
-        # ── Startup zombie order sweep (cancel ALL open orders) ────
-        # At startup, no trades are active → any open order is a zombie
-        if self.exchange is not None:
+        # ── Startup zombie order sweep per adapter ────────────────
+        seen_adapters: set[int] = set()
+        for ac, adapter in self.adapters.items():
+            aid = id(adapter)
+            if aid in seen_adapters:
+                continue
+            seen_adapters.add(aid)
             try:
                 n_cancelled = 0
-                for sym in self.symbols:
+                for bot in self._bots_by_class.get(ac, []):
                     try:
-                        open_orders = await self.exchange.fetch_open_orders(sym)
+                        open_orders = await adapter.fetch_open_orders(bot.symbol)
                         for o in open_orders:
-                            o_id = str(o.get("id", ""))
+                            o_id = str(o.get("id", "") if isinstance(o, dict) else getattr(o, "order_id", ""))
                             if o_id:
-                                await self.exchange.cancel_order(o_id, sym)
+                                await adapter.cancel_order(o_id, bot.symbol)
                                 n_cancelled += 1
                     except Exception:
                         pass
+                # For OANDA: also sweep commodities bots (same adapter)
+                if ac == "forex":
+                    for bot in self._bots_by_class.get("commodities", []):
+                        try:
+                            open_orders = await adapter.fetch_open_orders(bot.symbol)
+                            for o in open_orders:
+                                o_id = str(o.get("id", "") if isinstance(o, dict) else getattr(o, "order_id", ""))
+                                if o_id:
+                                    await adapter.cancel_order(o_id, bot.symbol)
+                                    n_cancelled += 1
+                        except Exception:
+                            pass
                 if n_cancelled > 0:
-                    logger.info("Startup: cancelled %d zombie orders", n_cancelled)
+                    logger.info("Startup [%s]: cancelled %d zombie orders", ac, n_cancelled)
             except Exception as exc:
-                logger.warning("Startup zombie sweep failed: %s", exc)
+                logger.warning("Startup zombie sweep [%s] failed: %s", ac, exc)
 
-        # Start one OHLCV watcher task per symbol (5 m candle analysis)
-        for sym in self.symbols:
-            self._watcher_tasks[sym] = asyncio.create_task(
-                self._watch_symbol(sym)
-            )
-
-        # Start one ticker watcher task per symbol (real-time entry)
-        for sym in self.symbols:
-            self._ticker_tasks[sym] = asyncio.create_task(
-                self._watch_ticker(sym)
-            )
+        # Start watchers: WebSocket for crypto, REST polling for others
+        for bot in self.bots:
+            if bot.asset_class == "crypto":
+                # WebSocket-based (existing methods)
+                self._watcher_tasks[bot.symbol] = asyncio.create_task(
+                    self._watch_symbol(bot.symbol)
+                )
+                self._ticker_tasks[bot.symbol] = asyncio.create_task(
+                    self._watch_ticker(bot.symbol)
+                )
+            else:
+                # REST polling for OANDA/Alpaca
+                self._watcher_tasks[bot.symbol] = asyncio.create_task(
+                    self._poll_candles(bot)
+                )
+                self._ticker_tasks[bot.symbol] = asyncio.create_task(
+                    self._poll_ticker(bot)
+                )
 
         # Position poller (detects TP/SL fills on exchange)
         poll_task = asyncio.create_task(self._poll_positions())
@@ -3659,11 +3649,17 @@ class LiveMultiBotRunner:
         except Exception as exc:
             logger.warning("Paper Grid save failed: %s", exc)
 
-        # Close exchange WebSocket connections
-        try:
-            await self.exchange.close()
-        except Exception:
-            pass
+        # Close all exchange adapter connections (deduplicate OANDA)
+        closed: set[int] = set()
+        for adapter in self.adapters.values():
+            aid = id(adapter)
+            if aid in closed:
+                continue
+            closed.add(aid)
+            try:
+                await adapter.close()
+            except Exception:
+                pass
 
         # Final summary to console
         self._print_final_summary(final_equity)
@@ -3705,9 +3701,86 @@ class LiveMultiBotRunner:
 #  CLI entry point
 # ═══════════════════════════════════════════════════════════════════
 
+async def async_main(config: dict[str, Any], output_dir: Path) -> None:
+    """Async entry point: create adapters, bots, load history, run."""
+    console = Console()
+
+    # ── Create adapters (graceful skip for missing keys) ──────────
+    logger.info("Creating exchange adapters...")
+    adapters = await create_adapters(config)
+    if not adapters:
+        sys.exit(
+            "No exchange adapters available. Set API keys in .env\n"
+            "Copy .env.example → .env and fill in at least one broker's keys."
+        )
+
+    # ── Determine active instruments ──────────────────────────────
+    active: list[tuple[str, str]] = []  # (symbol, asset_class)
+    for ac in ["crypto", "forex", "stocks", "commodities"]:
+        if ac in adapters:
+            for sym in ALL_INSTRUMENTS[ac]:
+                active.append((sym, ac))
+
+    class_counts = {}
+    for _, ac in active:
+        class_counts[ac] = class_counts.get(ac, 0) + 1
+    count_str = ", ".join(f"{cnt} {ac}" for ac, cnt in class_counts.items())
+    logger.info("%d instruments active: %s", len(active), count_str)
+    console.print(f"[bold cyan]Creating {len(active)} bots ({count_str}) ...[/bold cyan]")
+
+    # ── Create RL Brain ───────────────────────────────────────────
+    all_symbols = [sym for sym, _ in active]
+    central_brain = CentralRLBrain(
+        model_dir=output_dir / "rl_models",
+        coin_ids=all_symbols,
+    )
+
+    # ── Create bots ───────────────────────────────────────────────
+    bots: list[PaperBot] = []
+    for idx, (sym, ac) in enumerate(active):
+        bot = PaperBot(
+            bot_id=idx + 1,
+            symbol=sym,
+            config=config,
+            output_dir=output_dir,
+            asset_class=ac,
+            adapter=adapters[ac],
+            central_brain=central_brain,
+        )
+        bots.append(bot)
+
+    console.print(f"[bold green]{len(bots)} bots created.[/bold green]")
+
+    # ── Load history (batched, rate-limit-friendly) ───────────────
+    logger.info("Loading history (250+ bars per TF) for %d instruments...", len(bots))
+    batch_size = 10
+    for i in range(0, len(bots), batch_size):
+        batch = bots[i:i + batch_size]
+        await asyncio.gather(*[b.load_history() for b in batch])
+        if i + batch_size < len(bots):
+            await asyncio.sleep(1)  # rate-limit pause between batches
+    logger.info("History loaded for all %d instruments.", len(bots))
+
+    # ── Runner ────────────────────────────────────────────────────
+    runner = LiveMultiBotRunner(bots=bots, adapters=adapters)
+
+    # Signal handlers
+    loop = asyncio.get_event_loop()
+
+    def _signal_handler() -> None:
+        logger.info("Ctrl+C detected – shutting down gracefully ...")
+        runner.request_shutdown()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _signal_handler)
+
+    await runner.run()
+    logger.info("All bots stopped. Results in %s", output_dir)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Live 100-Bot Coin-Specialised System with RL Brain (Binance Testnet)",
+        description="SMC Multi-Asset Live Trading Bot (Crypto + Forex + Stocks + Commodities)",
     )
     parser.add_argument(
         "--config", default="config/default_config.yaml",
@@ -3721,13 +3794,6 @@ def main() -> None:
 
     # ── Load env ──────────────────────────────────────────────────
     load_dotenv()
-    api_key = os.getenv("BINANCE_API_KEY", "")
-    api_secret = os.getenv("BINANCE_SECRET", "")
-    if not api_key or not api_secret:
-        sys.exit(
-            "BINANCE_API_KEY and BINANCE_SECRET must be set in .env\n"
-            "Copy .env.example → .env and fill in your Binance Testnet keys."
-        )
 
     # ── Load config ───────────────────────────────────────────────
     cfg_path = Path(args.config)
@@ -3737,66 +3803,11 @@ def main() -> None:
         config = yaml.safe_load(f)
     logger.info("Config loaded from %s", cfg_path)
 
-    # ── Create exchange ───────────────────────────────────────────
-    exchange = create_exchange(api_key, api_secret)
-
-    # ── Create 100 bots (1 bot = 1 coin) ─────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    console = Console()
-    console.print(
-        f"[bold cyan]Creating {NUM_BOTS} coin-specialised bots …[/bold cyan]"
-    )
-
-    central_brain = CentralRLBrain(
-        model_dir=output_dir / "rl_models",
-        coin_ids=TOP_100_COINS,
-    )
-
-    bots: list[PaperBot] = []
-    for idx, coin in enumerate(TOP_100_COINS):
-        bot = PaperBot(
-            bot_id=idx + 1,
-            symbol=coin,
-            config=config,
-            output_dir=output_dir,
-            exchange=exchange,
-            central_brain=central_brain,
-        )
-        bots.append(bot)
-
-    logger.info("Created %d coin-specialised bots", len(bots))
-    console.print(
-        f"[bold green]✅ {len(bots)} bots created – "
-        f"each assigned to a unique coin.[/bold green]"
-    )
-
-    # ── Runner ────────────────────────────────────────────────────
-    runner = LiveMultiBotRunner(
-        bots=bots,
-        exchange=exchange,
-    )
-
-    # ── Graceful shutdown on Ctrl+C ───────────────────────────────
-    loop = asyncio.new_event_loop()
-
-    def _signal_handler() -> None:
-        logger.info("Ctrl+C detected – shutting down gracefully …")
-        runner.request_shutdown()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler)
-
-    try:
-        loop.run_until_complete(runner.run())
-    except KeyboardInterrupt:
-        runner.request_shutdown()
-        loop.run_until_complete(runner.run())
-    finally:
-        loop.close()
-
-    logger.info("✅  All bots stopped. Results in %s", output_dir)
+    # ── Run async main ────────────────────────────────────────────
+    asyncio.run(async_main(config, output_dir))
 
 
 if __name__ == "__main__":

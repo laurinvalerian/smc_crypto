@@ -1550,6 +1550,587 @@ def run(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Helper: simulate with specific params (DRY — used by objective,
+#  OOS evaluation, stability, cross-window validation)
+# ═══════════════════════════════════════════════════════════════════
+
+def _simulate_with_params(
+    params: dict[str, Any],
+    precomputed_signals: list[TradeSignal],
+    config: dict[str, Any],
+    symbol_to_asset: dict[str, str] | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Filter precomputed signals with params, simulate trades, return (trades_df, metrics).
+
+    This consolidates the repeated pattern from objective, OOS eval, and stability check.
+    """
+    alignment_th = params.get("alignment_threshold", 0.65)
+    min_rr = params.get("risk_reward", 2.0)
+    leverage = params.get("leverage", 10)
+    rpt = params.get("risk_per_trade", None)
+    account_size = config["account"]["size"]
+    max_eq = account_size * 2
+
+    # Filter signals
+    filtered: list[TradeSignal] = []
+    for sig in precomputed_signals:
+        if sig.alignment_score < alignment_th:
+            continue
+        if sig.risk_reward < min_rr:
+            continue
+        filtered.append(TradeSignal(
+            timestamp=sig.timestamp, symbol=sig.symbol,
+            direction=sig.direction, style=sig.style,
+            entry_price=sig.entry_price, stop_loss=sig.stop_loss,
+            take_profit=sig.take_profit, risk_reward=sig.risk_reward,
+            position_size=sig.position_size,
+            leverage=leverage,
+            alignment_score=sig.alignment_score, meta=sig.meta,
+        ))
+
+    if not filtered:
+        return pd.DataFrame(), compute_metrics(pd.DataFrame(), account_size=account_size)
+
+    # Group by asset class for correct commissions
+    by_class: dict[str, list[TradeSignal]] = {}
+    for sig in filtered:
+        ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
+        by_class.setdefault(ac, []).append(sig)
+
+    all_trades: list[pd.DataFrame] = []
+    for ac, sigs in by_class.items():
+        t = simulate_trades(
+            sigs,
+            commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
+            slippage_pct=config["backtest"]["slippage_pct"],
+            account_size=account_size,
+            use_circuit_breaker=True,
+            aaa_only=True,
+            asset_class=ac,
+            risk_per_trade_override=rpt,
+            max_equity_for_sizing=max_eq,
+        )
+        if not t.empty:
+            all_trades.append(t)
+
+    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    if not trades.empty:
+        trades = trades.sort_values("timestamp").reset_index(drop=True)
+    metrics = compute_metrics(trades, account_size=account_size)
+    return trades, metrics
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Cross-Window Evergreen Validation
+# ═══════════════════════════════════════════════════════════════════
+
+def cross_window_validate(
+    candidate_params: list[dict[str, Any]],
+    oos_signals_per_window: list[list[TradeSignal]],
+    asset_class: str,
+    config: dict[str, Any],
+    min_pf: float = 1.5,
+) -> dict[str, Any] | None:
+    """
+    Test each candidate param set on ALL OOS windows.
+
+    Only params with pf_real >= min_pf on EVERY window qualify as "evergreen".
+    Returns the best evergreen set (highest min PF across windows), or None.
+    """
+    symbol_to_asset: dict[str, str] = {}
+    for window_sigs in oos_signals_per_window:
+        for sig in window_sigs:
+            symbol_to_asset[sig.symbol] = asset_class
+
+    results: list[dict[str, Any]] = []
+
+    for params in candidate_params:
+        window_metrics: list[dict[str, float]] = []
+        all_pass = True
+
+        for wi, oos_sigs in enumerate(oos_signals_per_window):
+            if not oos_sigs:
+                all_pass = False
+                break
+            _, metrics = _simulate_with_params(
+                params, oos_sigs, config,
+                symbol_to_asset=symbol_to_asset,
+            )
+            pf = metrics.get("pf_real", metrics.get("profit_factor", 0))
+            if pf < min_pf:
+                all_pass = False
+            window_metrics.append(metrics)
+
+        if not all_pass or not window_metrics:
+            continue
+
+        pf_values = [m.get("pf_real", m.get("profit_factor", 0)) for m in window_metrics]
+        results.append({
+            "params": params,
+            "window_metrics": {
+                f"w{i}": {
+                    "pf_real": m.get("pf_real", 0),
+                    "winrate_real": m.get("winrate_real", 0),
+                    "trades": m.get("total_trades", 0),
+                    "dd": m.get("max_drawdown", 0),
+                    "sharpe": m.get("sharpe", 0),
+                }
+                for i, m in enumerate(window_metrics)
+            },
+            "min_pf": min(pf_values),
+            "mean_pf": sum(pf_values) / len(pf_values),
+        })
+
+    if not results:
+        return None
+
+    # Best = highest minimum PF across all windows
+    results.sort(key=lambda r: r["min_pf"], reverse=True)
+    best = results[0]
+
+    return {
+        "asset_class": asset_class,
+        "params": best["params"],
+        "cross_window_metrics": best["window_metrics"],
+        "min_pf": best["min_pf"],
+        "mean_pf": best["mean_pf"],
+        "is_evergreen": True,
+        "n_candidates_tested": len(candidate_params),
+        "n_evergreen_found": len(results),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Per-Asset-Class Walk-Forward Pipeline
+# ═══════════════════════════════════════════════════════════════════
+
+# Default conservative params for asset classes with too few signals
+_DEFAULT_CONSERVATIVE_PARAMS = {
+    "alignment_threshold": 0.88,
+    "risk_reward": 3.0,
+    "leverage": 5,
+    "risk_per_trade": 0.005,
+}
+
+
+def run_per_asset_class(
+    config_path: str = "config/default_config.yaml",
+) -> dict[str, dict[str, Any]]:
+    """
+    Walk-Forward Optuna backtest per asset class.
+
+    For each class: optimize params independently, then cross-validate
+    across ALL windows to find evergreen params.
+
+    Returns: {asset_class: evergreen_result_dict}
+    """
+    cfg = load_config(config_path)
+    results_dir = Path(cfg["backtest"]["results_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    train_months = cfg["backtest"]["train_months"]
+    test_months = cfg["backtest"]["test_months"]
+    n_trials = cfg["backtest"]["n_trials"]
+    top_pct = cfg["backtest"]["top_percent"]
+    study_name = cfg["backtest"]["study_name"]
+    storage = cfg["backtest"]["storage"]
+    account_size = cfg["account"]["size"]
+
+    start = pd.Timestamp(cfg["data"]["start_date"], tz="UTC")
+    end = pd.Timestamp(datetime.now(timezone.utc))
+
+    # Per-class tuning ranges
+    tuning_per_class = cfg.get("tuning_per_class", {})
+
+    # Discover symbols per class
+    multi_assets = get_multi_asset_symbols(cfg)
+    if not multi_assets:
+        logger.error("No instruments found in any data directory")
+        return {}
+
+    windows = generate_wf_windows(start, end, train_months, test_months)
+    if not windows:
+        logger.error("No walk-forward windows generated")
+        return {}
+    logger.info("Walk-forward windows: %d", len(windows))
+
+    evergreen_results: dict[str, dict[str, Any]] = {}
+
+    for ac, symbols in multi_assets.items():
+        logger.info(
+            "═══ Asset Class: %s (%d instruments) ═══",
+            ac.upper(), len(symbols),
+        )
+
+        ac_results_dir = results_dir / ac
+        ac_results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Symbol-to-asset mapping (single class)
+        symbol_to_asset = {s: ac for s in symbols}
+
+        # Pre-load price data for this class
+        logger.info("Loading price data for %d %s instruments...", len(symbols), ac)
+        load_price_data_for_symbols(symbols, cfg)
+
+        # Per-class leverage range
+        class_tuning = tuning_per_class.get(ac, {})
+        lev_min = class_tuning.get("leverage_min", cfg["leverage"]["min"])
+        lev_max = class_tuning.get("leverage_max", cfg["leverage"]["max"])
+
+        # Collect best params + OOS signals per window for cross-validation
+        best_params_per_window: list[dict[str, Any]] = []
+        top_params_per_window: list[list[dict[str, Any]]] = []
+        oos_signals_per_window: list[list[TradeSignal]] = []
+
+        for wi, window in enumerate(windows):
+            logger.info(
+                "%s Window %d: Train %s → %s | Test %s → %s",
+                ac.upper(), wi,
+                window["train_start"].date(), window["train_end"].date(),
+                window["test_start"].date(), window["test_end"].date(),
+            )
+
+            # ── Signal precomputation (per-class, fewer symbols = less RAM) ──
+            train_signals = _precompute_window_signals(
+                cfg, symbols, window["train_start"], window["train_end"],
+                symbol_to_asset=symbol_to_asset,
+            )
+
+            if len(train_signals) < 50:
+                logger.warning(
+                    "%s W%d: Only %d signals (< 50) — using conservative defaults",
+                    ac, wi, len(train_signals),
+                )
+                best_params_per_window.append(dict(_DEFAULT_CONSERVATIVE_PARAMS))
+
+                # Still precompute OOS signals for cross-validation
+                oos_sigs = _precompute_window_signals(
+                    cfg, symbols, window["test_start"], window["test_end"],
+                    symbol_to_asset=symbol_to_asset,
+                )
+                oos_signals_per_window.append(oos_sigs)
+                top_params_per_window.append([dict(_DEFAULT_CONSERVATIVE_PARAMS)])
+                del train_signals
+                gc.collect()
+                continue
+
+            # ── Optuna study (per-class, per-window) ─────────────────
+            window_study_name = f"{study_name}_{ac}_w{wi}"
+
+            # Build objective with per-class leverage range
+            def _make_objective(cfg, train_sigs, wi, res_dir, s2a, lmin, lmax):
+                """Create objective with class-specific leverage range."""
+                signals_by_class: dict[str, list[TradeSignal]] = {}
+                for sig in train_sigs:
+                    c = (s2a or {}).get(sig.symbol, "crypto")
+                    signals_by_class.setdefault(c, []).append(sig)
+
+                def objective(trial: optuna.Trial) -> float:
+                    tuning = cfg.get("tuning", {})
+                    alignment_threshold = trial.suggest_float(
+                        "alignment_threshold",
+                        tuning.get("alignment_threshold_min", 0.60),
+                        tuning.get("alignment_threshold_max", 0.90),
+                        step=0.05,
+                    )
+                    min_rr = trial.suggest_categorical(
+                        "risk_reward", cfg["risk_reward"]["options"],
+                    )
+                    leverage = trial.suggest_int("leverage", lmin, lmax)
+                    risk_per_trade = trial.suggest_float(
+                        "risk_per_trade",
+                        cfg["risk_per_trade"]["min"],
+                        cfg["risk_per_trade"]["max"],
+                        step=0.001,
+                    )
+
+                    params = {
+                        "alignment_threshold": alignment_threshold,
+                        "risk_reward": min_rr,
+                        "leverage": leverage,
+                        "risk_per_trade": risk_per_trade,
+                    }
+                    _, metrics = _simulate_with_params(
+                        params, train_sigs, cfg,
+                        symbol_to_asset=s2a,
+                    )
+
+                    if res_dir is not None and trial.number < 10:
+                        pass  # skip per-trial CSV saves for per-class mode
+
+                    score = (
+                        metrics["pf_real"]
+                        * (1.0 + metrics["max_drawdown"])
+                        * max(metrics["sharpe"], 0.01)
+                    )
+                    if metrics["max_drawdown"] < -0.10:
+                        score *= 0.1
+                    if metrics["total_trades"] < 5:
+                        score = 0.0
+
+                    for k, v in metrics.items():
+                        trial.set_user_attr(k, v)
+                    return score
+
+                return objective
+
+            study = optuna.create_study(
+                study_name=window_study_name,
+                storage=storage,
+                direction="maximize",
+                load_if_exists=True,
+            )
+            objective = _make_objective(
+                cfg, train_signals, wi, ac_results_dir,
+                symbol_to_asset, lev_min, lev_max,
+            )
+            study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+
+            best = study.best_trial.params
+            best_params_per_window.append(dict(best))
+
+            # Collect top-20% param sets for cross-validation
+            top_df = extract_top_params(study, top_pct=top_pct)
+            top_sets: list[dict[str, Any]] = []
+            if not top_df.empty:
+                for _, row in top_df.iterrows():
+                    p = {}
+                    for col in ("alignment_threshold", "risk_reward", "leverage", "risk_per_trade"):
+                        if col in row:
+                            p[col] = row[col]
+                    top_sets.append(p)
+                top_df.to_csv(ac_results_dir / f"top_params_w{wi}.csv", index=False)
+            top_params_per_window.append(top_sets)
+
+            # ── OOS signals ──────────────────────────────────────────
+            oos_sigs = _precompute_window_signals(
+                cfg, symbols, window["test_start"], window["test_end"],
+                symbol_to_asset=symbol_to_asset,
+            )
+            oos_signals_per_window.append(oos_sigs)
+
+            # ── OOS evaluation with best params ──────────────────────
+            oos_trades, oos_metrics = _simulate_with_params(
+                best, oos_sigs, cfg,
+                symbol_to_asset=symbol_to_asset,
+            )
+
+            if not oos_trades.empty:
+                oos_trades.to_csv(ac_results_dir / f"oos_trades_w{wi}.csv", index=False)
+
+            # Monte Carlo
+            mc_result = None
+            if not oos_trades.empty:
+                mc_result = monte_carlo_check(oos_trades, account_size)
+
+            # Stability
+            stability_result = check_parameter_stability(
+                study, best, cfg, oos_sigs,
+            )
+
+            # Validation
+            validation = validate_oos_results(
+                oos_metrics, mc_result,
+                stability_result=stability_result,
+            )
+
+            logger.info(
+                "%s W%d OOS: PF=%.2f(real) WR=%.1f%%(real) BE=%.0f%% "
+                "Trades=%d DD=%.2f%% Stability=%.1f%% | %s",
+                ac.upper(), wi,
+                oos_metrics.get("pf_real", 0),
+                oos_metrics.get("winrate_real", 0) * 100,
+                oos_metrics.get("be_rate", 0) * 100,
+                oos_metrics.get("total_trades", 0),
+                oos_metrics.get("max_drawdown", 0) * 100,
+                stability_result.get("max_pf_change_pct", 0),
+                validation["verdict"],
+            )
+
+            # Param importance
+            compute_param_importance(study, ac_results_dir)
+
+            # Cleanup
+            del train_signals, oos_sigs, oos_trades, study
+            gc.collect()
+
+        # ── Cross-window validation ──────────────────────────────────
+        # Collect ALL unique candidate param sets from all windows
+        all_candidates: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for params_list in [best_params_per_window] + top_params_per_window:
+            for p in (params_list if isinstance(params_list, list) else [params_list]):
+                key = json.dumps(p, sort_keys=True)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_candidates.append(p)
+
+        logger.info(
+            "%s: Cross-window validation with %d candidates on %d OOS windows",
+            ac.upper(), len(all_candidates), len(oos_signals_per_window),
+        )
+
+        evergreen = cross_window_validate(
+            all_candidates, oos_signals_per_window, ac, cfg,
+        )
+
+        if evergreen is not None:
+            # Save evergreen params
+            eg_path = ac_results_dir / "evergreen_params.json"
+            with open(eg_path, "w") as f:
+                json.dump(evergreen, f, indent=2, default=str)
+            logger.info(
+                "✓ %s EVERGREEN: alignment=%.2f rr=%.1f lev=%d risk=%.3f | min_PF=%.2f (%d/%d candidates)",
+                ac.upper(),
+                evergreen["params"]["alignment_threshold"],
+                evergreen["params"]["risk_reward"],
+                evergreen["params"]["leverage"],
+                evergreen["params"]["risk_per_trade"],
+                evergreen["min_pf"],
+                evergreen["n_evergreen_found"],
+                evergreen["n_candidates_tested"],
+            )
+            evergreen_results[ac] = evergreen
+        else:
+            # No evergreen found — use conservative defaults
+            logger.warning(
+                "✗ %s: No evergreen params found! Using conservative defaults.",
+                ac.upper(),
+            )
+            default_result = {
+                "asset_class": ac,
+                "params": dict(_DEFAULT_CONSERVATIVE_PARAMS),
+                "cross_window_metrics": {},
+                "min_pf": 0.0,
+                "mean_pf": 0.0,
+                "is_evergreen": False,
+                "n_candidates_tested": len(all_candidates),
+                "n_evergreen_found": 0,
+            }
+            eg_path = ac_results_dir / "evergreen_params.json"
+            with open(eg_path, "w") as f:
+                json.dump(default_result, f, indent=2, default=str)
+            evergreen_results[ac] = default_result
+
+        # Free OOS signals memory
+        del oos_signals_per_window
+        gc.collect()
+
+    # ── Summary ──────────────────────────────────────────────────────
+    summary = {}
+    for ac, eg in evergreen_results.items():
+        summary[ac] = {
+            "is_evergreen": eg.get("is_evergreen", False),
+            "params": eg["params"],
+            "min_pf": eg.get("min_pf", 0),
+        }
+    with open(results_dir / "evergreen_summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    logger.info("Per-asset-class backtest complete. Results in %s", results_dir)
+    for ac, s in summary.items():
+        status = "EVERGREEN" if s["is_evergreen"] else "DEFAULT"
+        logger.info(
+            "  %s: [%s] alignment=%.2f rr=%.1f lev=%d risk=%.3f min_pf=%.2f",
+            ac, status,
+            s["params"]["alignment_threshold"],
+            s["params"]["risk_reward"],
+            s["params"]["leverage"],
+            s["params"]["risk_per_trade"],
+            s["min_pf"],
+        )
+
+    return evergreen_results
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Paper Grid Variant Generator
+# ═══════════════════════════════════════════════════════════════════
+
+# Asset-class leverage caps (must match live_multi_bot.py)
+_ASSET_MAX_LEVERAGE = {
+    "crypto": 20, "forex": 30, "stocks": 4, "commodities": 20,
+}
+
+
+def generate_paper_grid_variants(
+    results_dir: str = "backtest/results",
+    output_path: str = "paper_grid_results/variants.json",
+) -> list[dict[str, Any]]:
+    """
+    Generate 20 parameter variants per asset class from evergreen params.
+
+    Reads evergreen_params.json from each class's results directory,
+    creates 20 variants spanning conservative to aggressive.
+    """
+    results_path = Path(results_dir)
+    all_variants: list[dict[str, Any]] = []
+
+    for ac in ("crypto", "forex", "stocks", "commodities"):
+        eg_file = results_path / ac / "evergreen_params.json"
+        if not eg_file.exists():
+            logger.warning("No evergreen params for %s — skipping", ac)
+            continue
+
+        with open(eg_file) as f:
+            eg = json.load(f)
+
+        p = eg["params"]
+        al = p["alignment_threshold"]
+        rr = p["risk_reward"]
+        lev = int(p["leverage"])
+        risk = p["risk_per_trade"]
+        max_lev = _ASSET_MAX_LEVERAGE.get(ac, 20)
+
+        def _v(name, a, r, l, rk):
+            """Create variant dict, clamping values to valid ranges."""
+            return {
+                "name": f"{ac}-{name}",
+                "alignment_threshold": round(min(max(a, 0.60), 0.95), 2),
+                "min_rr": round(max(r, 1.5), 1),
+                "leverage": max(1, min(int(round(l)), max_lev)),
+                "risk_per_trade": round(min(max(rk, 0.002), 0.025), 4),
+                "asset_class": ac,
+            }
+
+        variants = [
+            _v("Base",            al,        rr,       lev,           risk),
+            _v("Conservative-1",  al + 0.02, rr + 0.5, lev * 0.6,    risk * 0.5),
+            _v("Conservative-2",  al + 0.02, rr,       lev * 0.6,    risk * 0.7),
+            _v("Risk-Low",        al,        rr,       lev,           risk * 0.5),
+            _v("Risk-High",       al,        rr,       lev,           risk * 1.5),
+            _v("Risk-Max",        al,        rr,       lev,           min(risk * 2.0, 0.02)),
+            _v("Lev-Low",         al,        rr,       max(lev*0.5,1),risk),
+            _v("Lev-High",        al,        rr,       lev * 1.5,     risk),
+            _v("Lev-Max",         al,        rr,       max_lev,       risk),
+            _v("RR-Relaxed",      al,        rr - 0.5, lev,           risk),
+            _v("RR-Strict",       al,        rr + 0.5, lev,           risk),
+            _v("Align-Relaxed",   al - 0.05, rr,       lev,           risk),
+            _v("Align-Strict",    al + 0.02, rr,       lev,           risk),
+            _v("AAA+-Fallback",   0.78,      2.0,      lev,           risk),
+            _v("Aggressive",      al - 0.05, rr - 0.5, lev * 1.5,    risk * 1.5),
+            _v("Defensive",       al + 0.02, rr + 0.5, lev * 0.5,    risk * 0.5),
+            _v("Wild-Max",        0.78,      2.0,      max_lev,       0.02),
+            _v("Wild-Min",        0.92,      3.5,      max(1, int(max_lev * 0.2)), 0.003),
+            _v("Balanced",        al,        rr,       lev,           risk * 0.8),
+            _v("Turbo",           al - 0.03, rr,       lev * 1.3,    risk * 1.3),
+        ]
+        all_variants.extend(variants)
+        logger.info("Generated 20 variants for %s (base: al=%.2f rr=%.1f lev=%d risk=%.3f)",
+                     ac, al, rr, lev, risk)
+
+    # Save
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(all_variants, f, indent=2)
+    logger.info("Saved %d paper grid variants → %s", len(all_variants), out_path)
+
+    return all_variants
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1561,5 +2142,22 @@ if __name__ == "__main__":
         "--config", default="config/default_config.yaml",
         help="Path to YAML config file",
     )
+    parser.add_argument(
+        "--per-class", action="store_true",
+        help="Run per-asset-class optimization (separate Optuna per class + cross-window evergreen)",
+    )
+    parser.add_argument(
+        "--generate-paper-grid", action="store_true",
+        help="Generate 20 paper grid variants per asset class from evergreen params",
+    )
     args = parser.parse_args()
-    run(config_path=args.config)
+
+    if args.generate_paper_grid:
+        cfg = load_config(args.config)
+        generate_paper_grid_variants(
+            results_dir=cfg["backtest"]["results_dir"],
+        )
+    elif args.per_class:
+        run_per_asset_class(config_path=args.config)
+    else:
+        run(config_path=args.config)

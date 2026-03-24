@@ -123,6 +123,21 @@ tuning:
   fvg_threshold_min: 0.0002
   fvg_threshold_max: 0.0008
 
+# ── Per-Asset-Class Tuning Ranges ──────────────────────────────
+tuning_per_class:
+  crypto:
+    leverage_min: 3
+    leverage_max: 20
+  forex:
+    leverage_min: 5
+    leverage_max: 30
+  stocks:
+    leverage_min: 1
+    leverage_max: 4
+  commodities:
+    leverage_min: 3
+    leverage_max: 20
+
 # ── Data ──────────────────────────────────────────────────────────
 data:
   exchange: "binanceusdm"  # CCXT exchange id (Binance USDT-M Futures)

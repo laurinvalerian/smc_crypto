@@ -14,7 +14,7 @@ Multi-Asset Trading Bot basierend auf Smart Money Concepts (SMC/ICT), der nur di
 
 | Datei | Zweck |
 |---|---|
-| `live_multi_bot.py` | Haupt-Orchestrator, PaperBot-Klasse, Multi-TF Alignment, Tier-Klassifizierung, Order-Execution |
+| `live_multi_bot.py` | Multi-Asset Orchestrator (112 Bots: 30 Crypto + 28 Forex + 50 Stocks + 4 Commodities), PaperBot, Multi-TF Alignment, Order-Execution |
 | `strategies/smc_multi_style.py` | SMC-Indikatoren (BOS, CHoCH, FVG, OB, Liquidity), Entry-Zone-Erkennung, Multi-Dir Data Loading |
 | `rl_brain.py` | Zentrales PPO RL-Gehirn (24-dim Input, shared across alle Instrumente) |
 | `filters/` | AAA++ Filter-Module (trend_strength, volume_liquidity, session_filter, zone_quality) |
@@ -165,9 +165,9 @@ Neue Filter-Module, 13-Komponenten-Scoring, Tier-Umbau, RL-Brain-Erweiterung.
 ### Phase 2: Exchange-Abstraktionsschicht (✅ FERTIG)
 - `exchanges/models.py` — `InstrumentMeta`, `OrderResult`, `PositionInfo`, `BalanceInfo` Dataclasses
 - `exchanges/base.py` — Abstract `ExchangeAdapter` (alle Methoden: Market Data, Trading, Account, Leverage, Trading Hours)
-- `exchanges/binance_adapter.py` — `BinanceAdapter` wraps ccxt.pro + ccxt sync, `raw` Property für schrittweise Migration
+- `exchanges/binance_adapter.py` — `BinanceAdapter` wraps ccxt.pro + ccxt sync, inkl. `fetch_max_leverage()` 3-Methoden-Fallback
 - `exchanges/__init__.py` — Package-Exports
-- **Migration**: `live_multi_bot.py` nutzt `BinanceAdapter` über `adapter.raw` Property während der Übergangsphase. Schrittweise Umstellung auf Adapter-Methoden geplant.
+- **Migration ABGESCHLOSSEN**: `live_multi_bot.py` nutzt NUR noch `self.adapter` Methoden. `self.exchange` (adapter.raw) komplett entfernt. Alle Order/Market/Balance Calls gehen über das abstrakte ExchangeAdapter Interface → funktioniert für Binance, OANDA und Alpaca.
 
 ### Phase 3: Multi-Asset Integration (✅ FERTIG)
 - `exchanges/oanda_adapter.py` — Forex (28 Pairs) + 4 Commodities via OANDA v20 API
@@ -509,6 +509,88 @@ risk_per_trade: 0.01 (1.0% max, dynamisch je nach Score)
 - Alpaca: Standalone SL/TP Orders → gleicher Mechanismus via `cancel_order()`
 - Alle Adapter implementieren `fetch_open_orders()` + `cancel_order()` → generische Lösung
 
+### Multi-Asset Live Bot Refactoring (✅ FERTIG)
+
+**`live_multi_bot.py`** von Crypto-only (100 Binance Bots) auf Multi-Asset (112 Instrumente) umgebaut:
+
+**Neue Constants & Symbol-Listen:**
+- `TOP_30_CRYPTO` (30 höchste Liquidität), `FOREX_28`, `STOCKS_50`, `COMMODITIES_4`
+- `ALL_INSTRUMENTS` dict → 112 Instrumente total
+- `ASSET_COMMISSION` — per Asset-Klasse (crypto 0.04%, forex 0.005%, stocks 0%, commodities 0.01%)
+- `ASSET_SMC_PARAMS` — per Asset-Klasse aus `config/default_config.yaml` smc_profiles
+- `ASSET_MAX_LEVERAGE` — crypto 20x, forex 30x, stocks 4x, commodities 20x
+- `ASSET_CLASS_ID` — RL Feature (crypto 0.0, forex 0.25, stocks 0.5, commodities 0.75)
+- `symbol_to_asset_class()` Helper
+
+**Multi-Exchange Init (`create_adapters()`):**
+- Async, erstellt BinanceAdapter + OandaAdapter + AlpacaAdapter basierend auf .env Keys
+- OANDA mapped auf "forex" + "commodities" (gleiche Instanz, Dedup via `id(adapter)`)
+- Graceful Skip bei fehlenden Keys/Packages
+
+**PaperBot Refactoring:**
+- Neue Params: `asset_class`, `adapter` (ExchangeAdapter)
+- `self.exchange` entfernt — alle Calls über `self.adapter` (Exchange-agnostisch)
+- Per-Asset SMC Params, Commission, Leverage Cap
+- `load_history()` jetzt async via `adapter.fetch_ohlcv()` (250 daily bars für EMA200)
+
+**Signal Pipeline Asset-Class-Aware:**
+- 5× hardcoded `"crypto"` → `self.asset_class` (Circuit Breaker, Volume, Session, Paper Grid, Record Close)
+- Trading Hours Check via `adapter.is_market_open()`
+- Volatility Gate per Asset-Klasse (`self.min_daily_atr_pct`, `self.min_5m_atr_pct`)
+
+**Data Feed Strategie:**
+- Crypto: WebSocket (`watch_ohlcv`, `watch_ticker`) — bestehend
+- Forex/Stocks/Commodities: REST Polling (`_poll_candles`, `_poll_ticker`, 10s/5s Intervall)
+
+**Runner Multi-Exchange:**
+- `LiveMultiBotRunner` akzeptiert `adapters: dict[str, ExchangeAdapter]`
+- Per-Adapter Position Polling, Zombie Sweep, Balance Fetch (mit OANDA Dedup)
+- Shutdown: alle Adapter geschlossen
+
+**Dashboard:**
+- Header: "SMC MULTI-ASSET LIVE TRADING DASHBOARD"
+- Per-Class Bot-Counts, "Class" Column in Bot-Tabellen
+
+**`async_main()` + `main()`:**
+- `main()` → `asyncio.run(async_main())`
+- History Loading in 10er-Batches (Rate-Limit-freundlich)
+- Graceful Degradation: nur verfügbare Asset-Klassen starten
+
+### Order Execution Migration (✅ FERTIG)
+
+**`self.exchange` komplett entfernt** — alle Order-/Market-Calls gehen über `self.adapter`:
+
+**`_place_bracket_order()`**: Entry via `adapter.create_market_order()`, SL via `adapter.create_stop_loss()`, TP via `adapter.create_take_profit()`, Cancel via `adapter.cancel_order()`, Precision via `adapter.price_to_precision()`
+
+**`_execute_bracket_order_with_risk_reduction()`**: ~500→~250 Zeilen. `adapter.get_instrument()` ersetzt manuelles Binance-Filter-Parsing. `adapter.fetch_max_leverage()` ersetzt 3-Methoden-Fallback. `adapter.set_margin_mode()` + `adapter.set_leverage()` für Margin-Management.
+
+**`_fetch_balance()`**: `adapter.fetch_balance()` → `BalanceInfo.free` (statt raw ccxt dict-Parsing)
+
+**Runner**: `self.exchange` → `self._crypto_adapter` für WebSocket-Feeds. Kein `self.exchange` mehr im gesamten File.
+
+### Per-Asset-Class Backtesting (✅ FERTIG)
+
+**Neuer Modus**: `python3 -m backtest.optuna_backtester --per-class`
+
+- Optuna läuft **separat pro Asset-Klasse** (statt global über 112 Instrumente)
+- Per-Class Leverage-Ranges aus `config/default_config.yaml` → `tuning_per_class` (crypto 3-20x, forex 5-30x, stocks 1-4x, commodities 3-20x)
+- **Cross-Window-Validierung automatisiert**: Alle Kandidaten-Params werden auf ALLEN OOS-Windows getestet
+- **Evergreen-Kriterium**: `pf_real >= 1.5` auf jedem Window → Ranking nach `min(pf_real)`
+- Ergebnis: `backtest/results/{asset_class}/evergreen_params.json` pro Klasse
+- Weniger RAM pro Run (30 Symbole statt 112)
+- Commodities-Fallback: < 50 Signale → konservative Default-Params
+
+**Paper Grid Varianten-Generator**: `python3 -m backtest.optuna_backtester --generate-paper-grid`
+- Liest Evergreen-Params pro Klasse
+- Generiert **20 Varianten pro Klasse** (80 total): Base, Conservative, Risk-Tests, Leverage-Tests, RR-Tests, Aggressive, Defensive, Wild-Max, Wild-Min, etc.
+- Gespeichert als `paper_grid_results/variants.json`
+- `PaperGrid` lädt automatisch aus variants.json wenn vorhanden
+
+**Paper Grid Asset-Class-Aware:**
+- `VariantConfig` hat neues Feld `asset_class: str | None`
+- `evaluate_signal()` filtert: Variant mit `asset_class="crypto"` evaluiert nur Crypto-Signale
+- Backward-compat: `asset_class=None` → evaluiert alle Klassen
+
 ### Nächste Schritte
 1. **Daten**: ✅ FERTIG + Prefetch komplett
 2. **V12 Fixes**: ✅ GEFIXT — Lookahead-freie Structure-TP + Short-BE Fix + risk_reward Options
@@ -517,8 +599,13 @@ risk_per_trade: 0.01 (1.0% max, dynamisch je nach Score)
 5. **Backtester V12c**: ✅ FERTIG — 3/3 PASS, Evergreen-Params validiert
 6. **Paper Grid**: ✅ FERTIG — 20 Varianten, A/B Testing, realistische Fees
 7. **Zombie Prevention**: ✅ FERTIG — 3-Layer Schutz, Startup Sweep
-8. **Paper Trading**: ⏳ 2 Wochen Demo mit Sniper-Params über alle Asset-Klassen
-9. **Live → Funded**: 3× Funded Accounts geplant
+8. **Multi-Asset Live Bot**: ✅ FERTIG — 112 Instrumente, 3 Exchanges, REST+WS Feeds
+9. **Order Execution Migration**: ✅ FERTIG — `self.exchange` entfernt, alles über `self.adapter`
+10. **Per-Asset-Class Backtesting**: ✅ FERTIG — `--per-class` + Cross-Window Evergreen + Paper Grid Generator
+11. **Per-Class Backtest ausführen**: ⏳ `python3 -m backtest.optuna_backtester --per-class` (~3-4h)
+12. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (nach Backtest)
+13. **Paper Trading**: ⏳ 2 Wochen Demo mit per-Class Evergreen-Params über alle Asset-Klassen
+14. **Live → Funded**: 3× Funded Accounts geplant
 
 ## Testing & Anti-Overfitting
 
@@ -528,9 +615,72 @@ risk_per_trade: 0.01 (1.0% max, dynamisch je nach Score)
 - **Parameter-Stabilität**: ±10% Änderung darf Performance nicht kippen (Backtester: `check_parameter_stability()`)
 - **Monte-Carlo**: R-multiple compound shuffling, 1000x, 95%-KI > 0 (Backtester: `monte_carlo_check()`)
 - **7-Gate OOS-Validierung**: PF≥1.5, Trades≥20, Sharpe≥0.5, MC robust, DD>-10%, Stability<50%, Quality (WR>20% + positive expectancy)
-- **Cross-Window-Test**: Alle Parameter-Sets auf ALLEN OOS-Windows testen. Nur "Evergreen" Params (PF≥1.5 auf allen Windows) für Live verwenden.
+- **Cross-Window-Test (AUTOMATISIERT)**: `cross_window_validate()` testet alle Kandidaten-Params auf ALLEN OOS-Windows. Nur "Evergreen" Params (PF≥1.5 auf JEDEM Window) werden akzeptiert. Ranking: höchstes Minimum-PF.
+- **Per-Asset-Class Params**: Gleiche Params über ALLE Zeitfenster, aber VERSCHIEDENE Params pro Asset-Klasse (crypto, forex, stocks, commodities verhalten sich fundamental anders)
 - **RL Pre-Training**: Nur mit Out-of-Sample Backtest-Trades, Curriculum-basiert (erst nach 100 Paper-Trades)
 - **Paper-Trading**: Mindestens 2 Wochen vor Live, innerhalb 1 Std-Abweichung der Backtests
+
+### Per-Class Backtest Workflow (Komplett-Anleitung)
+
+```bash
+# Schritt 1: Per-Class Backtest (~3-4h, sequentiell pro Klasse)
+python3 -m backtest.optuna_backtester --per-class
+
+# Was passiert:
+# - Für jede der 4 Klassen (crypto, forex, stocks, commodities):
+#   - Signal-Precomputation NUR für diese Klasse (weniger RAM)
+#   - Optuna: 30 Trials pro Window, per-class Leverage-Range
+#   - OOS-Validierung mit 7 Gates
+#   - Cross-Window: testet ALLE Kandidaten auf ALLEN OOS-Windows
+#   - Speichert: backtest/results/{class}/evergreen_params.json
+# - Walk-Forward: 3 Windows (W0 Jun-Aug, W1 Sep-Nov, W2 Dec-Feb)
+
+# Schritt 2: Paper Grid Varianten generieren
+python3 -m backtest.optuna_backtester --generate-paper-grid
+
+# Was passiert:
+# - Liest evergreen_params.json pro Klasse
+# - Generiert 20 Varianten pro Klasse (80 total)
+# - Speichert: paper_grid_results/variants.json
+# - Varianten: Base, Conservative, Risk-Tests, Leverage-Tests, etc.
+
+# Schritt 3: Paper Trading starten
+python3 live_multi_bot.py
+
+# Was passiert:
+# - Lädt variants.json → 80 Varianten (20 pro Klasse)
+# - 112 Bots (30 crypto + 28 forex + 50 stocks + 4 commodities)
+# - Jedes Signal wird durch alle passenden Varianten evaluiert
+# - Dashboard zeigt Top-Varianten pro Klasse
+
+# Monitoring:
+tail -f backtest/results/backtest.log           # Backtest-Log
+tail -f paper_grid_results/summary.csv          # Paper Grid Ergebnisse
+```
+
+### Ergebnis-Dateien nach Per-Class Backtest
+
+```
+backtest/results/
+├── crypto/
+│   ├── evergreen_params.json    # Beste Evergreen-Params für Crypto
+│   ├── oos_trades_w0.csv        # OOS Trades pro Window
+│   ├── top_params_w0.csv        # Top-20% Params pro Window
+│   └── param_importance.csv     # fANOVA Importance Ranking
+├── forex/
+│   └── evergreen_params.json
+├── stocks/
+│   └── evergreen_params.json
+├── commodities/
+│   └── evergreen_params.json
+├── evergreen_summary.json       # Übersicht: alle Klassen
+└── signal_cache/                # Gecachte Signale (wiederverwendbar)
+
+paper_grid_results/
+├── variants.json                # 80 Varianten (20 pro Klasse)
+├── state.json                   # Laufender Paper-Trading State
+└── summary.csv                  # Trade-Export
+```
 
 ## Exchanges
 
@@ -544,11 +694,17 @@ risk_per_trade: 0.01 (1.0% max, dynamisch je nach Score)
 ## Commands
 
 ```bash
-# Live/Paper Trading starten
+# Live/Paper Trading starten (Dashboard im Terminal)
 python3 live_multi_bot.py [--config config/default_config.yaml]
 
-# Backtesting (Optuna Walk-Forward)
-python3 -m backtest.optuna_backtester --monte-carlo --stability-check
+# Backtesting — Global (alle Assets gleiche Params)
+python3 -m backtest.optuna_backtester
+
+# Backtesting — Per Asset-Klasse (separate Optuna + Cross-Window Evergreen)
+python3 -m backtest.optuna_backtester --per-class
+
+# Paper Grid Varianten generieren (aus Evergreen-Ergebnissen)
+python3 -m backtest.optuna_backtester --generate-paper-grid
 
 # Daten herunterladen
 python3 -m utils.data_downloader --workers 3                  # Crypto (Binance, parallel)
@@ -567,12 +723,21 @@ tail -f backtest/results/backtest.log                          # Detaillierter L
 ## Wichtige Konstanten
 
 ```
-# Evergreen Live-Parameter (Cross-Window validiert, nicht optimiert)
+# Evergreen Live-Parameter — werden JETZT per Asset-Klasse optimiert!
+# Vorher: globale Sniper-Params für alle Klassen
+# Nachher: per-class Evergreen aus `backtest/results/{class}/evergreen_params.json`
+# Fallback wenn kein Evergreen gefunden:
 ALIGNMENT_THRESHOLD = 0.88       # Sniper: nur AAA++ Trades
 MIN_RR = 3.0                     # Nur Trades mit RR ≥ 3.0
 LEVERAGE = 5                     # Konservativ
-RISK_PER_TRADE = 0.01            # 1.0% max (dynamisch je nach Score)
+RISK_PER_TRADE = 0.005           # 0.5% (konservativer Fallback)
 MAX_EQUITY_FOR_SIZING = 2x       # Equity Cap bei 2× Initial (anti-compound-explosion)
+
+# Per-Class Leverage-Ranges (Optuna tuning_per_class in config)
+CRYPTO_LEVERAGE_RANGE = 3-20x
+FOREX_LEVERAGE_RANGE = 5-30x
+STOCKS_LEVERAGE_RANGE = 1-4x
+COMMODITIES_LEVERAGE_RANGE = 3-20x
 
 # Tier-Definitionen (für Signal-Klassifizierung)
 TIER_AAA_PLUS_PLUS: score ≥ 0.88, RR ≥ 3.0, risk 1.0-1.5% (max 1.5%)
@@ -603,7 +768,7 @@ bot/
 ├── check_downloads.sh             # Status-Script für Daten-Downloads
 ├── check_backtest.sh              # Status-Script für Backtest-Fortschritt
 ├── live_multi_bot.py              # Haupt-Orchestrator (PaperBot + Runner)
-├── paper_grid.py                  # Multi-Variant A/B Testing (20 Varianten, virtuelle PnL)
+├── paper_grid.py                  # Multi-Variant A/B Testing (80 Varianten: 20 pro Asset-Klasse, virtuelle PnL)
 ├── rl_brain.py                    # PPO RL Brain (24-dim, shaped rewards)
 ├── strategies/
 │   └── smc_multi_style.py         # SMC/ICT Strategie (BOS, CHoCH, FVG, OB)
@@ -616,7 +781,7 @@ bot/
 ├── config/
 │   └── default_config.yaml        # Alle Parameter
 ├── backtest/
-│   └── optuna_backtester.py       # Walk-Forward Optimizer
+│   └── optuna_backtester.py       # Walk-Forward Optimizer (--per-class + --generate-paper-grid)
 ├── utils/
 │   ├── data_downloader.py         # Crypto OHLCV Download (CCXT/Binance, 3 parallel workers)
 │   ├── forex_data_downloader.py   # Forex+Commodities OHLCV Download (OANDA v20)

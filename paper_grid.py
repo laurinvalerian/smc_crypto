@@ -79,6 +79,7 @@ class VariantConfig:
     min_rr: float
     leverage: int
     risk_per_trade: float  # max risk cap (dynamic scoring still applies)
+    asset_class: str | None = None  # None = evaluate for all classes
 
 
 @dataclass
@@ -192,6 +193,9 @@ class PaperGrid:
         account_size: float = 100_000.0,
         results_dir: str = "paper_grid_results",
     ):
+        # Load from variants.json if available and no explicit variants given
+        if variants is None:
+            variants = self._load_variants_from_file(results_dir)
         self.variants: list[VariantConfig] = variants or DEFAULT_VARIANTS
         self.states: dict[str, VariantState] = {
             v.name: VariantState(config=v, equity=account_size, peak_equity=account_size)
@@ -200,7 +204,41 @@ class PaperGrid:
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self._account_size = account_size
-        logger.info("PaperGrid initialized: %d variants, $%.0f each", len(self.variants), account_size)
+        # Count per-class variants
+        class_counts: dict[str, int] = {}
+        for v in self.variants:
+            ac = v.asset_class or "global"
+            class_counts[ac] = class_counts.get(ac, 0) + 1
+        logger.info(
+            "PaperGrid initialized: %d variants ($%.0f each) — %s",
+            len(self.variants), account_size,
+            ", ".join(f"{k}:{v}" for k, v in sorted(class_counts.items())),
+        )
+
+    @staticmethod
+    def _load_variants_from_file(results_dir: str) -> list[VariantConfig] | None:
+        """Load per-class variants from variants.json if it exists."""
+        vfile = Path(results_dir) / "variants.json"
+        if not vfile.exists():
+            return None
+        try:
+            with open(vfile) as f:
+                data = json.load(f)
+            variants = []
+            for d in data:
+                variants.append(VariantConfig(
+                    name=d["name"],
+                    alignment_threshold=d["alignment_threshold"],
+                    min_rr=d["min_rr"],
+                    leverage=int(d["leverage"]),
+                    risk_per_trade=d["risk_per_trade"],
+                    asset_class=d.get("asset_class"),
+                ))
+            logger.info("Loaded %d variants from %s", len(variants), vfile)
+            return variants
+        except Exception as exc:
+            logger.warning("Failed loading variants.json: %s — using defaults", exc)
+            return None
 
     # ── Signal evaluation ───────────────────────────────────────
 
@@ -233,6 +271,11 @@ class PaperGrid:
 
         for name, state in self.states.items():
             cfg = state.config
+
+            # Filter 0: asset-class match (skip variants for other classes)
+            if cfg.asset_class and cfg.asset_class != asset_class:
+                results[name] = None
+                continue
 
             # Filter 1: alignment threshold
             if score < cfg.alignment_threshold:
