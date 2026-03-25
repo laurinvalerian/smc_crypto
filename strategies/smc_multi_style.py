@@ -90,6 +90,376 @@ def _to_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  Causal SMC indicators (NO future data — safe for backtesting/live)
+# ═══════════════════════════════════════════════════════════════════
+#
+# The external `smartmoneyconcepts` library has inherent lookahead bias:
+#   - swing_highs_lows() uses shift(-(swing_length//2)) → peeks future bars
+#   - fvg() uses shift(-1) → peeks next bar
+# These causal versions use ONLY past data. They produce the same
+# DataFrame column structure so all downstream code works unchanged.
+
+
+def _causal_swing_highs_lows(
+    ohlc: pd.DataFrame, swing_length: int,
+) -> pd.DataFrame:
+    """
+    Causal swing detection — only uses past bars (no future peek).
+
+    Returns DataFrame with columns: HighLow (+1/-1/NaN), Level (price/NaN).
+    Same format as smc.swing_highs_lows().
+    """
+    high = ohlc["high"].values.astype(float)
+    low = ohlc["low"].values.astype(float)
+    n = len(high)
+
+    hl = np.full(n, np.nan)
+    level = np.full(n, np.nan)
+
+    if n <= swing_length:
+        return pd.DataFrame({"HighLow": hl, "Level": level}, index=ohlc.index)
+
+    high_s = pd.Series(high)
+    low_s = pd.Series(low)
+
+    # Rolling max/min of PREVIOUS swing_length bars (shift(1) = no current bar)
+    roll_max = high_s.shift(1).rolling(window=swing_length, min_periods=swing_length).max()
+    roll_min = low_s.shift(1).rolling(window=swing_length, min_periods=swing_length).min()
+
+    is_sh = (high_s >= roll_max).values & ~np.isnan(roll_max.values)
+    is_sl = (low_s <= roll_min).values & ~np.isnan(roll_min.values)
+
+    for i in range(n):
+        if is_sh[i]:
+            hl[i] = 1.0
+            level[i] = high[i]
+        elif is_sl[i]:
+            hl[i] = -1.0
+            level[i] = low[i]
+
+    return pd.DataFrame({"HighLow": hl, "Level": level}, index=ohlc.index)
+
+
+def _causal_fvg(ohlc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Causal FVG detection — confirmed at bar i (the 3rd bar of the pattern).
+
+    Bullish FVG:  bar[i-2].high < bar[i].low  (gap up), bar[i-1] bullish candle
+    Bearish FVG:  bar[i-2].low  > bar[i].high (gap down), bar[i-1] bearish candle
+
+    The FVG is placed on index i because all 3 bars (i-2, i-1, i) are known.
+    The external library places it on i-1 using shift(-1) = bar i = FUTURE.
+
+    Returns DataFrame with columns: FVG (+1/-1/NaN), Top, Bottom, MitigatedIndex.
+    """
+    high = ohlc["high"].values.astype(float)
+    low = ohlc["low"].values.astype(float)
+    close = ohlc["close"].values.astype(float)
+    open_ = ohlc["open"].values.astype(float)
+    n = len(high)
+
+    fvg_type = np.full(n, np.nan)
+    fvg_top = np.full(n, np.nan)
+    fvg_bottom = np.full(n, np.nan)
+    mitigated = np.full(n, np.nan)
+
+    for i in range(2, n):
+        # Bullish FVG: gap between bar[i-2].high and bar[i].low
+        if high[i - 2] < low[i] and close[i - 1] > open_[i - 1]:
+            fvg_type[i] = 1.0
+            fvg_top[i] = low[i]
+            fvg_bottom[i] = high[i - 2]
+        # Bearish FVG: gap between bar[i-2].low and bar[i].high
+        elif low[i - 2] > high[i] and close[i - 1] < open_[i - 1]:
+            fvg_type[i] = -1.0
+            fvg_top[i] = low[i - 2]
+            fvg_bottom[i] = high[i]
+
+    # Track mitigation: when price later fills the gap
+    active_fvgs: list[tuple[int, float, float, float]] = []  # (idx, type, top, bottom)
+    for i in range(n):
+        if not np.isnan(fvg_type[i]):
+            active_fvgs.append((i, fvg_type[i], fvg_top[i], fvg_bottom[i]))
+        # Check if current bar mitigates any active FVG
+        still_active = []
+        for (fidx, ftype, ftop, fbot) in active_fvgs:
+            if np.isnan(mitigated[fidx]):
+                # Bullish FVG mitigated when price drops below bottom
+                if ftype > 0 and low[i] <= fbot:
+                    mitigated[fidx] = float(i)
+                # Bearish FVG mitigated when price rises above top
+                elif ftype < 0 and high[i] >= ftop:
+                    mitigated[fidx] = float(i)
+                else:
+                    still_active.append((fidx, ftype, ftop, fbot))
+            # Already mitigated, skip
+        active_fvgs = still_active
+
+    return pd.DataFrame({
+        "FVG": fvg_type, "Top": fvg_top, "Bottom": fvg_bottom,
+        "MitigatedIndex": mitigated,
+    }, index=ohlc.index)
+
+
+def _causal_bos_choch(
+    ohlc: pd.DataFrame, swing_hl: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Causal BOS/CHoCH detection from causal swing highs/lows.
+
+    BOS (Break of Structure): price breaks the last swing high (bullish) or
+    swing low (bearish) in the SAME direction as the current trend.
+
+    CHoCH (Change of Character): price breaks a swing level in the OPPOSITE
+    direction — first sign of trend reversal.
+
+    Returns DataFrame with columns: BOS (+1/-1/NaN), CHOCH (+1/-1/NaN),
+    Level (broken level), BrokenIndex (index of broken swing).
+    """
+    high = ohlc["high"].values.astype(float)
+    low = ohlc["low"].values.astype(float)
+    n = len(high)
+
+    bos = np.full(n, np.nan)
+    choch = np.full(n, np.nan)
+    level = np.full(n, np.nan, dtype=np.float32)
+    broken_idx = np.full(n, np.nan)
+
+    hl_vals = swing_hl["HighLow"].values
+    lvl_vals = swing_hl["Level"].values
+
+    # Track the last confirmed swing high and low
+    last_sh_price = np.nan
+    last_sh_idx = -1
+    last_sl_price = np.nan
+    last_sl_idx = -1
+    trend = 0  # +1 bullish, -1 bearish, 0 unknown
+
+    for i in range(n):
+        # Check for breaks BEFORE registering new swings at this bar
+        # (otherwise bar i can't break its own swing since high[i] == swing level)
+        if not np.isnan(last_sh_price) and high[i] > last_sh_price:
+            # Bullish break of last swing high
+            if trend <= 0:
+                # Was bearish or neutral → CHoCH (trend reversal)
+                choch[i] = 1.0
+            else:
+                # Was already bullish → BOS (continuation)
+                bos[i] = 1.0
+            level[i] = np.float32(last_sh_price)
+            broken_idx[i] = float(last_sh_idx)
+            trend = 1
+            last_sh_price = np.nan  # consumed
+
+        elif not np.isnan(last_sl_price) and low[i] < last_sl_price:
+            # Bearish break of last swing low
+            if trend >= 0:
+                choch[i] = -1.0
+            else:
+                bos[i] = -1.0
+            level[i] = np.float32(last_sl_price)
+            broken_idx[i] = float(last_sl_idx)
+            trend = -1
+            last_sl_price = np.nan  # consumed
+
+        # Register new swings AFTER checking breaks
+        if not np.isnan(hl_vals[i]):
+            if hl_vals[i] > 0:
+                last_sh_price = lvl_vals[i]
+                last_sh_idx = i
+            elif hl_vals[i] < 0:
+                last_sl_price = lvl_vals[i]
+                last_sl_idx = i
+
+    return pd.DataFrame({
+        "BOS": bos, "CHOCH": choch, "Level": level, "BrokenIndex": broken_idx,
+    }, index=ohlc.index)
+
+
+def _causal_ob(
+    ohlc: pd.DataFrame, swing_hl: pd.DataFrame, bos_choch: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Causal Order Block detection.
+
+    Bullish OB: last bearish candle before a bullish BOS/CHoCH.
+    Bearish OB: last bullish candle before a bearish BOS/CHoCH.
+
+    Returns DataFrame with columns: OB (+1/-1/NaN), Top, Bottom,
+    OBVolume, MitigatedIndex, Percentage.
+    """
+    high = ohlc["high"].values.astype(float)
+    low = ohlc["low"].values.astype(float)
+    close = ohlc["close"].values.astype(float)
+    open_ = ohlc["open"].values.astype(float)
+    volume = ohlc["volume"].values.astype(float)
+    n = len(high)
+
+    ob_type = np.full(n, np.nan)
+    ob_top = np.full(n, np.nan, dtype=np.float32)
+    ob_bottom = np.full(n, np.nan, dtype=np.float32)
+    ob_vol = np.full(n, np.nan, dtype=np.float32)
+    ob_mitigated = np.full(n, np.nan)
+    ob_pct = np.full(n, np.nan, dtype=np.float32)
+
+    bos_vals = bos_choch["BOS"].values
+    choch_vals = bos_choch["CHOCH"].values
+
+    for i in range(1, n):
+        # Detect bullish or bearish break
+        bull_break = (not np.isnan(bos_vals[i]) and bos_vals[i] > 0) or \
+                     (not np.isnan(choch_vals[i]) and choch_vals[i] > 0)
+        bear_break = (not np.isnan(bos_vals[i]) and bos_vals[i] < 0) or \
+                     (not np.isnan(choch_vals[i]) and choch_vals[i] < 0)
+
+        if bull_break:
+            # Find last bearish candle before this bar
+            for j in range(i - 1, max(i - 20, -1), -1):
+                if close[j] < open_[j]:  # bearish candle
+                    ob_type[j] = 1.0
+                    ob_top[j] = np.float32(high[j])
+                    ob_bottom[j] = np.float32(low[j])
+                    ob_vol[j] = np.float32(volume[j])
+                    body = abs(close[j] - open_[j])
+                    wick = high[j] - low[j]
+                    ob_pct[j] = np.float32(body / wick * 100 if wick > 0 else 0)
+                    break
+        elif bear_break:
+            # Find last bullish candle before this bar
+            for j in range(i - 1, max(i - 20, -1), -1):
+                if close[j] > open_[j]:  # bullish candle
+                    ob_type[j] = -1.0
+                    ob_top[j] = np.float32(high[j])
+                    ob_bottom[j] = np.float32(low[j])
+                    ob_vol[j] = np.float32(volume[j])
+                    body = abs(close[j] - open_[j])
+                    wick = high[j] - low[j]
+                    ob_pct[j] = np.float32(body / wick * 100 if wick > 0 else 0)
+                    break
+
+    # Track mitigation
+    active_obs: list[tuple[int, float, float, float]] = []
+    for i in range(n):
+        if not np.isnan(ob_type[i]):
+            active_obs.append((i, ob_type[i], float(ob_top[i]), float(ob_bottom[i])))
+        still_active = []
+        for (oidx, otype, otop, obot) in active_obs:
+            if np.isnan(ob_mitigated[oidx]):
+                # Bullish OB mitigated when price drops below bottom
+                if otype > 0 and low[i] < obot:
+                    ob_mitigated[oidx] = float(i)
+                # Bearish OB mitigated when price rises above top
+                elif otype < 0 and high[i] > otop:
+                    ob_mitigated[oidx] = float(i)
+                else:
+                    still_active.append((oidx, otype, otop, obot))
+        active_obs = still_active
+
+    return pd.DataFrame({
+        "OB": ob_type, "Top": ob_top, "Bottom": ob_bottom,
+        "OBVolume": ob_vol, "MitigatedIndex": ob_mitigated, "Percentage": ob_pct,
+    }, index=ohlc.index)
+
+
+def _causal_liquidity(
+    ohlc: pd.DataFrame, swing_hl: pd.DataFrame,
+    range_percent: float = 0.005,
+) -> pd.DataFrame:
+    """
+    Causal liquidity detection — unswept swing highs/lows.
+
+    Liquidity pools form at swing highs (sell-side) and swing lows (buy-side).
+    They are "swept" when price trades through them.
+
+    Returns DataFrame with columns: Liquidity (+1/-1/NaN), Level, End, Swept.
+    """
+    high = ohlc["high"].values.astype(float)
+    low = ohlc["low"].values.astype(float)
+    n = len(high)
+
+    liq_type = np.full(n, np.nan, dtype=np.float32)
+    liq_level = np.full(n, np.nan, dtype=np.float32)
+    liq_end = np.full(n, np.nan, dtype=np.float32)
+    liq_swept = np.full(n, np.nan, dtype=np.float32)
+
+    hl_vals = swing_hl["HighLow"].values
+    lvl_vals = swing_hl["Level"].values
+
+    # Track active liquidity levels
+    active_levels: list[tuple[int, float, float]] = []  # (idx, type, price)
+
+    for i in range(n):
+        # Register new liquidity at swing points
+        if not np.isnan(hl_vals[i]) and not np.isnan(lvl_vals[i]):
+            if hl_vals[i] > 0:
+                # Sell-side liquidity above swing high
+                liq_type[i] = np.float32(1.0)
+                liq_level[i] = np.float32(lvl_vals[i])
+                active_levels.append((i, 1.0, float(lvl_vals[i])))
+            elif hl_vals[i] < 0:
+                # Buy-side liquidity below swing low
+                liq_type[i] = np.float32(-1.0)
+                liq_level[i] = np.float32(lvl_vals[i])
+                active_levels.append((i, -1.0, float(lvl_vals[i])))
+
+        # Check sweeps
+        still_active = []
+        for (lidx, ltype, lprice) in active_levels:
+            swept = False
+            if ltype > 0 and high[i] > lprice * (1 + range_percent):
+                swept = True
+            elif ltype < 0 and low[i] < lprice * (1 - range_percent):
+                swept = True
+            if swept:
+                liq_swept[lidx] = np.float32(1.0)
+                liq_end[lidx] = np.float32(i)
+            else:
+                still_active.append((lidx, ltype, lprice))
+        active_levels = still_active
+
+    return pd.DataFrame({
+        "Liquidity": liq_type, "Level": liq_level,
+        "End": liq_end, "Swept": liq_swept,
+    }, index=ohlc.index)
+
+
+def compute_smc_indicators_causal(
+    df: pd.DataFrame,
+    swing_length: int = 8,
+    fvg_threshold: float = 0.0004,
+    ob_lookback: int = 15,
+    liq_range_pct: float = 0.005,
+) -> dict[str, Any]:
+    """
+    Compute all SMC indicators using CAUSAL implementations only.
+
+    Drop-in replacement for compute_smc_indicators() — same output structure,
+    same column names, but NO future data used.
+    """
+    ohlc = _to_ohlc(df)
+    results: dict[str, Any] = {}
+
+    # Swing Highs / Lows (causal)
+    swing_hl = _causal_swing_highs_lows(ohlc, swing_length=swing_length)
+    results["swing_highs_lows"] = swing_hl
+
+    # FVG (causal)
+    results["fvg"] = _causal_fvg(ohlc)
+
+    # BOS/CHoCH (causal, from causal swings)
+    bos_choch = _causal_bos_choch(ohlc, swing_hl)
+    results["bos_choch"] = bos_choch
+
+    # Order Blocks (causal, from causal BOS/CHoCH)
+    results["order_blocks"] = _causal_ob(ohlc, swing_hl, bos_choch)
+
+    # Liquidity (causal, from causal swings)
+    results["liquidity"] = _causal_liquidity(ohlc, swing_hl, range_percent=liq_range_pct)
+
+    return results
+
+
 def compute_smc_indicators(
     df: pd.DataFrame,
     swing_length: int = 8,
@@ -1329,7 +1699,7 @@ class SMCMultiStyleStrategy:
             if df.empty or len(df) < self.swing_length * 2:
                 continue
             try:
-                indicators[tf] = compute_smc_indicators(
+                indicators[tf] = compute_smc_indicators_causal(
                     df,
                     swing_length=self.swing_length,
                     fvg_threshold=self.fvg_threshold,

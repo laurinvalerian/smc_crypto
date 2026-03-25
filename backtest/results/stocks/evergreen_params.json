@@ -1,37 +1,42 @@
 {
   "asset_class": "stocks",
   "params": {
-    "alignment_threshold": 0.9,
-    "risk_reward": 2.0,
-    "leverage": 3.0,
-    "risk_per_trade": 0.01
+    "alignment_threshold": 0.85,
+    "risk_reward": 2.5,
+    "leverage": 1,
+    "risk_per_trade": 0.015,
+    "be_ratchet_r": 1.0,
+    "timeout_rr_threshold": 0.3,
+    "max_hold_bars": 288
   },
   "cross_window_metrics": {
     "w0": {
-      "pf_real": 17.29706714359763,
-      "winrate_real": 0.7692307692307693,
-      "trades": 33,
-      "dd": -0.014094110439704183,
-      "sharpe": 14.301205633629186
+      "pf_real": 9.0963255154825,
+      "winrate_real": 0.7,
+      "trades": 13,
+      "dd": -0.03978568721276599,
+      "sharpe": 11.841205928347796
     },
     "w1": {
-      "pf_real": 13.199637259487291,
-      "winrate_real": 0.7058823529411765,
-      "trades": 42,
-      "dd": -0.03024128597975345,
-      "sharpe": 12.516870957958108
+      "pf_real": 4.938749704244395,
+      "winrate_real": 0.6,
+      "trades": 18,
+      "dd": -0.0252172280341144,
+      "sharpe": 7.755683704663865
     },
     "w2": {
-      "pf_real": 6.23631042051552,
-      "winrate_real": 0.5384615384615384,
-      "trades": 35,
-      "dd": -0.06734241980066619,
-      "sharpe": 7.790107154905381
+      "pf_real": 3.4474902276081827,
+      "winrate_real": 0.4,
+      "trades": 12,
+      "dd": -0.02510653715500724,
+      "sharpe": 4.226416000492324
     }
   },
-  "min_pf": 6.23631042051552,
-  "mean_pf": 12.244338274533481,
+  "min_pf": 3.4474902276081827,
+  "mean_pf": 5.827521815778359,
   "is_evergreen": true,
-  "n_candidates_tested": 19,
-  "n_evergreen_found": 19
+  "confidence": "medium",
+  "n_candidates_tested": 3024,
+  "n_evergreen_found": 576,
+  "warnings": []
 }

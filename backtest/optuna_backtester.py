@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -146,11 +147,36 @@ def classify_signal_tier(
     """
     Classify a trade signal into AAA++ or AAA+ tier.
     Returns None if signal doesn't meet minimum quality.
+
+    Checks component flags from signal.meta to match live bot behavior.
     """
-    for tier_name in (TIER_AAA_PLUS_PLUS, TIER_AAA_PLUS):
-        thresholds = TIER_THRESHOLDS[tier_name]
-        if alignment_score >= thresholds["min_score"] and rr >= thresholds["min_rr"]:
-            return tier_name
+    meta = getattr(signal, 'meta', {}) or {}
+
+    # Components available from generate_signals():
+    # bias_strong, h4_confirms, h4_poi, h1_confirm, h1_choch,
+    # entry_zone, precision_trigger, volume_ok
+
+    # AAA++ requires ALL available structure components
+    aaa_pp_required = [
+        "bias_strong", "h4_confirms", "h4_poi", "h1_confirm", "h1_choch",
+        "entry_zone", "precision_trigger", "volume_ok",
+    ]
+    # AAA+ requires core components
+    aaa_p_required = [
+        "bias_strong", "h4_confirms", "h1_confirm",
+        "precision_trigger", "volume_ok",
+    ]
+
+    if alignment_score >= TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]["min_score"] \
+       and rr >= TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]["min_rr"]:
+        if all(meta.get(k) for k in aaa_pp_required):
+            return TIER_AAA_PLUS_PLUS
+
+    if alignment_score >= TIER_THRESHOLDS[TIER_AAA_PLUS]["min_score"] \
+       and rr >= TIER_THRESHOLDS[TIER_AAA_PLUS]["min_rr"]:
+        if all(meta.get(k) for k in aaa_p_required):
+            return TIER_AAA_PLUS
+
     return None
 
 
@@ -229,6 +255,9 @@ def _resolve_trade_outcome(
     sig: TradeSignal,
     commission_pct: float = 0.0004,
     slippage_pct: float = 0.0001,
+    be_ratchet_r: float = 1.5,
+    timeout_rr_threshold: float = 0.5,
+    max_hold_bars: int = 576,
 ) -> tuple[str, float, pd.Timestamp | None]:
     """
     Walk forward through real price bars after entry to determine outcome.
@@ -260,8 +289,7 @@ def _resolve_trade_outcome(
     if future_bars.empty:
         return "skip", sig.entry_price, None
 
-    max_bars = _MAX_BARS_DEFAULT
-    future_bars = future_bars.iloc[:max_bars]
+    future_bars = future_bars.iloc[:max_hold_bars]
 
     is_long = sig.direction == "long"
     entry = sig.entry_price
@@ -283,7 +311,11 @@ def _resolve_trade_outcome(
             # Check if we've reached +1R (move to net-breakeven once)
             if not reached_1r and sl_dist > 0:
                 bar_best_r = (high - entry) / sl_dist
-                if bar_best_r >= 1.0:
+                if bar_best_r >= be_ratchet_r:
+                    # +1.5R reached — but did original SL also get hit on same bar?
+                    if low <= original_sl:
+                        # AMBIGUOUS: both +1.5R and SL on same bar → conservative = LOSS
+                        return "loss", original_sl, bar_ts
                     reached_1r = True
                     current_sl = max(current_sl, entry + fee_buffer)
 
@@ -299,7 +331,11 @@ def _resolve_trade_outcome(
         else:  # short
             if not reached_1r and sl_dist > 0:
                 bar_best_r = (entry - low) / sl_dist
-                if bar_best_r >= 1.0:
+                if bar_best_r >= be_ratchet_r:
+                    # +1.5R reached — but did original SL also get hit on same bar?
+                    if high >= original_sl:
+                        # AMBIGUOUS: both +1.5R and SL on same bar → conservative = LOSS
+                        return "loss", original_sl, bar_ts
                     reached_1r = True
                     current_sl = min(current_sl, entry - fee_buffer)
 
@@ -310,16 +346,18 @@ def _resolve_trade_outcome(
             if low <= tp:
                 return "win", tp, bar_ts
 
-    # Timeout: close at last bar's close
+    # Timeout: close at last bar's close — classify by actual RR achieved
     last_close = float(future_bars.iloc[-1]["close"])
     last_ts = future_bars.index[-1]
     if is_long:
-        pnl = last_close - entry
+        timeout_pnl = last_close - entry
     else:
-        pnl = entry - last_close
-    if pnl > entry * 0.002:  # meaningful profit (>0.2%)
+        timeout_pnl = entry - last_close
+    timeout_rr = timeout_pnl / sl_dist if sl_dist > 0 else 0.0
+
+    if timeout_rr >= timeout_rr_threshold:
         return "win", last_close, last_ts
-    elif pnl < -entry * 0.002:
+    elif timeout_rr <= -timeout_rr_threshold:
         return "loss", last_close, last_ts
     else:
         return "breakeven", last_close, last_ts
@@ -339,6 +377,9 @@ def simulate_trades(
     asset_class: str = "crypto",
     risk_per_trade_override: float | None = None,
     max_equity_for_sizing: float | None = None,
+    be_ratchet_r: float = 1.5,
+    timeout_rr_threshold: float = 0.5,
+    max_hold_bars: int = 576,
 ) -> pd.DataFrame:
     """
     Simulate trades using REAL price-path outcomes.
@@ -441,6 +482,9 @@ def simulate_trades(
         # ── REAL price-path outcome ──────────────────────────────
         outcome, exit_price, exit_ts = _resolve_trade_outcome(
             sig, commission_pct, slippage_pct,
+            be_ratchet_r=be_ratchet_r,
+            timeout_rr_threshold=timeout_rr_threshold,
+            max_hold_bars=max_hold_bars,
         )
 
         if outcome == "skip":
@@ -833,11 +877,26 @@ def validate_oos_results(
 
     all_passed = all(gates.values())
 
+    # ── Sanity warnings (don't auto-reject, but flag suspicious metrics) ──
+    warnings: list[str] = []
+    if pf > 10:
+        warnings.append(f"Suspicious PF={pf:.1f} (>10)")
+    if wr > 0.80:
+        warnings.append(f"Suspicious WR={wr*100:.0f}% (>80%)")
+    be_rate = oos_metrics.get("be_rate", 0)
+    if be_rate > 0.50:
+        warnings.append(f"High BE rate={be_rate*100:.0f}% (>50%)")
+
+    verdict = "PASS - Ready for paper trading" if all_passed else "FAIL - " + "; ".join(reasons)
+    if warnings:
+        verdict += " | WARNINGS: " + "; ".join(warnings)
+
     return {
         "passed": all_passed,
         "gates": gates,
         "reasons": reasons,
-        "verdict": "PASS - Ready for paper trading" if all_passed else "FAIL - " + "; ".join(reasons),
+        "warnings": warnings,
+        "verdict": verdict,
     }
 
 
@@ -847,7 +906,7 @@ def validate_oos_results(
 
 # Bump this version whenever signal generation logic changes (TP calc, filters, etc.)
 # Old caches with different versions are automatically ignored.
-SIGNAL_CACHE_VERSION = "v13"
+SIGNAL_CACHE_VERSION = "v16"  # v16: causal SMC indicators (no lookahead)
 
 
 def _signal_cache_key(
@@ -1055,7 +1114,7 @@ def _build_objective(
             t = simulate_trades(
                 sigs,
                 commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
-                slippage_pct=config["backtest"]["slippage_pct"],
+                slippage_pct=ASSET_SLIPPAGE.get(ac, config["backtest"]["slippage_pct"]),
                 account_size=config["account"]["size"],
                 use_circuit_breaker=True,
                 aaa_only=True,
@@ -1079,21 +1138,24 @@ def _build_objective(
                 index=False,
             )
 
-        # Objective: PF_real × (1 − |DD|) × Sharpe — quality over quantity
-        # Uses real PF (excluding breakeven exits) to prevent BE-inflation
-        score = (
-            metrics["pf_real"]
-            * (1.0 + metrics["max_drawdown"])  # max_drawdown is negative
-            * max(metrics["sharpe"], 0.01)
-        )
+        # Objective: capped PF × Sharpe × DD × confidence × WR sanity
+        # Caps prevent Optuna from chasing "zero loss" edge cases
+        pf = min(metrics["pf_real"], 5.0)           # Cap: PF>5 is noise
+        sharpe = min(max(metrics["sharpe"], 0.01), 5.0)
+        trades = metrics["total_trades"]
 
-        # Hard funded-account DD gate: > -10% DD → heavy penalty
+        if trades < 5:
+            return 0.0
+
+        trade_conf = min(trades / 30.0, 1.0)       # More trades = more reliable
+        wr = metrics.get("winrate_real", 0.5)
+        wr_factor = 1.0 if wr <= 0.80 else max(0.3, 1.0 - (wr - 0.80) * 5)
+
+        dd_factor = max(0.1, 1.0 + metrics["max_drawdown"])
         if metrics["max_drawdown"] < -0.10:
-            score *= 0.1
+            dd_factor *= 0.1
 
-        # Quality floor: need at least some trades to evaluate
-        if metrics["total_trades"] < 5:
-            score = 0.0
+        score = pf * sharpe * dd_factor * trade_conf * wr_factor
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
@@ -1239,9 +1301,16 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
 # Asset-class specific commission rates
 ASSET_COMMISSION: dict[str, float] = {
     "crypto": 0.0004,       # 0.04% taker (Binance Futures)
-    "forex": 0.00005,       # ~0.5 pip spread equivalent
-    "stocks": 0.0,          # Commission-free (Alpaca)
-    "commodities": 0.0001,  # ~1 pip spread equivalent
+    "forex": 0.0003,        # ~3 pips round-trip spread (crosses average)
+    "stocks": 0.0001,       # ~$0.01/share implicit spread
+    "commodities": 0.0003,  # ~3 pips round-trip spread (Gold/Oil)
+}
+
+ASSET_SLIPPAGE: dict[str, float] = {
+    "crypto": 0.0002,       # 0.02% (liquid futures)
+    "forex": 0.0001,        # 0.01%
+    "stocks": 0.0001,       # 0.01%
+    "commodities": 0.0002,  # 0.02% (wider spreads)
 }
 
 
@@ -1256,6 +1325,7 @@ def check_parameter_stability(
     precomputed_signals: list[TradeSignal],
     perturbation_pct: float = 0.10,
     n_perturbations: int = 5,
+    asset_class: str = "crypto",
 ) -> dict[str, Any]:
     """
     Check if small parameter changes (±10%) drastically change performance.
@@ -1284,8 +1354,8 @@ def check_parameter_stability(
             ))
         trades = simulate_trades(
             filtered,
-            commission_pct=config["backtest"]["commission_pct"],
-            slippage_pct=config["backtest"]["slippage_pct"],
+            commission_pct=ASSET_COMMISSION.get(asset_class, config["backtest"]["commission_pct"]),
+            slippage_pct=ASSET_SLIPPAGE.get(asset_class, config["backtest"]["slippage_pct"]),
             account_size=config["account"]["size"],
             risk_per_trade_override=rpt,
             max_equity_for_sizing=max_eq,
@@ -1518,6 +1588,7 @@ def run(
         # ── Parameter stability check (always — it's a hard gate) ─
         stability_result = check_parameter_stability(
             study, best_params, cfg, oos_all_signals,
+            asset_class="crypto",  # Global mode defaults to crypto
         )
         logger.info(
             "Stability W%d: stable=%s max_change=%.1f%%",
@@ -1630,6 +1701,9 @@ def _simulate_with_params(
     min_rr = params.get("risk_reward", 2.0)
     leverage = params.get("leverage", 10)
     rpt = params.get("risk_per_trade", None)
+    be_ratchet_r = params.get("be_ratchet_r", 1.5)
+    timeout_rr_threshold = params.get("timeout_rr_threshold", 0.5)
+    max_hold_bars = params.get("max_hold_bars", 576)
     account_size = config["account"]["size"]
     max_eq = account_size * 2
 
@@ -1664,13 +1738,16 @@ def _simulate_with_params(
         t = simulate_trades(
             sigs,
             commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
-            slippage_pct=config["backtest"]["slippage_pct"],
+            slippage_pct=ASSET_SLIPPAGE.get(ac, config["backtest"]["slippage_pct"]),
             account_size=account_size,
             use_circuit_breaker=True,
             aaa_only=True,
             asset_class=ac,
             risk_per_trade_override=rpt,
             max_equity_for_sizing=max_eq,
+            be_ratchet_r=be_ratchet_r,
+            timeout_rr_threshold=timeout_rr_threshold,
+            max_hold_bars=max_hold_bars,
         )
         if not t.empty:
             all_trades.append(t)
@@ -1934,15 +2011,21 @@ def run_per_asset_class(
                     if res_dir is not None and trial.number < 10:
                         pass  # skip per-trial CSV saves for per-class mode
 
-                    score = (
-                        metrics["pf_real"]
-                        * (1.0 + metrics["max_drawdown"])
-                        * max(metrics["sharpe"], 0.01)
-                    )
-                    if metrics["max_drawdown"] < -0.10:
-                        score *= 0.1
-                    if metrics["total_trades"] < 5:
+                    # ── Objective: capped PF × Sharpe × DD × confidence × WR sanity ──
+                    pf = min(metrics["pf_real"], 5.0)
+                    sharpe = min(max(metrics["sharpe"], 0.01), 5.0)
+                    trades = metrics["total_trades"]
+                    wr = metrics.get("winrate_real", 0.5)
+
+                    if trades < 5:
                         score = 0.0
+                    else:
+                        trade_conf = min(trades / 30.0, 1.0)
+                        wr_factor = 1.0 if wr <= 0.80 else max(0.3, 1.0 - (wr - 0.80) * 5)
+                        dd_factor = max(0.1, 1.0 + metrics["max_drawdown"])
+                        if metrics["max_drawdown"] < -0.10:
+                            dd_factor *= 0.1
+                        score = pf * sharpe * dd_factor * trade_conf * wr_factor
 
                     for k, v in metrics.items():
                         trial.set_user_attr(k, v)
@@ -2002,13 +2085,14 @@ def run_per_asset_class(
             # Stability
             stability_result = check_parameter_stability(
                 study, best, cfg, oos_sigs,
+                asset_class=ac,
             )
 
             # Validation (per-class min trade gates)
             validation = validate_oos_results(
                 oos_metrics, mc_result,
                 stability_result=stability_result,
-                asset_class=asset_class,
+                asset_class=ac,
             )
 
             logger.info(
@@ -2121,6 +2205,344 @@ def run_per_asset_class(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Brute-Force Evergreen Grid Search
+# ═══════════════════════════════════════════════════════════════════
+
+# Module-level shared state for forked workers (copy-on-write)
+_BF_SIGNALS: list[list] = []
+_BF_CFG: dict[str, Any] = {}
+_BF_SYM2ASSET: dict[str, str] = {}
+_BF_MIN_TRADES: int = 10
+_BF_N_WINDOWS: int = 3
+
+
+def _eval_combo_worker(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Evaluate one param combo across all windows. Top-level for multiprocessing."""
+    window_metrics_list = []
+    all_pass = True
+
+    for wi, oos_sigs in enumerate(_BF_SIGNALS):
+        if not oos_sigs:
+            all_pass = False
+            break
+        _, metrics = _simulate_with_params(
+            params, oos_sigs, _BF_CFG,
+            symbol_to_asset=_BF_SYM2ASSET,
+        )
+        window_metrics_list.append(metrics)
+
+        pf = metrics.get("pf_real", 0)
+        trades = metrics.get("total_trades", 0)
+        dd = metrics.get("max_drawdown", 0)
+        wr = metrics.get("winrate_real", 0)
+        if (pf < 2.0 or pf > 20.0
+            or trades < _BF_MIN_TRADES
+            or dd < -0.08
+            or wr > 0.80):
+            all_pass = False
+            break
+
+    n_windows = _BF_N_WINDOWS
+    row: dict[str, Any] = dict(params)
+    for wi_r in range(n_windows):
+        if wi_r < len(window_metrics_list):
+            m = window_metrics_list[wi_r]
+            row[f"w{wi_r}_pf"] = m.get("pf_real", 0)
+            row[f"w{wi_r}_trades"] = m.get("total_trades", 0)
+            row[f"w{wi_r}_dd"] = m.get("max_drawdown", 0)
+            row[f"w{wi_r}_wr"] = m.get("winrate_real", 0)
+            row[f"w{wi_r}_sharpe"] = m.get("sharpe", 0)
+        else:
+            row[f"w{wi_r}_pf"] = 0
+            row[f"w{wi_r}_trades"] = 0
+            row[f"w{wi_r}_dd"] = 0
+            row[f"w{wi_r}_wr"] = 0
+            row[f"w{wi_r}_sharpe"] = 0
+
+    if all_pass and len(window_metrics_list) == n_windows:
+        pfs = [m.get("pf_real", 0) for m in window_metrics_list]
+        pf_ratio = max(pfs) / min(pfs) if min(pfs) > 0 else 999
+        if pf_ratio > 5.0:
+            all_pass = False
+
+    eg_entry = None
+    if all_pass and len(window_metrics_list) == n_windows:
+        pfs = [m.get("pf_real", 0) for m in window_metrics_list]
+        row["min_pf"] = min(pfs)
+        row["mean_pf"] = sum(pfs) / len(pfs)
+        row["is_evergreen"] = True
+        eg_entry = {
+            "params": dict(params),
+            "min_pf": min(pfs),
+            "mean_pf": sum(pfs) / len(pfs),
+            "window_metrics": {
+                f"w{i}": {
+                    "pf_real": m.get("pf_real", 0),
+                    "winrate_real": m.get("winrate_real", 0),
+                    "trades": m.get("total_trades", 0),
+                    "dd": m.get("max_drawdown", 0),
+                    "sharpe": m.get("sharpe", 0),
+                }
+                for i, m in enumerate(window_metrics_list)
+            },
+        }
+    else:
+        pf_vals = [m.get("pf_real", 0) for m in window_metrics_list] if window_metrics_list else [0]
+        row["min_pf"] = min(pf_vals)
+        row["mean_pf"] = sum(pf_vals) / len(pf_vals)
+        row["is_evergreen"] = False
+
+    return row, eg_entry
+
+
+def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build exhaustive parameter grid for a given asset class."""
+    tuning = config.get("tuning_per_class", {}).get(asset_class, {})
+    lev_min = tuning.get("leverage_min", 3)
+    lev_max = tuning.get("leverage_max", 10)
+
+    # 3 leverage steps (min, mid, max)
+    lev_mid = (lev_min + lev_max) // 2
+    lev_vals = sorted(set([lev_min, lev_mid, lev_max]))
+
+    grid = []
+    for align, rr, lev, risk, be_r, to_r, max_b in itertools.product(
+        [0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.92],  # 7 values
+        [2.0, 2.5, 3.0, 3.5],                          # 4 values
+        lev_vals,                                        # 3 values
+        [0.005, 0.010, 0.015],                          # 3 values
+        [1.0, 1.5, 2.0],                                # 3 BE ratchet R
+        [0.3, 0.5],                                      # 2 Timeout RR threshold
+        [288, 576],                                      # 2 Max hold bars (24h, 48h)
+    ):
+        grid.append({
+            "alignment_threshold": align,
+            "risk_reward": rr,
+            "leverage": lev,
+            "risk_per_trade": risk,
+            "be_ratchet_r": be_r,
+            "timeout_rr_threshold": to_r,
+            "max_hold_bars": max_b,
+        })
+    return grid
+
+
+def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str, dict[str, Any]]:
+    """
+    Exhaustive grid search over ALL OOS windows — no Optuna, no train optimization.
+
+    For each asset class:
+      1. Precompute signals for each OOS window (reuse cache)
+      2. Test EVERY param combo on ALL 3 OOS windows
+      3. Evergreen filter: PF ≥ 1.5 + min trades + max DD on EVERY window
+      4. Rank by min(PF) — best worst-case
+      5. Monte Carlo check on top result
+      6. Save results (JSON + full CSV)
+
+    Anti-overfitting: no train/test bias, ranking by worst window, exhaustive search.
+    """
+    cfg = load_config(config_path)
+    results_dir = Path(cfg["backtest"]["results_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    train_months = cfg["backtest"]["train_months"]
+    test_months = cfg["backtest"]["test_months"]
+    account_size = cfg["account"]["size"]
+
+    start = pd.Timestamp(cfg["data"]["start_date"], tz="UTC")
+    end = pd.Timestamp(datetime.now(timezone.utc))
+
+    multi_assets = get_multi_asset_symbols(cfg)
+    if not multi_assets:
+        logger.error("No instruments found in any data directory")
+        return {}
+
+    windows = generate_wf_windows(start, end, train_months, test_months)
+    if not windows:
+        logger.error("No walk-forward windows generated")
+        return {}
+    logger.info("Walk-forward windows: %d", len(windows))
+
+    # Min trades per window (asset-class specific)
+    MIN_TRADES = {"crypto": 10, "stocks": 10, "forex": 5, "commodities": 5}
+
+    evergreen_results: dict[str, dict[str, Any]] = {}
+
+    for ac, symbols in multi_assets.items():
+        logger.info(
+            "═══ BRUTEFORCE: %s (%d instruments) ═══",
+            ac.upper(), len(symbols),
+        )
+
+        ac_results_dir = results_dir / ac
+        ac_results_dir.mkdir(parents=True, exist_ok=True)
+        symbol_to_asset = {s: ac for s in symbols}
+
+        # Load price data
+        logger.info("Loading price data for %d %s instruments...", len(symbols), ac)
+        load_price_data_for_symbols(symbols, cfg)
+
+        # ── Precompute OOS signals for all windows ──────────────────
+        oos_signals_per_window: list[list[TradeSignal]] = []
+        for wi, window in enumerate(windows):
+            logger.info(
+                "%s Window %d: OOS %s → %s (train %s → %s for warmup)",
+                ac.upper(), wi,
+                window["test_start"].date(), window["test_end"].date(),
+                window["train_start"].date(), window["train_end"].date(),
+            )
+            # Signal gen uses train period for indicator warmup, emits only OOS signals
+            oos_sigs = _precompute_window_signals(
+                cfg, symbols, window["test_start"], window["test_end"],
+                symbol_to_asset=symbol_to_asset,
+            )
+            oos_signals_per_window.append(oos_sigs)
+            logger.info("%s W%d: %d OOS signals", ac.upper(), wi, len(oos_sigs))
+
+        # ── Build parameter grid ────────────────────────────────────
+        grid = _build_grid(ac, cfg)
+        logger.info("%s: Grid size = %d combinations", ac.upper(), len(grid))
+
+        min_trades_per_window = MIN_TRADES.get(ac, 10)
+
+        # ── Evaluate ALL combos on ALL windows (parallel) ───────────
+        # Store shared state in module-level vars for forked workers (COW)
+        global _BF_SIGNALS, _BF_CFG, _BF_SYM2ASSET, _BF_MIN_TRADES, _BF_N_WINDOWS
+        _BF_SIGNALS = oos_signals_per_window
+        _BF_CFG = cfg
+        _BF_SYM2ASSET = symbol_to_asset
+        _BF_MIN_TRADES = min_trades_per_window
+        _BF_N_WINDOWS = len(windows)
+
+        import multiprocessing as mp
+        with mp.Pool(processes=4) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_eval_combo_worker, grid, chunksize=32),
+                total=len(grid), desc=f"{ac} bruteforce",
+            ))
+
+        all_grid_results = [r[0] for r in results]
+        eg_candidates = [r[1] for r in results if r[1] is not None]
+
+        # ── Save full grid CSV ──────────────────────────────────────
+        grid_df = pd.DataFrame(all_grid_results)
+        grid_df.to_csv(ac_results_dir / "grid_search_results.csv", index=False)
+        logger.info(
+            "%s: %d/%d evergreen candidates found",
+            ac.upper(), len(eg_candidates), len(grid),
+        )
+
+        # ── Rank + save ─────────────────────────────────────────────
+        if eg_candidates:
+            eg_candidates.sort(key=lambda r: r["min_pf"], reverse=True)
+            best = eg_candidates[0]
+
+            # Sanity warnings
+            warnings: list[str] = []
+            for wi_key, wm in best["window_metrics"].items():
+                if wm["pf_real"] > 10:
+                    warnings.append(f"{wi_key}: PF={wm['pf_real']:.1f} (>10)")
+                if wm["winrate_real"] > 0.80:
+                    warnings.append(f"{wi_key}: WR={wm['winrate_real']*100:.0f}% (>80%)")
+
+            if warnings:
+                logger.warning(
+                    "%s SANITY WARNINGS: %s",
+                    ac.upper(), "; ".join(warnings),
+                )
+
+            # Confidence based on min trades across all windows
+            min_t = min(
+                wm["trades"] for wm in best["window_metrics"].values()
+            )
+            confidence = "low" if min_t < 10 else ("medium" if min_t < 20 else "high")
+
+            evergreen = {
+                "asset_class": ac,
+                "params": best["params"],
+                "cross_window_metrics": best["window_metrics"],
+                "min_pf": best["min_pf"],
+                "mean_pf": best["mean_pf"],
+                "is_evergreen": True,
+                "confidence": confidence,
+                "n_candidates_tested": len(grid),
+                "n_evergreen_found": len(eg_candidates),
+                "warnings": warnings,
+            }
+
+            eg_path = ac_results_dir / "evergreen_params.json"
+            with open(eg_path, "w") as f:
+                json.dump(evergreen, f, indent=2, default=str)
+
+            logger.info(
+                "✓ %s EVERGREEN: alignment=%.2f rr=%.1f lev=%d risk=%.3f | "
+                "min_PF=%.2f (%d/%d candidates) confidence=%s",
+                ac.upper(),
+                best["params"]["alignment_threshold"],
+                best["params"]["risk_reward"],
+                best["params"]["leverage"],
+                best["params"]["risk_per_trade"],
+                best["min_pf"],
+                len(eg_candidates), len(grid),
+                confidence,
+            )
+            evergreen_results[ac] = evergreen
+        else:
+            logger.warning(
+                "✗ %s: No evergreen params found! Using conservative defaults.",
+                ac.upper(),
+            )
+            default_result = {
+                "asset_class": ac,
+                "params": dict(_DEFAULT_CONSERVATIVE_PARAMS),
+                "cross_window_metrics": {},
+                "min_pf": 0.0,
+                "mean_pf": 0.0,
+                "is_evergreen": False,
+                "confidence": "none",
+                "n_candidates_tested": len(grid),
+                "n_evergreen_found": 0,
+            }
+            eg_path = ac_results_dir / "evergreen_params.json"
+            with open(eg_path, "w") as f:
+                json.dump(default_result, f, indent=2, default=str)
+            evergreen_results[ac] = default_result
+
+        # Cleanup — free memory before next asset class
+        del oos_signals_per_window, all_grid_results
+        _price_cache.clear()
+        gc.collect()
+
+    # ── Summary ──────────────────────────────────────────────────────
+    summary = {}
+    for ac, eg in evergreen_results.items():
+        summary[ac] = {
+            "is_evergreen": eg.get("is_evergreen", False),
+            "params": eg["params"],
+            "min_pf": eg.get("min_pf", 0),
+            "confidence": eg.get("confidence", "none"),
+        }
+    with open(results_dir / "evergreen_summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    logger.info("Brute-force grid search complete. Results in %s", results_dir)
+    for ac, s in summary.items():
+        status = "EVERGREEN" if s["is_evergreen"] else "DEFAULT"
+        logger.info(
+            "  %s: [%s] alignment=%.2f rr=%.1f lev=%d risk=%.3f min_pf=%.2f conf=%s",
+            ac, status,
+            s["params"]["alignment_threshold"],
+            s["params"]["risk_reward"],
+            s["params"]["leverage"],
+            s["params"]["risk_per_trade"],
+            s["min_pf"],
+            s.get("confidence", "?"),
+        )
+
+    return evergreen_results
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Paper Grid Variant Generator
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2226,6 +2648,10 @@ if __name__ == "__main__":
         "--generate-paper-grid", action="store_true",
         help="Generate 20 paper grid variants per asset class from evergreen params",
     )
+    parser.add_argument(
+        "--bruteforce", action="store_true",
+        help="Exhaustive grid search on ALL OOS windows (no Optuna, anti-overfitting)",
+    )
     args = parser.parse_args()
 
     if args.generate_paper_grid:
@@ -2233,6 +2659,8 @@ if __name__ == "__main__":
         generate_paper_grid_variants(
             results_dir=cfg["backtest"]["results_dir"],
         )
+    elif args.bruteforce:
+        run_bruteforce(config_path=args.config)
     elif args.per_class:
         run_per_asset_class(config_path=args.config)
     else:

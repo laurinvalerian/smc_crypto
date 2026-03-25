@@ -720,6 +720,69 @@ Optuna findet Crypto 18x / Commodities 18x weil hoher Leverage Compound-Growth m
 
 **Signal-Cache bleibt gültig** — Fixes betreffen nur Simulation, nicht Signal-Generierung.
 
+### V14 Backtest-Ergebnisse (2026-03-25)
+
+| Klasse | Evergreen Params | W0 | W1 | W2 |
+|--------|-----------------|-----|-----|-----|
+| Crypto | align=0.85, rr=3.0, lev=11, risk=1.2% | PF=27.5, 43T, WR=88%, DD=-1.9% | PF=7.1, 58T, WR=64%, DD=-2.4% | PF=261, 31T, WR=88%, DD=-1.3% |
+| Forex | NO EVERGREEN (pf=0) | 1T (all BE) | 5T (all BE) | 20T (all BE) |
+| Stocks | align=0.90, rr=2.0, lev=3, risk=1.0% | PF=7.1, 22T, WR=62% | PF=7.7, 28T, WR=60% | PF=5.3, 26T, WR=50% |
+| Commodities | NO EVERGREEN | 3T | 10T, PF=5.6 | 4T |
+
+**Hauptproblem**: PF immer noch zu hoch (7-261). 3 Root Causes identifiziert:
+1. BE-Ratchet bei +1R zu leicht erreichbar (36-48% BE-Rate)
+2. Timeout-Trades alle als "breakeven" klassifiziert (Forex: 100% BE → pf_real=0)
+3. Objective uncapped → Optuna optimiert für "null Verluste"
+
+### V15 Fixes (2026-03-25) — Realistischere Metriken + Anti-Overfitting
+
+**4 Fixes implementiert:**
+
+1. **BE-Ratchet von +1R auf +1.5R angehoben**: Trade braucht jetzt 1.5R Profit bevor SL auf Breakeven verschoben wird. +1R war zu leicht durch normale Volatilität erreichbar. Reduziert BE-Rate von 36-48% auf 11-36%.
+
+2. **Timeout-Klassifizierung nach tatsächlichem RR**: Statt alle Timeouts als "breakeven": ≥+0.5R → "win", ≤-0.5R → "loss", dazwischen → "breakeven". Forex bekommt endlich echte Win/Loss-Labels.
+
+3. **Optuna-Objective mit Caps + Sanity-Checks**:
+   - PF gekappt bei 5.0 (darüber ist Rauschen)
+   - Sharpe gekappt bei 5.0
+   - Trade-Confidence: linear skaliert bis 30 Trades
+   - WR-Penalty: >80% WR wird bestraft (zu gut für SMC)
+   - DD-Penalty: >-10% DD → 0.1x Faktor
+
+4. **Automatische Sanity-Warnings in Validation**: PF>10, WR>80%, BE-Rate>50% werden gewarnt (nicht abgelehnt). Sofort sichtbar im Log.
+
+**Signal-Cache bleibt gültig** — Fixes betreffen nur Simulation/Metriken.
+
+### V15 Backtest-Ergebnisse (2026-03-25)
+
+| Klasse | Evergreen Params | W0 | W1 | W2 | Verdict |
+|--------|-----------------|-----|-----|-----|---------|
+| Crypto | align=0.85, rr=3.0, lev=9, risk=1.1% | PF=14.2, 52T(36W/8BE/8L), WR=82%, DD=-1.7% | PF=12.0, 53T(27W/19BE/7L), WR=79%, DD=-2.2% | PF=466, 31T(22W/7BE/2L), WR=92%, DD=-0.5% | EVERGREEN min_pf=12.1 |
+| Forex | align=0.80, rr=3.0, lev=21, risk=1.5% | PF=100, 1T(1W) FAIL | PF=100, 5T(4W/1BE) FAIL | PF=100, 20T(13W/7BE) PASS | EVERGREEN* (UNZUVERLÄSSIG) |
+| Stocks | align=0.85, rr=2.0, lev=2, risk=1.0% | PF=13.7, 21T(13W/3BE/5L), WR=72%, DD=-0.6% | PF=7.4, 28T(15W/3BE/10L), WR=60%, DD=-3.8% | PF=6.4, 22T(9W/4BE/9L), WR=50%, DD=-0.6% | EVERGREEN min_pf=7.3 |
+| Commodities | DEFAULT | 3T(2W/1L) FAIL | 9T(4W/2BE/3L), PF=4.2 FAIL | 4T(3W/1L) FAIL | KEIN EVERGREEN |
+
+**V15 vs V14 Verbesserungen:**
+- BE-Rate: Crypto 36-48% → 15-36%, Stocks 23% → 11-18%
+- Forex: Hat jetzt echte Win-Labels (statt 100% BE), aber immer noch 0 Losses
+- Stocks W2: WR 50%, PF 6.4 — nähert sich realistischen Werten
+- Sanity-Warnings fangen verdächtige Metriken ab
+
+**Verbleibende Probleme:**
+- Crypto PF 12-466 IMMER NOCH zu hoch (realistisch wäre 2-5)
+- Forex 0 Losses auf ALLEN Windows (Timeout-Drift positiv → nur Wins)
+- Commodities zu wenige Instrumente/Trades (nur 4 auf OANDA)
+- **Root Cause**: Structure-based TP und SMC-Signalqualität erzeugen genuine hohes Win/Loss-Ratio. Ob das Overfitting oder realer Edge ist, kann nur Paper Trading zeigen.
+
+### BEWERTUNG: Paper-Trading-Readiness
+
+| Klasse | Ready? | Vertrauen | Begründung |
+|--------|--------|-----------|------------|
+| **Stocks** | JA | HOCH | PF 6.4-13.7, WR 50-72%, konservative Params (lev=2, risk=1%), sinkendes PF über Windows = kein Curve-Fit |
+| **Crypto** | JA (vorsichtig) | MITTEL | PF zu hoch (12+), aber konsistente Trades (31-53/Window), niedrige DD (<2.4%). Paper Trading wird zeigen ob real |
+| **Forex** | NEIN | NIEDRIG | 0 Losses auf 3 Windows = kein realer Edge nachgewiesen. SMC funktioniert nicht mit Tick-Volume |
+| **Commodities** | NEIN | NIEDRIG | Zu wenige Trades (3-9/Window) für statistische Signifikanz |
+
 ### Commodities-Entscheid: Bleiben bei 4
 
 OANDA Practice bietet nur 4 Rohstoff-CFDs: XAU_USD, XAG_USD, WTICO_USD, BCO_USD. Weitere (Platin, Palladium, Agrar) sind nicht verfügbar. Performance der 4 ist gut. Kein Handlungsbedarf.
@@ -735,15 +798,13 @@ OANDA Practice bietet nur 4 Rohstoff-CFDs: XAU_USD, XAG_USD, WTICO_USD, BCO_USD.
 8. **Zombie Prevention**: ✅ FERTIG — 3-Layer Schutz
 9. **Multi-Asset Live Bot**: ✅ FERTIG — 112 Instrumente, 3 Exchanges
 10. **Order Execution Migration**: ✅ FERTIG — alles über `self.adapter`
-11. **V13 Forex+SMC-Profile Fix**: ✅ FERTIG — 7 Code-Fixes implementiert + Backtest abgeschlossen
-12. **V14 Concurrent Position Fix**: ✅ FERTIG — 1 Position/Symbol, chronologische Sortierung, exit_timestamp Tracking
-13. **V14 Breakeven-Fee-Buffer Fix**: ✅ FERTIG — Fee-Buffer = tatsächliche Round-Trip-Kosten pro Asset-Klasse
-14. **V14 Leverage-Caps**: ✅ FERTIG — Crypto/Commodities max 10x, Forex max 20x
-15. **V14 Per-Class Min-Trade-Gates**: ✅ FERTIG — Forex/Commodities min 5 Trades, confidence Feld
-16. **V14 Backtest Rerun**: ⏳ Alle Klassen neu mit V14 Fixes
-17. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (nach V14 Rerun)
-18. **Paper Trading**: ⏳ 2 Wochen Demo mit V14-validierten Params
-19. **Live → Funded**: 3× Funded Accounts geplant
+11. **V13 Forex+SMC-Profile Fix**: ✅ FERTIG — 7 Code-Fixes implementiert
+12. **V14 Concurrent Position Fix**: ✅ FERTIG — 1 Position/Symbol + Fee-Buffer + Leverage-Caps
+13. **V15 Realistic Metrics**: ✅ FERTIG — BE +1.5R, Timeout-RR-Labels, Objective Caps, Sanity Warnings
+14. **V14+V15 Backtest Reruns**: ✅ FERTIG — Ergebnisse dokumentiert
+15. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (Stocks + Crypto zuerst)
+16. **Paper Trading**: ⏳ 2 Wochen Demo — Stocks (hoch) + Crypto (mittel), Forex/Commodities pausiert
+17. **Live → Funded**: 3× Funded Accounts geplant (erst nach Paper-Validierung)
 
 ## Testing & Anti-Overfitting
 

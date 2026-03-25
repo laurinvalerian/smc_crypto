@@ -54,3 +54,8 @@ rl_models/
 # Logs
 *.logbacktest/results/signal_cache/
 backtest/results/
+
+backtest/results/signal_cache/
+*.pkl
+*.h5
+*.parquet

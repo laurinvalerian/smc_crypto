@@ -130,7 +130,7 @@ tuning_per_class:
     leverage_max: 10     # Funded-account-safe (was 20)
   forex:
     leverage_min: 5
-    leverage_max: 20     # Conservative (was 30)
+    leverage_max: 15     # Conservative (was 20)
   stocks:
     leverage_min: 1
     leverage_max: 4

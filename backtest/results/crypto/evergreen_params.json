@@ -2,36 +2,45 @@
   "asset_class": "crypto",
   "params": {
     "alignment_threshold": 0.85,
-    "risk_reward": 2.0,
-    "leverage": 18,
-    "risk_per_trade": 0.009000000000000001
+    "risk_reward": 3.5,
+    "leverage": 3,
+    "risk_per_trade": 0.01,
+    "be_ratchet_r": 1.0,
+    "timeout_rr_threshold": 0.3,
+    "max_hold_bars": 288
   },
   "cross_window_metrics": {
     "w0": {
-      "pf_real": 14.585149197128768,
-      "winrate_real": 0.7951807228915663,
-      "trades": 111,
-      "dd": -0.07722902419469735,
-      "sharpe": 14.189843663457545
+      "pf_real": 15.817023990341136,
+      "winrate_real": 0.7647058823529411,
+      "trades": 25,
+      "dd": -0.02179389267154443,
+      "sharpe": 9.79716063082422
     },
     "w1": {
-      "pf_real": 13.138123369044859,
-      "winrate_real": 0.8059701492537313,
-      "trades": 137,
-      "dd": -0.019403057771784853,
-      "sharpe": 9.2391325807424
+      "pf_real": 11.695495784243759,
+      "winrate_real": 0.7777777777777778,
+      "trades": 31,
+      "dd": -0.020939190448292948,
+      "sharpe": 10.55331603288809
     },
     "w2": {
-      "pf_real": 36.92485727382263,
-      "winrate_real": 0.9166666666666666,
-      "trades": 76,
-      "dd": -0.01003947353874484,
-      "sharpe": 13.732121835387828
+      "pf_real": 13.869696575826696,
+      "winrate_real": 0.75,
+      "trades": 25,
+      "dd": -0.010904531654787239,
+      "sharpe": 10.728833535038103
     }
   },
-  "min_pf": 13.138123369044859,
-  "mean_pf": 21.549376613332086,
+  "min_pf": 11.695495784243759,
+  "mean_pf": 13.794072116803862,
   "is_evergreen": true,
-  "n_candidates_tested": 23,
-  "n_evergreen_found": 23
+  "confidence": "high",
+  "n_candidates_tested": 3024,
+  "n_evergreen_found": 1251,
+  "warnings": [
+    "w0: PF=15.8 (>10)",
+    "w1: PF=11.7 (>10)",
+    "w2: PF=13.9 (>10)"
+  ]
 }
