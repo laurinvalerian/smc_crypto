@@ -941,19 +941,20 @@ def _find_entry_zone_at(
     bias: str,
     fvg_threshold: float,
     valid_len: int,
+    max_zone_bars: int = 6,
 ) -> dict[str, Any] | None:
     """
     On the 15m timeframe, locate the most recent FVG or OB that
     aligns with the daily bias, only considering first *valid_len* rows.
 
-    Strict version: only zones from the last **6** 15m-bars (max 1.5 hours).
+    Strict version: only zones from the last *max_zone_bars* 15m-bars.
+    Default 6 (1.5h for crypto/stocks), forex uses 12 (3h — slower structure).
     Additionally, price must be at least 30 % into the FVG/OB zone.
     """
     if valid_len <= 0:
         return None
 
     current_price = float(df_15m["close"].iloc[valid_len - 1])
-    max_zone_bars = 6  # 6 × 15m = 1.5 hours
 
     # Check FVGs
     fvg_data = indicators_15m.get("fvg")
@@ -1016,12 +1017,16 @@ def _find_entry_zone_at(
     return None
 
 
-def _precompute_5m_trigger_mask(indicators_5m: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+def _precompute_5m_trigger_mask(
+    indicators_5m: dict[str, Any],
+    lookback_bars: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Precompute boolean arrays for bullish/bearish triggers on 5m.
 
-    Strict version: only **real BOS or CHoCH** on exactly the current bar
-    or the immediately preceding bar (max 1 bar lookback, no rolling window).
+    Only **real BOS or CHoCH** within *lookback_bars* of the current bar.
+    Default 1 (crypto/stocks: current + previous bar).
+    Forex uses 3 (15 min window — tick volume produces noisier swings).
     FVG is excluded from the trigger (too noisy for 5m).
 
     Returns (bullish_trigger, bearish_trigger) arrays.
@@ -1044,12 +1049,13 @@ def _precompute_5m_trigger_mask(indicators_5m: dict[str, Any]) -> tuple[np.ndarr
         elif pd.notna(val) and val < 0:
             bear_raw[i] = True
 
-    # Only allow current bar or previous bar (max 1 bar lookback)
+    # Allow current bar + lookback_bars preceding bars
     bull = np.zeros(n, dtype=bool)
     bear = np.zeros(n, dtype=bool)
     for i in range(n):
-        bull[i] = bull_raw[i] or (i > 0 and bull_raw[i - 1])
-        bear[i] = bear_raw[i] or (i > 0 and bear_raw[i - 1])
+        start = max(0, i - lookback_bars)
+        bull[i] = any(bull_raw[start:i + 1])
+        bear[i] = any(bear_raw[start:i + 1])
 
     return bull, bear
 
@@ -1110,44 +1116,51 @@ def _compute_alignment_score(
     h4_poi: bool = False,
     h1_choch: bool = False,
     volume_ok: bool = False,
+    asset_class: str | None = None,
 ) -> float:
     """
     Granular top-down alignment score (0–1).
 
-    Scoring breakdown (adds up to 1.0 maximum):
-      • Daily bias present (1D)       → +0.12
-      • Daily bias from BOS/CHoCH     → +0.08  (bonus for strong bias)
-      • 4H structure confirms          → +0.08
-      • 4H POI (OB/FVG) active        → +0.08
-      • 1H structure confirms          → +0.08
-      • 1H CHoCH detected             → +0.06  (stronger than BOS)
-      • 15m entry zone exists          → +0.15
-      • 5m precision trigger active    → +0.15
-      • 5m volume above average       → +0.10
-      • Style weight multiplier        → ×weight
+    Default scoring (crypto/stocks/commodities):
+      • Daily bias (1D) +0.12, strong +0.08, 4H +0.08, 4H POI +0.08,
+        1H +0.08, CHoCH +0.06, entry_zone +0.15, trigger +0.15, volume +0.10
+      Max = 0.90
+
+    Forex scoring (redistributed — entry_zone/trigger unreliable with tick volume):
+      • Daily bias +0.12, strong +0.12, 4H +0.12, 4H POI +0.08,
+        1H +0.10, CHoCH +0.06, entry_zone +0.08, trigger +0.08, volume +0.14
+      Max = 0.90
 
     Clamped to [0, 1].
     """
+    # Forex-specific weights: less on entry_zone/trigger, more on HTF structure
+    if asset_class == "forex":
+        w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.12, 0.12, 0.08
+        w_h1, w_choch, w_zone, w_trigger, w_vol = 0.10, 0.06, 0.08, 0.08, 0.14
+    else:
+        w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.08, 0.08, 0.08
+        w_h1, w_choch, w_zone, w_trigger, w_vol = 0.08, 0.06, 0.15, 0.15, 0.10
+
     score = 0.0
 
     if daily_bias in ("bullish", "bearish"):
-        score += 0.12
+        score += w_bias
         if bias_strong:
-            score += 0.08
+            score += w_strong
     if h4_confirms:
-        score += 0.08
+        score += w_h4
     if h4_poi:
-        score += 0.08
+        score += w_h4poi
     if h1_confirms:
-        score += 0.08
+        score += w_h1
         if h1_choch:
-            score += 0.06
+            score += w_choch
     if entry_zone is not None:
-        score += 0.15
+        score += w_zone
     if precision_trigger:
-        score += 0.15
+        score += w_trigger
     if volume_ok:
-        score += 0.10
+        score += w_vol
 
     # Backward compat: if using old 4-arg call and no new flags,
     # fall back to roughly equivalent old scoring
@@ -1196,6 +1209,7 @@ class SMCMultiStyleStrategy:
         self.alignment_threshold: float = params.get(
             "alignment_threshold", config["top_down"]["alignment_threshold"]
         )
+        self.asset_class: str | None = params.get("asset_class")
 
         # Day style weight (only style)
         sw = params.get("style_weights", {})
@@ -1358,8 +1372,9 @@ class SMCMultiStyleStrategy:
             _precompute_running_structure(ind_4h)
             if ind_4h is not None else np.zeros(0, dtype=np.int8)
         )
+        _trigger_lookback = 3 if self.asset_class == "forex" else 1
         bull_trigger_5m, bear_trigger_5m = (
-            _precompute_5m_trigger_mask(ind_5m)
+            _precompute_5m_trigger_mask(ind_5m, lookback_bars=_trigger_lookback)
             if ind_5m is not None else (np.zeros(0, dtype=bool), np.zeros(0, dtype=bool))
         )
 
@@ -1448,9 +1463,11 @@ class SMCMultiStyleStrategy:
 
             # ── Step 4: 15m entry zone (FVG / OB) ────────────────
             entry_zone = None
+            _zone_bars = 12 if self.asset_class == "forex" else 6
             if ind_15m is not None and not df_15m.empty:
                 entry_zone = _find_entry_zone_at(
                     ind_15m, df_15m, bias, self.fvg_threshold, int(vlen_15m[i]),
+                    max_zone_bars=_zone_bars,
                 )
 
             # ── Step 5: 5m precision trigger ──────────────────────
@@ -1472,6 +1489,7 @@ class SMCMultiStyleStrategy:
                 h4_poi=h4_poi,
                 h1_choch=h1_choch,
                 volume_ok=volume_ok,
+                asset_class=self.asset_class,
             )
 
             if score < self.alignment_threshold:

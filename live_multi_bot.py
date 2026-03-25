@@ -173,8 +173,8 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
         "min_daily_atr_pct": 0.008, "min_5m_atr_pct": 0.0015,
     },
     "forex": {
-        "swing_length": 12, "fvg_threshold": 0.0002,
-        "order_block_lookback": 25, "liquidity_range_percent": 0.003,
+        "swing_length": 20, "fvg_threshold": 0.001,
+        "order_block_lookback": 30, "liquidity_range_percent": 0.008,
         "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
         "min_daily_atr_pct": 0.004, "min_5m_atr_pct": 0.0005,
     },
@@ -631,6 +631,23 @@ class PaperBot:
         daily_bias = "neutral"
         score = 0.0
 
+        # Forex-specific scoring weights (redistribute from entry_zone/trigger to HTF)
+        _fx = self.asset_class == "forex"
+        _w_bias      = 0.10               # same for all
+        _w_bias_half = 0.05               # same for all
+        _w_h4        = 0.08               # same for all
+        _w_h4_poi    = 0.08               # same for all
+        _w_h1        = 0.08 if not _fx else 0.10
+        _w_h1_choch  = 0.06               # same for all
+        _w_zone      = 0.12 if not _fx else 0.06   # forex: zone unreliable w/ tick vol
+        _w_trigger   = 0.10 if not _fx else 0.06   # forex: trigger unreliable
+        _w_volume    = 0.08 if not _fx else 0.12   # forex: compensate
+        _w_adx       = 0.08 if not _fx else 0.10   # forex: compensate
+        _w_session   = 0.06               # same for all
+        _w_momentum  = 0.06               # same for all
+        _w_tf_agree  = 0.05               # same for all
+        _w_freshness = 0.05               # same for all
+
         # ═══ STEP 1: Daily Bias (1D) – HTF direction (0.10) ═════
         if len(self.buffer_1d) >= swing_len * 2:
             try:
@@ -646,10 +663,10 @@ class PaperBot:
                     pure_struct = _precompute_running_structure(ind_1d)
                     pure_bias = _bias_from_running(pure_struct, len(self.buffer_1d))
                     if pure_bias != "neutral" and pure_bias == daily_bias:
-                        score += 0.10
+                        score += _w_bias
                         comp["bias_strong"] = True
                     else:
-                        score += 0.05  # EMA fallback only = half credit
+                        score += _w_bias_half  # EMA fallback only = half credit
             except Exception as exc:
                 self.logger.debug("1D bias computation failed: %s", exc)
 
@@ -669,7 +686,7 @@ class PaperBot:
                 )
                 running_4h = _precompute_running_structure(ind_4h)
                 if _structure_confirms_from_running(running_4h, daily_bias, len(self.buffer_4h)):
-                    score += 0.08
+                    score += _w_h4
                     comp["h4_confirms"] = True
 
                 price = float(self.buffer_4h["close"].iloc[-1])
@@ -677,7 +694,7 @@ class PaperBot:
                     ind_4h, price, daily_bias, lookback_bars=10,
                 )
                 if h4_poi is not None:
-                    score += 0.08
+                    score += _w_h4_poi
                     comp["h4_poi"] = True
                     comp["h4_poi_data"] = h4_poi
                     htf_zones.append(h4_poi)
@@ -716,7 +733,7 @@ class PaperBot:
                 )
                 running_1h = _precompute_running_structure(ind_1h)
                 if _structure_confirms_from_running(running_1h, daily_bias, len(self.buffer_1h)):
-                    score += 0.08
+                    score += _w_h1
                     comp["h1_confirms"] = True
 
                 bos_choch_1h = ind_1h.get("bos_choch")
@@ -726,7 +743,7 @@ class PaperBot:
                         if pd.notna(choch_val) and choch_val != 0:
                             choch_dir = "bullish" if choch_val > 0 else "bearish"
                             if choch_dir == daily_bias:
-                                score += 0.06
+                                score += _w_h1_choch
                                 comp["h1_choch"] = True
                             break
             except Exception as exc:
@@ -740,9 +757,11 @@ class PaperBot:
                 ind_15m = compute_smc_indicators(
                     self.buffer_15m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                _zone_bars = 12 if _fx else 6
                 entry_zone = _find_entry_zone_at(
                     ind_15m, self.buffer_15m, daily_bias,
                     fvg_thresh, len(self.buffer_15m),
+                    max_zone_bars=_zone_bars,
                 )
                 if entry_zone is not None:
                     comp["entry_zone"] = entry_zone
@@ -774,8 +793,8 @@ class PaperBot:
                     comp["zone_quality"] = zq
                     comp["zone_quality_ok"] = zone_quality_result.get("zone_quality_ok", False)
 
-                    # Score weighted by zone quality (0.12 * zone_quality)
-                    score += 0.12 * zq
+                    # Score weighted by zone quality
+                    score += _w_zone * zq
                     comp["zone_fresh"] = zone_quality_result.get("decay_factor", 0.0) > 0.5
             except Exception as exc:
                 self.logger.debug("15m entry zone computation failed: %s", exc)
@@ -786,13 +805,14 @@ class PaperBot:
                 ind_5m = compute_smc_indicators(
                     self.buffer_5m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
-                bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m)
+                _trig_lb = 3 if _fx else 1
+                bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m, lookback_bars=_trig_lb)
                 if len(bull_mask) > 0:
                     if daily_bias == "bullish" and bull_mask[-1]:
-                        score += 0.10
+                        score += _w_trigger
                         comp["precision_trigger"] = True
                     elif daily_bias == "bearish" and bear_mask[-1]:
-                        score += 0.10
+                        score += _w_trigger
                         comp["precision_trigger"] = True
             except Exception as exc:
                 self.logger.debug("5m trigger computation failed: %s", exc)
@@ -824,7 +844,7 @@ class PaperBot:
                 comp["volume_ok"] = vol_result.get("volume_ok", False)
                 comp["volume_score"] = vol_score
                 comp["volume_details"] = vol_result
-                score += 0.08 * vol_score
+                score += _w_volume * vol_score
             except Exception as exc:
                 self.logger.debug("Volume scoring failed: %s", exc)
 
@@ -839,7 +859,7 @@ class PaperBot:
                 comp["adx_strong"] = adx > 25.0
                 # Score: ADX 25+ = starts contributing, 50+ = full score
                 adx_score = min(max(adx - 15.0, 0.0) / 35.0, 1.0)
-                score += 0.08 * adx_score
+                score += _w_adx * adx_score
             except Exception as exc:
                 self.logger.debug("ADX computation failed: %s", exc)
 
@@ -848,7 +868,7 @@ class PaperBot:
             session_sc = compute_session_score(asset_class=self.asset_class)
             comp["session_score"] = session_sc
             comp["session_optimal"] = session_sc >= 0.8
-            score += 0.06 * session_sc
+            score += _w_session * session_sc
         except Exception as exc:
             self.logger.debug("Session scoring failed: %s", exc)
 
@@ -859,7 +879,7 @@ class PaperBot:
                 mom_ok, mom_score = check_momentum_confluence(c1h, direction)
                 comp["momentum_confluent"] = mom_ok
                 comp["momentum_score"] = mom_score
-                score += 0.06 * mom_score
+                score += _w_momentum * mom_score
             except Exception as exc:
                 self.logger.debug("Momentum confluence failed: %s", exc)
 
@@ -873,14 +893,14 @@ class PaperBot:
             tf_count, tf_score = multi_tf_trend_agreement(c_1d, c_4h, c_1h, c_15m, direction)
             comp["tf_agreement"] = tf_count
             comp["tf_agreement_score"] = tf_score
-            score += 0.05 * tf_score
+            score += _w_tf_agree * tf_score
         except Exception as exc:
             self.logger.debug("Multi-TF trend agreement failed: %s", exc)
 
         # ═══ STEP 11: Zone Freshness Decay Bonus (0.05) ══════════
         if zone_quality_result:
             decay_factor = zone_quality_result.get("decay_factor", 0.0)
-            score += 0.05 * decay_factor
+            score += _w_freshness * decay_factor
 
         # Clamp final score
         score = float(np.clip(score, 0.0, 1.0))

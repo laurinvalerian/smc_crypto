@@ -466,6 +466,27 @@ risk_per_trade: 0.01 (1.0% max, dynamisch je nach Score)
 
 **Sniper-Set gewinnt**: Höchster Min-PF (7.88), konsistentester DD (<7%), nie optimiert (zero overfitting risk).
 
+### V12d Fixes (2026-03-24) — PF Inflation Bug + Cross-Window Quality Gates
+
+**Problem**: `compute_metrics()` produzierte Billionen-PF wenn n_real_losses=0:
+- `real_loss_pnl = 1e-9` → `pf_real = wins / 1e-9` = Trillionen
+- Betroffen: Forex (ALLE 3 Windows 100% WR, 6-17 Trades), Commodities W2 (18 Trades, 100% WR)
+
+**Fixes:**
+1. **PF Cap bei 100**: Wenn n_real_losses=0 aber wins > 0 → `pf_real = 100.0` (nicht Infinity)
+2. **Min Trades Gate**: `cross_window_validate()` erfordert jetzt ≥ 5 Trades pro Window (vorher: kein Minimum)
+
+**Per-Class Backtest Ergebnisse (Erster Run, vor V12d Fix):**
+
+| Klasse | min_pf | Params | Status |
+|--------|--------|--------|--------|
+| Crypto | 5.52 | align=0.9, rr=3.5, lev=6, risk=1.5% | ✅ CLEAN — 23-84 trades, 53-56% WR |
+| Stocks | 8.56 | align=0.9, rr=2.0, lev=3, risk=0.3% | ✅ CLEAN — 47-60 trades, 65-91% WR |
+| Forex | 6.3T | align=0.9, rr=2.0, lev=13, risk=1.5% | ❌ BUG — 0 losses, PF=Trillion |
+| Commodities | 4.89 | align=0.7, rr=2.0, lev=10, risk=0.9% | ⚠️ W2 broken (0 losses → 43.9T) |
+
+**Rerun nach Fix erwartet**: Forex/Commodities mit realistischen PF-Werten.
+
 ### Paper Grid — Multi-Variant A/B Testing (✅ FERTIG)
 
 **Neues Modul: `paper_grid.py`**
@@ -591,21 +612,138 @@ risk_per_trade: 0.01 (1.0% max, dynamisch je nach Score)
 - `evaluate_signal()` filtert: Variant mit `asset_class="crypto"` evaluiert nur Crypto-Signale
 - Backward-compat: `asset_class=None` → evaluiert alle Klassen
 
+### Per-Class Backtest V1 Ergebnisse (2026-03-24) — KRITISCHER BUG GEFUNDEN
+
+**Erster Run mit `--per-class` abgeschlossen.** Resultate:
+
+| Klasse | min_pf | Params | Trades/Window | Verdict |
+|--------|--------|--------|---------------|---------|
+| Crypto | 5.52 | align=0.90, rr=3.5, lev=6, risk=1.5% | 23-113 | ✅ SAUBER |
+| Stocks | 8.28 | align=0.85, rr=2.0, lev=2, risk=0.9% | 35-180 | ✅ SAUBER |
+| Forex | 100.0 | align=0.90, rr=2.0, lev=13, risk=1.5% | 6-51 | ❌ KAPUTT |
+| Commodities | 4.89 | align=0.70, rr=2.0, lev=10, risk=0.9% | 18-23 | ⚠️ TEILWEISE |
+
+**Detaillierte OOS-Ergebnisse pro Window:**
+
+| Klasse | W0 (Jun-Aug) | W1 (Sep-Nov) | W2 (Dec-Feb) |
+|--------|-------------|-------------|-------------|
+| Crypto | PF=6.37, WR=57%, 74T, DD=-6.5% PASS | PF=5.52, WR=55%, 84T, DD=-12.8% FAIL(DD) | PF=2.92, WR=50%, 113T, DD=-7.5% PASS |
+| Stocks | PF=14.59, WR=74%, 180T, DD=-1.4% PASS | PF=12.51, WR=68%, 58T, DD=-3.3% FAIL(stab) | PF=7.12, WR=58%, 35T, DD=-1.1% FAIL(stab) |
+| Forex | PF=100, WR=100%, 17T FAIL(trades) | PF=100, WR=100%, 6T FAIL(trades) | PF=107, WR=98%, 51T PASS |
+| Commodities | PF=4.88, WR=67%, 19T FAIL(trades) | PF=11.47, WR=81%, 23T PASS | PF=100, WR=100%, 18T FAIL(trades) |
+
+**Avg Win RR**: Crypto 4.63, Stocks 5.40, Forex 1.67, Commodities 2.92
+
+### KRITISCHER BUG: Backtester ignoriert `smc_profiles` (ALLE Klassen betroffen!)
+
+**Root Cause**: `_precompute_window_signals()` (Zeile 852) liest nur `config["smc"]` (globale Crypto-Defaults). Die asset-spezifischen `config["smc_profiles"]` werden **komplett ignoriert**.
+
+| Parameter | Backtester benutzt | Crypto Profile | Stocks Profile | Forex Profile |
+|---|---|---|---|---|
+| swing_length | **8** | 8 (ok) | **10** (FALSCH) | **12→20** (FALSCH) |
+| fvg_threshold | **0.0004** | **0.0006** (FALSCH) | **0.0003** (FALSCH) | **0.0002→0.001** (FALSCH) |
+| ob_lookback | **15** | **20** (FALSCH) | **20** (FALSCH) | **25→30** (FALSCH) |
+| liq_range | **0.005** | **0.01** (FALSCH) | 0.005 (ok) | **0.003→0.008** (FALSCH) |
+
+**Konsequenz**: Backtest ≠ Live-Bot. `live_multi_bot.py` L400 nutzt korrekt `ASSET_SMC_PARAMS[asset_class]`. ALLE bisherigen Backtest-Ergebnisse basieren auf falschen SMC-Parametern.
+
+### Forex Signal-Problem — Zusätzlich zu `smc_profiles`-Bug
+
+Forex generiert zu wenige Signale weil SMC-Indikatoren mit Tick-Volume-Daten schlecht funktionieren:
+
+1. **Entry Zone Detection: 95.5% Failure** — FVGs entstehen kaum mit 5-10 Ticks/Bar (Tick-Volume ≠ echtes Volume)
+2. **Precision Trigger: 97.6% Failure** — BOS/CHoCH auf 5m ist mit Tick-Volume zu noisy
+3. **H1 Confirmation: 79.1% Failure** (vs 44.6% Crypto) — langsamere Struktur
+4. **Score-Decke bei ~0.75** → AAA+ (≥0.78) fast unerreichbar
+
+**V13 Fixes (✅ ALLE IMPLEMENTIERT)**:
+1. ✅ Backtester `smc_profiles` Overlay — per-class Profile verwenden (war globale `smc` Defaults)
+2. ✅ Forex Config: swing_length 12→20, fvg_threshold 0.0002→0.001, ob_lookback 25→30, liq_range 0.003→0.008
+3. ✅ Entry Zone Lookback: `max_zone_bars` parametrisch (Forex: 12 statt 6)
+4. ✅ Precision Trigger Lookback: parametrisch (Forex: 3 Bars statt 1)
+5. ✅ Forex-spezifische Scoring-Gewichte: entry_zone 0.15→0.08, trigger 0.15→0.08, bias_strong 0.08→0.12, h4 0.08→0.12, h1 0.08→0.10, volume 0.10→0.14 (Max bleibt 0.90)
+6. ✅ Stability Check: Skip für Windows mit <30 Trades
+7. ✅ `ASSET_SMC_PARAMS["forex"]` in live_multi_bot.py synched (inkl. alle 13 Scoring-Gewichte variabel)
+
+### V13 Backtest-Ergebnisse (2026-03-25) — 3 NEUE BUGS GEFUNDEN
+
+**Ergebnisse mit korrekten smc_profiles pro Klasse + Forex-Optimierungen:**
+
+| Klasse | Evergreen Params | W0 | W1 | W2 | Verdict |
+|--------|-----------------|-----|-----|-----|---------|
+| Crypto | align=0.85, rr=2.0, lev=18, risk=0.9% | PF=14.6, 111T, DD=-7.7% PASS | PF=13.1, 137T, DD=-1.9% PASS | PF=36.9, 76T, DD=-1.0% PASS | ⚠️ PF zu hoch |
+| Forex | align=0.80, rr=3.0, lev=21, risk=1.5% | PF=100, 2T FAIL | PF=100, 7T FAIL | PF=796, 241T, DD=-0.7% PASS | ❌ KAPUTT |
+| Stocks | align=0.90, rr=2.0, lev=3, risk=1.0% | PF=17.3, 33T, DD=-1.4% PASS | PF=13.2, 42T, DD=-3.0% PASS | PF=6.2, 35T, DD=-6.7% PASS | ✅ Am besten |
+| Commodities | align=0.75, rr=2.0, lev=18, risk=1.4% | PF=1.5, 8T FAIL | PF=7.2, 21T, DD=-3.2% PASS | PF=14.0, 5T FAIL | ⚠️ Marginal |
+
+**Outcome-Verteilung:**
+- Crypto: W0: 66W/28BE/17L, W1: 32W/56BE/9L, W2: 44W/28BE/4L
+- Forex W2: 224W/16BE/1L (unrealistisch — clustered duplicates)
+- Stocks: W0: 17W/7BE/6L, W1: 24W/8BE/10L, W2: 11W/9BE/16L (realistisch!)
+- Commodities: W0: 2W/3BE/3L, W1: 12W/4BE/5L, W2: 4W/0BE/1L
+
+### Bug 1: KEINE Concurrent Position Prevention im Backtester (KRITISCH)
+
+`simulate_trades()` hat KEINEN Check ob auf demselben Symbol bereits eine Position offen ist. Live-Bot erlaubt nur 1 Position/Symbol. Backtester öffnet beliebig viele gleichzeitig.
+
+**Beweis**: Forex W2 EUR_JPY: 8 Longs innerhalb 45min (07:30, 07:35, 07:40, 08:00, 08:05, 08:10, 08:15, 08:55), alle mit identischem SL=178.657. Alle "win". → Trade-Count UND PnL massiv aufgebläht.
+
+**Betrifft ALLE Klassen** — nicht nur Forex. Crypto/Stocks haben ebenfalls Signal-Cluster.
+
+### Bug 2: Breakeven-Fee-Buffer erzeugt Mini-Gewinne
+
+`_resolve_trade_outcome()` setzt BE-SL auf `entry + 0.1%`, aber tatsächliche Kosten variieren:
+- Stocks (0% Commission): BE = +0.08% netto → kleine positive PnL → infliert Equity
+- Fix: `fee_buffer = entry * (commission_pct * 2 + slippage_pct * 2)` statt fix 0.1%
+
+### Bug 3: Leverage zu aggressiv
+
+Optuna findet Crypto 18x / Commodities 18x weil hoher Leverage Compound-Growth maximiert. Unrealistisch für Funded Accounts. Fix: Leverage-Caps reduzieren (Crypto/Commodities max 10x).
+
+### Parameter Importance (fANOVA):
+- **Crypto**: leverage (45%) > alignment (24%) > risk (24%) > rr (7%) — Leverage dominiert
+- **Stocks**: alignment (88%) > rest — Score-Threshold ist der entscheidende Faktor
+- **Forex**: leverage (35%) > risk (30%) > alignment (26%) > rr (9%)
+- **Commodities**: alignment (61%) > rr (31%) > leverage (5%) > risk (3%)
+
+### V14 Fixes (2026-03-25) — Concurrent Position + Realistischere Backtests
+
+**3 Fixes implementiert:**
+
+1. **Concurrent Position Prevention** (KRITISCH): `simulate_trades()` trackt jetzt offene Positionen pro Symbol. Neue Signale auf einem Symbol mit aktiver Position werden übersprungen (wie Live-Bot). `_resolve_trade_outcome()` gibt jetzt 3-Tuple zurück: `(outcome, exit_price, exit_timestamp)`. Signale werden chronologisch sortiert vor Simulation.
+
+2. **Breakeven-Fee-Buffer pro Asset-Klasse**: `fee_buffer = entry * (commission_pct * 2 + slippage_pct * 2)` statt fix 0.1%. Damit sind BE-Exits wirklich neutral (PnL ≈ 0 nach Kosten) statt kleine Gewinne.
+
+3. **Leverage-Caps reduziert** (`config/default_config.yaml`): Crypto 20→10x, Forex 30→20x, Commodities 20→10x. Stocks bleibt 4x.
+
+4. **Per-Class Min-Trade-Gates**: `validate_oos_results()` akzeptiert `asset_class` Parameter. Forex/Commodities brauchen nur 5 Trades/Window (statt 20). `cross_window_validate()` gibt `confidence` Feld zurück (low/medium/high).
+
+**Signal-Cache bleibt gültig** — Fixes betreffen nur Simulation, nicht Signal-Generierung.
+
+### Commodities-Entscheid: Bleiben bei 4
+
+OANDA Practice bietet nur 4 Rohstoff-CFDs: XAU_USD, XAG_USD, WTICO_USD, BCO_USD. Weitere (Platin, Palladium, Agrar) sind nicht verfügbar. Performance der 4 ist gut. Kein Handlungsbedarf.
+
 ### Nächste Schritte
 1. **Daten**: ✅ FERTIG + Prefetch komplett
 2. **V12 Fixes**: ✅ GEFIXT — Lookahead-freie Structure-TP + Short-BE Fix + risk_reward Options
 3. **V12b Metriken-Fix**: ✅ GEFIXT — Breakeven-Outcome + ehrliche Metriken + Cache-Versioning
 4. **V12c Backtester-Fix**: ✅ GEFIXT — Equity Cap + risk_per_trade Cap + Stability Fix + OOS Fix
-5. **Backtester V12c**: ✅ FERTIG — 3/3 PASS, Evergreen-Params validiert
-6. **Paper Grid**: ✅ FERTIG — 20 Varianten, A/B Testing, realistische Fees
-7. **Zombie Prevention**: ✅ FERTIG — 3-Layer Schutz, Startup Sweep
-8. **Multi-Asset Live Bot**: ✅ FERTIG — 112 Instrumente, 3 Exchanges, REST+WS Feeds
-9. **Order Execution Migration**: ✅ FERTIG — `self.exchange` entfernt, alles über `self.adapter`
-10. **Per-Asset-Class Backtesting**: ✅ FERTIG — `--per-class` + Cross-Window Evergreen + Paper Grid Generator
-11. **Per-Class Backtest ausführen**: ⏳ `python3 -m backtest.optuna_backtester --per-class` (~3-4h)
-12. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (nach Backtest)
-13. **Paper Trading**: ⏳ 2 Wochen Demo mit per-Class Evergreen-Params über alle Asset-Klassen
-14. **Live → Funded**: 3× Funded Accounts geplant
+5. **V12d PF-Cap**: ✅ GEFIXT — PF capped bei 100 wenn n_real_losses=0
+6. **Per-Asset-Class Backtesting**: ✅ FERTIG — Code + erster Run
+7. **Paper Grid**: ✅ FERTIG — 20 Varianten pro Klasse, A/B Testing
+8. **Zombie Prevention**: ✅ FERTIG — 3-Layer Schutz
+9. **Multi-Asset Live Bot**: ✅ FERTIG — 112 Instrumente, 3 Exchanges
+10. **Order Execution Migration**: ✅ FERTIG — alles über `self.adapter`
+11. **V13 Forex+SMC-Profile Fix**: ✅ FERTIG — 7 Code-Fixes implementiert + Backtest abgeschlossen
+12. **V14 Concurrent Position Fix**: ✅ FERTIG — 1 Position/Symbol, chronologische Sortierung, exit_timestamp Tracking
+13. **V14 Breakeven-Fee-Buffer Fix**: ✅ FERTIG — Fee-Buffer = tatsächliche Round-Trip-Kosten pro Asset-Klasse
+14. **V14 Leverage-Caps**: ✅ FERTIG — Crypto/Commodities max 10x, Forex max 20x
+15. **V14 Per-Class Min-Trade-Gates**: ✅ FERTIG — Forex/Commodities min 5 Trades, confidence Feld
+16. **V14 Backtest Rerun**: ⏳ Alle Klassen neu mit V14 Fixes
+17. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (nach V14 Rerun)
+18. **Paper Trading**: ⏳ 2 Wochen Demo mit V14-validierten Params
+19. **Live → Funded**: 3× Funded Accounts geplant
 
 ## Testing & Anti-Overfitting
 

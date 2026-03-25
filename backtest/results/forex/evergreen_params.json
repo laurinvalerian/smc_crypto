@@ -1,37 +1,37 @@
 {
   "asset_class": "forex",
   "params": {
-    "alignment_threshold": 0.9,
-    "risk_reward": 2.0,
-    "leverage": 13,
+    "alignment_threshold": 0.8,
+    "risk_reward": 3.0,
+    "leverage": 21.0,
     "risk_per_trade": 0.015
   },
   "cross_window_metrics": {
     "w0": {
-      "pf_real": 29867387748479.17,
+      "pf_real": 100.0,
       "winrate_real": 1.0,
-      "trades": 17,
+      "trades": 186,
       "dd": 0.0,
-      "sharpe": 17.232093270436252
+      "sharpe": 30.71521227226947
     },
     "w1": {
-      "pf_real": 6344785874078.307,
+      "pf_real": 100.0,
       "winrate_real": 1.0,
-      "trades": 6,
-      "dd": -0.00022563163570082272,
-      "sharpe": 13.725593557538218
+      "trades": 160,
+      "dd": -0.00015819818974797058,
+      "sharpe": 21.98098994329354
     },
     "w2": {
-      "pf_real": 26501379926936.7,
-      "winrate_real": 1.0,
-      "trades": 11,
-      "dd": 0.0,
-      "sharpe": 41.461380432857936
+      "pf_real": 795.8786476238263,
+      "winrate_real": 0.9948979591836735,
+      "trades": 212,
+      "dd": -0.006628662607544413,
+      "sharpe": 29.628595187778554
     }
   },
-  "min_pf": 6344785874078.307,
-  "mean_pf": 20904517849831.395,
+  "min_pf": 100.0,
+  "mean_pf": 331.9595492079421,
   "is_evergreen": true,
-  "n_candidates_tested": 19,
-  "n_evergreen_found": 19
+  "n_candidates_tested": 54,
+  "n_evergreen_found": 20
 }

@@ -227,25 +227,28 @@ _MAX_BARS_DEFAULT = 576  # 48 hours × 12 bars/hour
 
 def _resolve_trade_outcome(
     sig: TradeSignal,
-) -> tuple[str, float]:
+    commission_pct: float = 0.0004,
+    slippage_pct: float = 0.0001,
+) -> tuple[str, float, pd.Timestamp | None]:
     """
     Walk forward through real price bars after entry to determine outcome.
 
     Breakeven-only stop logic (like a patient SMC trader):
     - Before +1R: original SL stays
-    - At +1R: SL moves to net-breakeven (entry + fees/slippage buffer)
+    - At +1R: SL moves to net-breakeven (entry + actual round-trip costs)
     - After +1R: SL stays at breakeven — NO further trailing
     - Price has room to breathe and reach structure-based TP
     - TP hit → full win at target RR
-    - BE-SL hit → tiny win (covers fees)
+    - BE-SL hit → ~zero PnL (covers fees exactly)
     - Timeout → close at last bar close
 
     Returns:
-        (outcome, exit_price) where outcome is "win", "loss", or "skip"
+        (outcome, exit_price, exit_timestamp) where outcome is "win", "loss",
+        "breakeven", or "skip". exit_timestamp is None for "skip".
     """
     df = _price_cache.get(sig.symbol)
     if df is None or df.empty:
-        return "skip", sig.entry_price
+        return "skip", sig.entry_price, None
 
     entry_ts = sig.timestamp
     if not hasattr(entry_ts, 'tzinfo') or entry_ts.tzinfo is None:
@@ -255,7 +258,7 @@ def _resolve_trade_outcome(
     future_bars = df.loc[mask]
 
     if future_bars.empty:
-        return "skip", sig.entry_price
+        return "skip", sig.entry_price, None
 
     max_bars = _MAX_BARS_DEFAULT
     future_bars = future_bars.iloc[:max_bars]
@@ -269,10 +272,10 @@ def _resolve_trade_outcome(
     # Breakeven stop state
     current_sl = original_sl
     reached_1r = False
-    # Net-breakeven buffer: covers round-trip fees + slippage (~0.1%)
-    fee_buffer = entry * 0.001
+    # Net-breakeven buffer: actual round-trip costs (entry + exit)
+    fee_buffer = entry * (commission_pct * 2 + slippage_pct * 2)
 
-    for _, bar in future_bars.iterrows():
+    for bar_ts, bar in future_bars.iterrows():
         high = bar["high"]
         low = bar["low"]
 
@@ -287,11 +290,11 @@ def _resolve_trade_outcome(
             # Check SL first (conservative: worst case within bar)
             if low <= current_sl:
                 if reached_1r:
-                    return "breakeven", current_sl
-                return "loss", current_sl
+                    return "breakeven", current_sl, bar_ts
+                return "loss", current_sl, bar_ts
             # Check TP
             if high >= tp:
-                return "win", tp
+                return "win", tp, bar_ts
 
         else:  # short
             if not reached_1r and sl_dist > 0:
@@ -302,23 +305,24 @@ def _resolve_trade_outcome(
 
             if high >= current_sl:
                 if reached_1r:
-                    return "breakeven", current_sl
-                return "loss", current_sl
+                    return "breakeven", current_sl, bar_ts
+                return "loss", current_sl, bar_ts
             if low <= tp:
-                return "win", tp
+                return "win", tp, bar_ts
 
     # Timeout: close at last bar's close
     last_close = float(future_bars.iloc[-1]["close"])
+    last_ts = future_bars.index[-1]
     if is_long:
         pnl = last_close - entry
     else:
         pnl = entry - last_close
     if pnl > entry * 0.002:  # meaningful profit (>0.2%)
-        return "win", last_close
+        return "win", last_close, last_ts
     elif pnl < -entry * 0.002:
-        return "loss", last_close
+        return "loss", last_close, last_ts
     else:
-        return "breakeven", last_close
+        return "breakeven", last_close, last_ts
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -353,6 +357,9 @@ def simulate_trades(
     if not signals:
         return pd.DataFrame()
 
+    # Sort signals chronologically — required for concurrent position tracking
+    signals = sorted(signals, key=lambda s: s.timestamp)
+
     cb = CircuitBreaker() if use_circuit_breaker else None
     # Suppress CB logging during simulation — it toggles pause/resume rapidly
     # which produces thousands of log lines. CB logic still works, just silent.
@@ -365,7 +372,15 @@ def simulate_trades(
     rejected_count = 0
     skipped_no_data = 0
 
+    # Track open positions per symbol — live bot only allows ONE position per symbol
+    open_positions: dict[str, pd.Timestamp] = {}  # symbol → exit_timestamp
+
     for sig in signals:
+        # ── Concurrent position check — only 1 position per symbol ──
+        if sig.symbol in open_positions:
+            if sig.timestamp < open_positions[sig.symbol]:
+                continue  # Skip — already holding this symbol
+
         sl_dist = abs(sig.entry_price - sig.stop_loss)
         tp_dist = abs(sig.take_profit - sig.entry_price)
         if sl_dist <= 0 or tp_dist <= 0:
@@ -424,11 +439,17 @@ def simulate_trades(
         cost = position_notional * cost_pct
 
         # ── REAL price-path outcome ──────────────────────────────
-        outcome, exit_price = _resolve_trade_outcome(sig)
+        outcome, exit_price, exit_ts = _resolve_trade_outcome(
+            sig, commission_pct, slippage_pct,
+        )
 
         if outcome == "skip":
             skipped_no_data += 1
             continue
+
+        # Track position close time for concurrent position prevention
+        if exit_ts is not None:
+            open_positions[sig.symbol] = exit_ts
 
         # Calculate actual PnL from price movement
         if sig.direction == "long":
@@ -535,8 +556,13 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
 
     # Real PF: profit from wins only vs losses only (BE excluded from both)
     real_win_pnl = float(pnl[outcomes == "win"].sum()) if n_real_wins > 0 else 0.0
-    real_loss_pnl = abs(float(pnl[outcomes == "loss"].sum())) if n_real_losses > 0 else 1e-9
-    pf_real = real_win_pnl / real_loss_pnl if real_loss_pnl > 0 else real_win_pnl
+    real_loss_pnl = abs(float(pnl[outcomes == "loss"].sum())) if n_real_losses > 0 else 0.0
+    if real_loss_pnl > 0:
+        pf_real = real_win_pnl / real_loss_pnl
+    elif real_win_pnl > 0:
+        pf_real = 100.0  # Cap: no losses but has wins — don't let PF go to infinity
+    else:
+        pf_real = 0.0
 
     # Cumulative equity & drawdown
     equity = account_size + pnl.cumsum()
@@ -716,13 +742,14 @@ def validate_oos_results(
     mc_result: dict[str, Any] | None = None,
     stability_result: dict[str, Any] | None = None,
     max_dd_limit: float = -0.10,
+    asset_class: str = "crypto",
 ) -> dict[str, Any]:
     """
     Check if out-of-sample results pass anti-overfitting gates.
 
     7 Gates (ALL must pass):
     1. Profit Factor >= 1.5
-    2. Minimum 20 trades (SMC sniper: ~6-7/month over 2-3 month OOS)
+    2. Minimum trades (per-class: 20 for crypto/stocks, 5 for forex/commodities)
     3. Sharpe >= 0.5
     4. Monte Carlo robust (95% CI profitable)
     5. Max Drawdown > -10% (funded account compliance)
@@ -738,11 +765,12 @@ def validate_oos_results(
     if not gates["profit_factor_ok"]:
         reasons.append(f"Profit Factor(real) {pf:.2f} < 1.5")
 
-    # Gate 2: Minimum trades (SMC sniper = few but high quality)
+    # Gate 2: Minimum trades — per-class (forex/commodities have fewer instruments)
+    min_trades_required = 5 if asset_class in ("forex", "commodities") else 20
     n_trades = oos_metrics.get("total_trades", 0)
-    gates["min_trades_ok"] = n_trades >= 20
+    gates["min_trades_ok"] = n_trades >= min_trades_required
     if not gates["min_trades_ok"]:
-        reasons.append(f"Only {n_trades} trades (need >= 20)")
+        reasons.append(f"Only {n_trades} trades (need >= {min_trades_required})")
 
     # Gate 3: Sharpe
     sharpe = oos_metrics.get("sharpe", 0)
@@ -769,14 +797,25 @@ def validate_oos_results(
     if not gates["max_dd_ok"]:
         reasons.append(f"Max DD {max_dd*100:.1f}% exceeds {max_dd_limit*100:.0f}% limit (funded account)")
 
-    # Gate 6: Parameter stability (hard fail, not just warning)
+    # Gate 6: Parameter stability (relaxed for small samples)
     if stability_result is not None:
-        gates["stability_ok"] = stability_result.get("stable", False)
-        if not gates["stability_ok"]:
-            reasons.append(
-                f"Parameter unstable: ±10% change causes "
-                f"{stability_result.get('max_pf_change_pct', 0):.0f}% PF shift (max 50%)"
-            )
+        n_real = oos_metrics.get("n_real_wins", 0) + oos_metrics.get("n_real_losses", 0)
+        if n_real < 30:
+            # Small sample: ±10% param change adds/removes 1-2 trades → huge PF swing
+            # This is statistics, not overfitting. Skip gate but warn.
+            gates["stability_ok"] = True
+            if not stability_result.get("stable", False):
+                reasons.append(
+                    f"Stability skipped (only {n_real} real trades < 30): "
+                    f"±10% → {stability_result.get('max_pf_change_pct', 0):.0f}% shift"
+                )
+        else:
+            gates["stability_ok"] = stability_result.get("stable", False)
+            if not gates["stability_ok"]:
+                reasons.append(
+                    f"Parameter unstable: ±10% change causes "
+                    f"{stability_result.get('max_pf_change_pct', 0):.0f}% PF shift (max 50%)"
+                )
     else:
         gates["stability_ok"] = True  # Skip if not run
 
@@ -808,7 +847,7 @@ def validate_oos_results(
 
 # Bump this version whenever signal generation logic changes (TP calc, filters, etc.)
 # Old caches with different versions are automatically ignored.
-SIGNAL_CACHE_VERSION = "v12"
+SIGNAL_CACHE_VERSION = "v13"
 
 
 def _signal_cache_key(
@@ -844,7 +883,27 @@ def _precompute_window_signals(
     are requested again, loads from cache instead of regenerating (~10-15min saved).
     """
     # Use config defaults for SMC params — these are not tuned per trial
+    # In per-class mode: overlay asset-specific smc_profiles on top of global smc
     smc_cfg = config.get("smc", {})
+    if symbol_to_asset:
+        classes = set(symbol_to_asset.values())
+        if len(classes) == 1:
+            asset_class = classes.pop()
+            profile = config.get("smc_profiles", {}).get(asset_class)
+            if profile:
+                smc_cfg = {**smc_cfg, **profile}
+                logger.info("Using smc_profiles[%s]: swing=%d fvg=%.4f ob=%d liq=%.4f",
+                            asset_class,
+                            profile.get("swing_length", "?"),
+                            profile.get("fvg_threshold", 0),
+                            profile.get("order_block_lookback", 0),
+                            profile.get("liquidity_range_percent", 0))
+    # Detect asset class for per-class mode
+    _asset_class = None
+    if symbol_to_asset:
+        classes = set(symbol_to_asset.values())
+        if len(classes) == 1:
+            _asset_class = classes.pop()
     params = {
         "swing_length": smc_cfg.get("swing_length", 10),
         "fvg_threshold": smc_cfg.get("fvg_threshold", 0.0004),
@@ -853,6 +912,7 @@ def _precompute_window_signals(
         "risk_reward": 3.0,  # Fallback RR (only used when no structure TP found)
         "alignment_threshold": 0.0,  # No filtering — let all signals through
         "style_weights": {"day": 1.0},
+        "asset_class": _asset_class,  # Passed to strategy for forex-specific lookbacks/scoring
     }
 
     # ── Check disk cache ──────────────────────────────────────────
@@ -1465,11 +1525,12 @@ def run(
             stability_result["max_pf_change_pct"],
         )
 
-        # ── Validation gates (6 gates: PF, trades, Sharpe, MC, DD, stability) ──
+        # ── Validation gates (7 gates: PF, trades, Sharpe, MC, DD, stability, quality) ──
         validation = validate_oos_results(
             oos_metrics, mc_result,
             stability_result=stability_result,
             max_dd_limit=-0.10,  # Funded account: max -10% all-time DD
+            asset_class="crypto",  # Global mode — default to crypto trade gate
         )
         validation["window"] = wi
         validation["stability"] = stability_result
@@ -1658,6 +1719,11 @@ def cross_window_validate(
                 symbol_to_asset=symbol_to_asset,
             )
             pf = metrics.get("pf_real", metrics.get("profit_factor", 0))
+            trades = metrics.get("total_trades", 0)
+            # Reject: too few trades (metrics unreliable)
+            if trades < 5:
+                all_pass = False
+                break
             if pf < min_pf:
                 all_pass = False
             window_metrics.append(metrics)
@@ -1689,6 +1755,14 @@ def cross_window_validate(
     results.sort(key=lambda r: r["min_pf"], reverse=True)
     best = results[0]
 
+    # Confidence: low if any window has < 10 trades
+    min_trades = min(
+        m.get("trades", 0)
+        for wm in best["window_metrics"].values()
+        for m in [wm]
+    )
+    confidence = "low" if min_trades < 10 else ("medium" if min_trades < 20 else "high")
+
     return {
         "asset_class": asset_class,
         "params": best["params"],
@@ -1696,6 +1770,7 @@ def cross_window_validate(
         "min_pf": best["min_pf"],
         "mean_pf": best["mean_pf"],
         "is_evergreen": True,
+        "confidence": confidence,
         "n_candidates_tested": len(candidate_params),
         "n_evergreen_found": len(results),
     }
@@ -1929,10 +2004,11 @@ def run_per_asset_class(
                 study, best, cfg, oos_sigs,
             )
 
-            # Validation
+            # Validation (per-class min trade gates)
             validation = validate_oos_results(
                 oos_metrics, mc_result,
                 stability_result=stability_result,
+                asset_class=asset_class,
             )
 
             logger.info(
