@@ -1,42 +1,16 @@
 {
   "asset_class": "commodities",
   "params": {
-    "alignment_threshold": 0.7,
-    "risk_reward": 2.0,
-    "leverage": 10,
-    "risk_per_trade": 0.015,
-    "be_ratchet_r": 1.0,
-    "timeout_rr_threshold": 0.3,
-    "max_hold_bars": 576
+    "alignment_threshold": 0.88,
+    "risk_reward": 3.0,
+    "leverage": 5,
+    "risk_per_trade": 0.005
   },
-  "cross_window_metrics": {
-    "w0": {
-      "pf_real": 6.743656265502009,
-      "winrate_real": 0.7058823529411765,
-      "trades": 21,
-      "dd": -0.03071538676162312,
-      "sharpe": 9.831331983456183
-    },
-    "w1": {
-      "pf_real": 7.632210506395637,
-      "winrate_real": 0.7692307692307693,
-      "trades": 16,
-      "dd": -0.016617126742134027,
-      "sharpe": 12.551437003699231
-    },
-    "w2": {
-      "pf_real": 9.62421223299748,
-      "winrate_real": 0.8,
-      "trades": 16,
-      "dd": -0.010958300431402052,
-      "sharpe": 11.333329591250825
-    }
-  },
-  "min_pf": 6.743656265502009,
-  "mean_pf": 8.000026334965042,
-  "is_evergreen": true,
-  "confidence": "medium",
-  "n_candidates_tested": 3024,
-  "n_evergreen_found": 486,
-  "warnings": []
+  "cross_window_metrics": {},
+  "min_pf": 0.0,
+  "mean_pf": 0.0,
+  "is_evergreen": false,
+  "confidence": "none",
+  "n_candidates_tested": 216,
+  "n_evergreen_found": 0
 }

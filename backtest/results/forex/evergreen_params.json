@@ -11,6 +11,6 @@
   "mean_pf": 0.0,
   "is_evergreen": false,
   "confidence": "none",
-  "n_candidates_tested": 3024,
+  "n_candidates_tested": 216,
   "n_evergreen_found": 0
 }

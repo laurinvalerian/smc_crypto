@@ -787,24 +787,74 @@ Optuna findet Crypto 18x / Commodities 18x weil hoher Leverage Compound-Growth m
 
 OANDA Practice bietet nur 4 Rohstoff-CFDs: XAU_USD, XAG_USD, WTICO_USD, BCO_USD. Weitere (Platin, Palladium, Agrar) sind nicht verfügbar. Performance der 4 ist gut. Kein Handlungsbedarf.
 
+### V16: Kausale SMC-Indikatoren + Erweiterter Bruteforce (2026-03-25)
+
+**KRITISCHER FIX: Externe `smartmoneyconcepts` Library hatte permanenten Lookahead-Bias**
+- `swing_highs_lows()`: `shift(-(swing_length//2))` = 4-10 Bars in die Zukunft
+- `fvg()`: `shift(-1)` = 1 Bar in die Zukunft
+- **Alle** bisherigen SMC-Indikatoren (BOS, CHoCH, FVG, OB, Liquidity) waren kontaminiert
+
+**Fix: Komplett eigene kausale SMC-Indikatoren** (`strategies/smc_multi_style.py`):
+- `_causal_swing_highs_lows()` — `shift(1).rolling()` = nur vergangene Bars
+- `_causal_fvg()` — FVG bestätigt am 3. Bar (kein Future-Peek)
+- `_causal_bos_choch()` — Break-Check VOR Swing-Registration (verhindert Self-Breaks)
+- `_causal_ob()` — Order Blocks basierend auf kausalen Swings
+- `_causal_liquidity()` — Unswept Swing Levels
+- `compute_smc_indicators_causal()` — Drop-in Replacement, gleiche Output-Struktur
+- `SIGNAL_CACHE_VERSION = "v16"` (alle alten Caches automatisch ungültig)
+
+**Bruteforce mit parallelisiertem Grid Search:**
+- `_eval_combo_worker()` + `multiprocessing.Pool(4)` = 400% CPU-Auslastung
+- `_build_grid()` erweitert: 7 align × 4 rr × 3 lev × 3 risk × 3 be × 2 timeout × 2 hold = 3,024 Combos/Klasse
+- Signal-Caches wiederverwendet (nur Grid-Evaluation parallelisiert)
+
+### V16 Bruteforce-Ergebnisse (2026-03-25)
+
+| Klasse | Evergreen | min_PF | Trades/W | WR | Best Params |
+|--------|-----------|--------|----------|-----|-------------|
+| Crypto | 1,251/3,024 (41%) | **11.7** | 25-31 | 75-78% | align=0.85, rr=3.5, lev=3, risk=1%, be=1.0R |
+| Stocks | 576/3,024 (19%) | **3.45** | 12-18 | 40-70% | align=0.85, rr=2.5, lev=1, risk=1.5%, be=1.0R |
+| Commodities | 486/3,024 (16%) | **6.74** | 16-21 | 71-80% | align=0.70, rr=2.0, lev=10, risk=1.5%, be=1.0R |
+| Forex | 0/3,024 (0%) | — | 0-20 | — | — (SMC + Tick-Volume = kaputt) |
+
+### V16 Trade-Level-Analyse — Detaillierte Metriken
+
+**Warum PF immer noch hoch (Reihenfolge der Wichtigkeit):**
+
+1. **~50%: Structure-based TP erzeugt genuinely hohe RR** — 52-87% der Wins haben RR>5.0
+   - Crypto Avg Win RR: 3.3-4.8 (max 8.98R)
+   - Stocks Avg Win RR: 5.3-6.7 (max 12.0R)
+   - Commodities Avg Win RR: 3.1-4.2 (max 5.9R)
+   - Losses IMMER genau -1.0R (SL-Hit)
+
+2. **~30%: Asymmetrische Win/Loss-Grösse** — Wins 3-6× grösser als Losses in Dollar
+   - Crypto: 3.1-6.4× Win/Loss-Ratio
+   - Stocks: 4.9-6.4× Win/Loss-Ratio
+
+3. **~15%: BE-Ratchet bei 1.0R zu aggressiv** — Alle Evergreen-Params wählen be_ratchet_r=1.0
+   - 15-36% der Trades werden Breakeven
+   - Effektive Loss-Rate stark reduziert
+
+4. **~5%: Small Sample Outlier-Konzentration**
+   - Top 3 Wins = 16-51% des gesamten Win-PnL
+   - Crypto W2: nur 2 Losses (PF=466 — Ausreisser)
+
+**Grid-Analyse — Nutzlose vs wichtige Parameter:**
+- **NULL Einfluss auf PF**: leverage, max_hold_bars, timeout_rr_threshold
+- **Wichtig**: alignment_threshold (0.92 = 0% Evergreen), risk_reward (Haupttreiber), be_ratchet_r
+- alignment=0.85 + rr=3.0-3.5 = Sweet Spot für Crypto/Stocks
+
+**Stocks am realistischsten**: W2 WR=40%, PF=3.45, fallendes PF über Windows = kein Curve-Fit
+
 ### Nächste Schritte
 1. **Daten**: ✅ FERTIG + Prefetch komplett
-2. **V12 Fixes**: ✅ GEFIXT — Lookahead-freie Structure-TP + Short-BE Fix + risk_reward Options
-3. **V12b Metriken-Fix**: ✅ GEFIXT — Breakeven-Outcome + ehrliche Metriken + Cache-Versioning
-4. **V12c Backtester-Fix**: ✅ GEFIXT — Equity Cap + risk_per_trade Cap + Stability Fix + OOS Fix
-5. **V12d PF-Cap**: ✅ GEFIXT — PF capped bei 100 wenn n_real_losses=0
-6. **Per-Asset-Class Backtesting**: ✅ FERTIG — Code + erster Run
-7. **Paper Grid**: ✅ FERTIG — 20 Varianten pro Klasse, A/B Testing
-8. **Zombie Prevention**: ✅ FERTIG — 3-Layer Schutz
-9. **Multi-Asset Live Bot**: ✅ FERTIG — 112 Instrumente, 3 Exchanges
-10. **Order Execution Migration**: ✅ FERTIG — alles über `self.adapter`
-11. **V13 Forex+SMC-Profile Fix**: ✅ FERTIG — 7 Code-Fixes implementiert
-12. **V14 Concurrent Position Fix**: ✅ FERTIG — 1 Position/Symbol + Fee-Buffer + Leverage-Caps
-13. **V15 Realistic Metrics**: ✅ FERTIG — BE +1.5R, Timeout-RR-Labels, Objective Caps, Sanity Warnings
-14. **V14+V15 Backtest Reruns**: ✅ FERTIG — Ergebnisse dokumentiert
-15. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (Stocks + Crypto zuerst)
-16. **Paper Trading**: ⏳ 2 Wochen Demo — Stocks (hoch) + Crypto (mittel), Forex/Commodities pausiert
-17. **Live → Funded**: 3× Funded Accounts geplant (erst nach Paper-Validierung)
+2. **V12-V15 Fixes**: ✅ ALLE FERTIG
+3. **V16 Kausale SMC-Indikatoren**: ✅ FERTIG — Eigene Library, kein Lookahead
+4. **V16 Bruteforce**: ✅ FERTIG — 3,024 Combos/Klasse, parallelisiert (4 Cores)
+5. **V17 Grid-Optimierung**: ⏳ Grid von 3,024→216 Combos (nutzlose Params fixieren), be_ratchet≥1.5, Metriken-Fixes
+6. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (Stocks + Crypto zuerst)
+7. **Paper Trading**: ⏳ 2 Wochen Demo — Stocks (hoch) + Crypto (mittel), Forex/Commodities pausiert
+8. **Live → Funded**: 3× Funded Accounts geplant (erst nach Paper-Validierung)
 
 ## Testing & Anti-Overfitting
 

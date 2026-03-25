@@ -506,6 +506,9 @@ def simulate_trades(
         # Actual realized RR (for logging)
         actual_rr = price_pnl_pct / sl_pct if sl_pct > 0 else 0.0
 
+        # Record risk_pct BEFORE equity update (for accurate MC calculations)
+        risk_pct_at_entry = risk_amount / equity if equity > 0 else 0
+
         # Update equity (never go below 0)
         equity = max(0, equity + pnl)
 
@@ -542,7 +545,7 @@ def simulate_trades(
                 "pnl": pnl,
                 "cost": cost,
                 "equity": equity,
-                "risk_pct": risk_amount / equity if equity > 0 else 0,
+                "risk_pct": risk_pct_at_entry,
             }
         )
 
@@ -636,10 +639,12 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     trades_aaa_pp = int((trades_df.get("tier") == TIER_AAA_PLUS_PLUS).sum()) if "tier" in trades_df.columns else 0
     trades_aaa_p = int((trades_df.get("tier") == TIER_AAA_PLUS).sum()) if "tier" in trades_df.columns else 0
 
-    # Expectancy = (winrate × avg_win) - ((1-winrate) × avg_loss)
-    avg_win = float(wins.mean()) if len(wins) > 0 else 0.0
-    avg_loss = abs(float(losses.mean())) if len(losses) > 0 else 0.0
-    expectancy = (winrate * avg_win) - ((1 - winrate) * avg_loss)
+    # Expectancy using REAL wins/losses only (excluding BE trades)
+    real_wins_pnl = pnl[outcomes == "win"] if len(outcomes) > 0 else pnl[pnl > 0]
+    real_losses_pnl = pnl[outcomes == "loss"] if len(outcomes) > 0 else pnl[pnl < 0]
+    avg_win = float(real_wins_pnl.mean()) if len(real_wins_pnl) > 0 else 0.0
+    avg_loss = abs(float(real_losses_pnl.mean())) if len(real_losses_pnl) > 0 else 0.0
+    expectancy = (winrate_real * avg_win) - ((1 - winrate_real) * avg_loss)
 
     return {
         "total_pnl": total_pnl,
@@ -2235,10 +2240,12 @@ def _eval_combo_worker(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         trades = metrics.get("total_trades", 0)
         dd = metrics.get("max_drawdown", 0)
         wr = metrics.get("winrate_real", 0)
-        if (pf < 2.0 or pf > 20.0
+        sharpe = metrics.get("sharpe", 0)
+        if (pf < 2.0 or pf > 15.0   # PF sanity range (tightened from 20)
             or trades < _BF_MIN_TRADES
-            or dd < -0.08
-            or wr > 0.80):
+            or dd < -0.08            # stricter DD gate
+            or wr > 0.80             # unrealistic WR
+            or sharpe > 8.0):        # impossible Sharpe
             all_pass = False
             break
 
@@ -2296,24 +2303,25 @@ def _eval_combo_worker(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str
 
 
 def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Build exhaustive parameter grid for a given asset class."""
-    tuning = config.get("tuning_per_class", {}).get(asset_class, {})
-    lev_min = tuning.get("leverage_min", 3)
-    lev_max = tuning.get("leverage_max", 10)
+    """Build exhaustive parameter grid for a given asset class.
 
-    # 3 leverage steps (min, mid, max)
-    lev_mid = (lev_min + lev_max) // 2
-    lev_vals = sorted(set([lev_min, lev_mid, lev_max]))
+    V17: Optimized grid — removed parameters with zero PF impact:
+    - leverage: fixed per class (doesn't affect PF, only position sizing)
+    - max_hold_bars: fixed at 576 (no PF difference 288 vs 576)
+    - timeout_rr_threshold: fixed at 0.5 (no PF difference)
+    - alignment 0.92 removed (produces 0% evergreen across all classes)
+    - be_ratchet_r floor raised to 1.5 (1.0R too easily triggered = inflated WR)
+    """
+    # Fixed leverage per class (conservative — tune in Paper Grid instead)
+    FIXED_LEVERAGE = {"crypto": 5, "stocks": 1, "commodities": 5, "forex": 10}
+    lev = FIXED_LEVERAGE.get(asset_class, 5)
 
     grid = []
-    for align, rr, lev, risk, be_r, to_r, max_b in itertools.product(
-        [0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.92],  # 7 values
-        [2.0, 2.5, 3.0, 3.5],                          # 4 values
-        lev_vals,                                        # 3 values
-        [0.005, 0.010, 0.015],                          # 3 values
-        [1.0, 1.5, 2.0],                                # 3 BE ratchet R
-        [0.3, 0.5],                                      # 2 Timeout RR threshold
-        [288, 576],                                      # 2 Max hold bars (24h, 48h)
+    for align, rr, risk, be_r in itertools.product(
+        [0.70, 0.75, 0.80, 0.85, 0.88, 0.90],  # 6 values (dropped 0.92)
+        [2.0, 2.5, 3.0, 3.5],                    # 4 values
+        [0.005, 0.010, 0.015],                    # 3 values
+        [1.5, 2.0, 2.5],                          # 3 BE ratchet R (floor 1.5)
     ):
         grid.append({
             "alignment_threshold": align,
@@ -2321,8 +2329,8 @@ def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]
             "leverage": lev,
             "risk_per_trade": risk,
             "be_ratchet_r": be_r,
-            "timeout_rr_threshold": to_r,
-            "max_hold_bars": max_b,
+            "timeout_rr_threshold": 0.5,   # Fixed — zero PF impact
+            "max_hold_bars": 576,           # Fixed — zero PF impact
         })
     return grid
 
@@ -2364,7 +2372,7 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
     logger.info("Walk-forward windows: %d", len(windows))
 
     # Min trades per window (asset-class specific)
-    MIN_TRADES = {"crypto": 10, "stocks": 10, "forex": 5, "commodities": 5}
+    MIN_TRADES = {"crypto": 15, "stocks": 15, "forex": 5, "commodities": 10}
 
     evergreen_results: dict[str, dict[str, Any]] = {}
 
