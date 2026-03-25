@@ -52,4 +52,5 @@ rl_models/
 *.pt
 
 # Logs
-*.log
+*.logbacktest/results/signal_cache/
+backtest/results/
