@@ -52,15 +52,21 @@ rl_models/
 *.pt
 
 # Logs
-*.logbacktest/results/signal_cache/
-backtest/results/
+*.log
 
+# Backtest cache & results
+backtest/results/
 backtest/results/signal_cache/
+backtests/results
+
+# Data logs
+data/*.log
+data/**/*.log
+
+# Binary/data artifacts
 *.pkl
 *.h5
 *.parquet
-
-backtests/results
 
 .omc
 .claude

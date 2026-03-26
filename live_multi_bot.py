@@ -197,7 +197,7 @@ FIXED_SMC_PARAMS: dict[str, Any] = ASSET_SMC_PARAMS["crypto"]
 
 # ── Asset-Class Leverage Caps ────────────────────────────────────
 ASSET_MAX_LEVERAGE: dict[str, int] = {
-    "crypto": 20, "forex": 30, "stocks": 4, "commodities": 20,
+    "crypto": 10, "forex": 15, "stocks": 4, "commodities": 10,
 }
 
 # ── Asset-Class IDs for RL Brain ─────────────────────────────────
@@ -408,7 +408,7 @@ class PaperBot:
 
         # Asset-class-specific commission & leverage
         self.commission_rate: float = ASSET_COMMISSION.get(asset_class, 0.0004)
-        self.max_asset_leverage: int = ASSET_MAX_LEVERAGE.get(asset_class, 20)
+        self.max_asset_leverage: int = ASSET_MAX_LEVERAGE.get(asset_class, 10)
 
         self.risk_pct: float = FIXED_RISK_PCT
         self.rr_ratio: float = FIXED_RR_MIN

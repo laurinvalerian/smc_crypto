@@ -72,16 +72,16 @@ aaa_plus_plus:
   tiers:
     "AAA++":
       min_score: 0.88
-      min_rr: 5.0
+      min_rr: 3.0
       base_risk: 0.01       # 1.0%
       max_risk: 0.015        # 1.5%
-      max_leverage: 50
+      max_leverage: 10
     "AAA+":
       min_score: 0.78
-      min_rr: 4.0
+      min_rr: 2.0
       base_risk: 0.005       # 0.5%
       max_risk: 0.01          # 1.0%
-      max_leverage: 30
+      max_leverage: 10
 
 # ── Multi-Asset SMC Profiles ────────────────────────────────────
 smc_profiles:
