@@ -189,6 +189,7 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
     }
     offset = tf_offset.get(target_tf, target_tf)
     tmp = df.set_index("timestamp")
+    tmp.index = pd.to_datetime(tmp.index, utc=True)
     resampled = tmp.resample(offset).agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     ).dropna(subset=["open"])
@@ -258,27 +259,56 @@ def run(
         safe_name = symbol.replace(".", "_")
         out_path = stocks_dir / f"{safe_name}_5m.parquet"
 
-        # Resume support
+        # Resume support — checks both forward (new data) AND backward (older start_date)
+        need_forward = True
+        need_backward = False
         actual_from = from_dt
         if out_path.exists():
             existing = pd.read_parquet(out_path, columns=["timestamp"])
             if not existing.empty:
                 last_ts = existing["timestamp"].max()
+                first_ts = existing["timestamp"].min()
                 resume_from = last_ts.to_pydatetime() + timedelta(minutes=5)
                 if resume_from >= to_dt - timedelta(hours=1):
-                    logger.info("Skipping %s (up-to-date)", symbol)
-                    continue
-                logger.info("Resuming %s from %s", symbol, last_ts)
-                actual_from = resume_from
+                    need_forward = False
+                else:
+                    logger.info("Resuming %s forward from %s", symbol, last_ts)
+                    actual_from = resume_from
+                # Check if we need older data (backfill)
+                if from_dt < first_ts.to_pydatetime().replace(tzinfo=from_dt.tzinfo) - timedelta(hours=1):
+                    need_backward = True
+                    logger.info("Backfilling %s from %s to %s", symbol, from_dt, first_ts)
 
-        df_5m = download_ohlcv_alpaca(client, symbol, "5m", actual_from, to_dt)
-
-        if df_5m.empty:
-            logger.warning("No data for %s — skipping", symbol)
+        if not need_forward and not need_backward:
+            logger.info("Skipping %s (up-to-date)", symbol)
             continue
 
-        # Merge with existing if resuming
-        if out_path.exists() and actual_from != from_dt:
+        dfs_to_merge = []
+
+        # Backfill older data
+        if need_backward and out_path.exists():
+            existing_df = pd.read_parquet(out_path, columns=["timestamp"])
+            first_ts = existing_df["timestamp"].min()
+            backfill_to = first_ts.to_pydatetime().replace(tzinfo=from_dt.tzinfo)
+            df_back = download_ohlcv_alpaca(client, symbol, "5m", from_dt, backfill_to)
+            if not df_back.empty:
+                logger.info("Backfilled %d bars for %s", len(df_back), symbol)
+                dfs_to_merge.append(df_back)
+
+        # Forward data
+        if need_forward:
+            df_fwd = download_ohlcv_alpaca(client, symbol, "5m", actual_from, to_dt)
+            if not df_fwd.empty:
+                dfs_to_merge.append(df_fwd)
+
+        if not dfs_to_merge:
+            logger.warning("No new data for %s — skipping", symbol)
+            continue
+
+        df_5m = pd.concat(dfs_to_merge, ignore_index=True)
+
+        # Merge with existing
+        if out_path.exists():
             old_df = pd.read_parquet(out_path)
             df_5m = pd.concat([old_df, df_5m]).drop_duplicates(
                 subset=["timestamp"]

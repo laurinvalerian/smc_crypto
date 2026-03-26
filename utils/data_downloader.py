@@ -102,6 +102,10 @@ def download_ohlcv(
     Returns a DataFrame with columns:
         timestamp, open, high, low, close, volume
     """
+    # Calculate ms per bar for this timeframe
+    tf_multipliers = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+    ms_per_bar = tf_multipliers.get(timeframe, 1) * MS_PER_MINUTE
+
     all_candles: list[list] = []
     fetch_since = since_ms
 
@@ -125,7 +129,7 @@ def download_ohlcv(
             break
 
         all_candles.extend(candles)
-        fetch_since = candles[-1][0] + MS_PER_MINUTE  # Next batch starts 1 min after last
+        fetch_since = candles[-1][0] + ms_per_bar  # Next batch starts 1 bar after last
         time.sleep(RATE_LIMIT_SLEEP)
 
     if not all_candles:
@@ -187,8 +191,8 @@ def compute_volume_rankings(
     records: list[dict] = []
 
     for symbol in tqdm(symbols, desc="Computing volume rankings"):
-        safe = symbol.replace("/", "_").replace(":", "_")
-        parquet_path = data_dir / f"{safe}_1m.parquet"
+        safe = symbol.replace("/", "").replace(":USDT", "")
+        parquet_path = data_dir / f"{safe}_5m.parquet"
         if not parquet_path.exists():
             continue
 
@@ -249,7 +253,7 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     start_date = cfg["data"]["start_date"]
-    resample_tfs = cfg["data"]["resample_tfs"]
+    # Not used anymore — TFs are downloaded directly, not resampled
 
     since_ms = int(
         datetime.strptime(start_date, "%Y-%m-%d")
@@ -267,68 +271,97 @@ def run(config_path: str = "config/default_config.yaml") -> None:
     all_symbols = get_usdt_perp_symbols(exchange)
     rank_threshold = cfg["volume_filter"].get("rank_threshold", 100)
 
-    # Sort by 24h quote volume (descending) to get top coins
+    # Use fetch_tickers() for real 24h volume (market info quoteVolume is 0/None for major coins)
+    logger.info("Fetching 24h ticker volume for %d symbols ...", len(all_symbols))
+    try:
+        tickers = exchange.fetch_tickers(all_symbols)
+    except Exception as exc:
+        logger.warning("fetch_tickers failed (%s), falling back to market info", exc)
+        tickers = {}
+
     vol_ranked = []
     for sym in all_symbols:
-        mkt = exchange.markets.get(sym, {})
-        info = mkt.get("info", {})
-        qvol = float(info.get("quoteVolume", 0) or 0)
+        ticker = tickers.get(sym, {})
+        qvol = float(ticker.get("quoteVolume", 0) or 0)
         vol_ranked.append((sym, qvol))
     vol_ranked.sort(key=lambda x: x[1], reverse=True)
 
-    # Take top N and convert to Binance format (remove / and :)
-    symbols = []
-    for sym, _vol in vol_ranked[:rank_threshold]:
-        safe = sym.replace("/", "").replace(":USDT", "")
-        symbols.append(safe)
+    # Take top N — use max_crypto_symbols if set (default: top 30 for trading/backtesting)
+    max_symbols = cfg["volume_filter"].get("max_crypto_symbols", rank_threshold)
+    symbols = [sym for sym, _vol in vol_ranked[:max_symbols]]
 
-    logger.info(f"Top {len(symbols)} USDT-M Futures coins by volume")
+    logger.info("Top %d USDT-M Futures coins by 24h volume", len(symbols))
+    logger.info("Top 10: %s", [s.split("/")[0] for s, _ in vol_ranked[:10]])
 
-    # ── 2. Download 1 m candles per symbol (parallel) ─────────────
+    # ── 2. Download ALL timeframes directly per symbol (parallel) ──
+    # No more 1m download + resample — fetch each TF directly from Binance
+    # This is 5x faster and uses 5x less disk than downloading 1m
+    download_tfs = ["5m", "15m", "1h", "4h", "1d"]
+    # Milliseconds per bar for each TF (for resume logic)
+    TF_MS = {"5m": 5*60_000, "15m": 15*60_000, "1h": 60*60_000,
+             "4h": 4*60*60_000, "1d": 24*60*60_000}
     num_workers = getattr(run, '_workers', NUM_WORKERS)
 
     def _download_one(symbol: str) -> str:
-        """Download a single symbol (runs in its own thread with own exchange)."""
+        """Download all timeframes for a single symbol."""
         thread_exchange = create_exchange(cfg)
-        safe = symbol.replace("/", "_").replace(":", "_")
-        out_path = data_dir / f"{safe}_1m.parquet"
+        # CCXT format: BTC/USDT:USDT → filename: BTCUSDT
+        safe = symbol.replace("/", "").replace(":USDT", "")
 
-        # Resume: skip if file already exists and is recent
-        if out_path.exists():
-            existing = pd.read_parquet(out_path, columns=["timestamp"])
-            if not existing.empty:
-                last_ts = existing["timestamp"].max()
-                resume_ms = int(last_ts.timestamp() * 1000) + MS_PER_MINUTE
-                if resume_ms >= until_ms - MS_PER_MINUTE * 60:
-                    logger.info("Skipping %s (up-to-date)", symbol)
-                    return f"skip:{symbol}"
-                logger.info("Resuming %s from %s", symbol, last_ts)
-                new_df = download_ohlcv(thread_exchange, symbol, "1m", resume_ms, until_ms)
-                if not new_df.empty:
-                    old_df = pd.read_parquet(out_path)
-                    df_1m = pd.concat([old_df, new_df]).drop_duplicates(
-                        subset=["timestamp"]
-                    ).sort_values("timestamp").reset_index(drop=True)
-                    save_parquet(df_1m, out_path)
-                return f"resume:{symbol}"
+        for tf in download_tfs:
+            out_path = data_dir / f"{safe}_{tf}.parquet"
+            tf_ms = TF_MS[tf]
 
-        df_1m = download_ohlcv(thread_exchange, symbol, "1m", since_ms, until_ms)
-        if df_1m.empty:
-            logger.warning("No data for %s – skipping", symbol)
-            return f"empty:{symbol}"
+            # Resume: check both forward AND backward
+            actual_since = since_ms
+            actual_until = until_ms
+            need_download = True
 
-        save_parquet(df_1m, out_path)
+            if out_path.exists():
+                existing = pd.read_parquet(out_path, columns=["timestamp"])
+                if not existing.empty:
+                    last_ts = existing["timestamp"].max()
+                    first_ts = existing["timestamp"].min()
+                    last_ms = int(last_ts.timestamp() * 1000)
+                    first_ms = int(first_ts.timestamp() * 1000)
 
-        # Resample & save higher timeframes
-        for tf in resample_tfs:
-            tf_df = resample_ohlcv(df_1m, tf)
-            tf_path = data_dir / f"{safe}_{tf}.parquet"
-            save_parquet(tf_df, tf_path)
+                    need_forward = last_ms + tf_ms < until_ms - tf_ms
+                    need_backward = since_ms < first_ms - tf_ms
+
+                    if not need_forward and not need_backward:
+                        continue  # This TF is up-to-date
+
+                    dfs_to_merge = []
+                    if need_backward:
+                        logger.info("Backfilling %s %s from %s", symbol, tf,
+                                    pd.Timestamp(since_ms, unit='ms', tz='UTC').date())
+                        back_df = download_ohlcv(thread_exchange, symbol, tf, since_ms, first_ms)
+                        if not back_df.empty:
+                            dfs_to_merge.append(back_df)
+                    if need_forward:
+                        fwd_df = download_ohlcv(thread_exchange, symbol, tf, last_ms + tf_ms, until_ms)
+                        if not fwd_df.empty:
+                            dfs_to_merge.append(fwd_df)
+
+                    if dfs_to_merge:
+                        old_df = pd.read_parquet(out_path)
+                        all_dfs = [old_df] + dfs_to_merge
+                        merged = pd.concat(all_dfs).drop_duplicates(
+                            subset=["timestamp"]
+                        ).sort_values("timestamp").reset_index(drop=True)
+                        save_parquet(merged, out_path)
+                    need_download = False
+
+            if need_download:
+                df = download_ohlcv(thread_exchange, symbol, tf, since_ms, until_ms)
+                if not df.empty:
+                    save_parquet(df, out_path)
 
         return f"done:{symbol}"
 
-    logger.info("Downloading with %d parallel workers", num_workers)
-    progress = tqdm(total=len(symbols), desc="Downloading 1m data")
+    logger.info("Downloading %d TFs directly (no 1m resample) with %d workers",
+                len(download_tfs), num_workers)
+    progress = tqdm(total=len(symbols), desc="Downloading all TFs")
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {executor.submit(_download_one, sym): sym for sym in symbols}

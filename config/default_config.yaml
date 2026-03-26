@@ -141,10 +141,10 @@ tuning_per_class:
 # ── Data ──────────────────────────────────────────────────────────
 data:
   exchange: "binanceusdm"  # CCXT exchange id (Binance USDT-M Futures)
-  base_tf: "1m"            # Lowest timeframe to download
-  resample_tfs: ["5m", "15m", "1h", "4h", "1d"]
-  start_date: "2025-03-01" # Walk-Forward-Start (5m Daten verfügbar ab hier)
-  history_start: "2024-01-01" # Higher-TF-History für EMA200 Warmup (via prefetch_history)
+  base_tf: "5m"            # Lowest timeframe to download (no 1m needed — saves 5x disk/time)
+  download_tfs: ["5m", "15m", "1h", "4h", "1d"]  # All TFs fetched directly from exchange
+  start_date: "2023-01-01" # 3 Jahre Daten für RL Training (Bull/Bear/Sideways Zyklen)
+  history_start: "2022-01-01" # Higher-TF-History für EMA200 Warmup (1 Jahr vor start_date)
   data_dir: "data"         # Where Parquet files are stored
   # Per-asset-class data directories
   crypto_dir: "data/crypto"

@@ -1,0 +1,355 @@
+2026-03-26 05:53:23,394 [INFO] OANDA v20 client connected (api-fxpractice.oanda.com)
+2026-03-26 05:53:23,395 [INFO] [1/32] Downloading EUR_USD (forex) — all TFs direct ...
+2026-03-26 05:53:23,424 [INFO]   Backfilling EUR_USD 5m from 2023-01-01
+2026-03-26 05:54:01,926 [INFO] Saved 241052 rows -> data/forex/EUR_USD_5m.parquet
+2026-03-26 05:54:01,935 [INFO]   Backfilling EUR_USD 15m from 2023-01-01
+2026-03-26 05:54:15,759 [INFO] Saved 80370 rows -> data/forex/EUR_USD_15m.parquet
+2026-03-26 05:54:15,766 [INFO]   Backfilling EUR_USD 1h from 2023-01-01
+2026-03-26 05:54:19,389 [INFO] Saved 20094 rows -> data/forex/EUR_USD_1h.parquet
+2026-03-26 05:54:19,393 [INFO]   Backfilling EUR_USD 4h from 2023-01-01
+2026-03-26 05:54:20,355 [INFO] Saved 5082 rows -> data/forex/EUR_USD_4h.parquet
+2026-03-26 05:54:20,360 [INFO]   Backfilling EUR_USD 1d from 2023-01-01
+2026-03-26 05:54:21,159 [INFO] Saved 896 rows -> data/forex/EUR_USD_1d.parquet
+2026-03-26 05:54:21,159 [INFO] [2/32] Downloading GBP_USD (forex) — all TFs direct ...
+2026-03-26 05:54:21,173 [INFO]   Backfilling GBP_USD 5m from 2023-01-01
+2026-03-26 05:55:00,795 [INFO] Saved 241037 rows -> data/forex/GBP_USD_5m.parquet
+2026-03-26 05:55:00,802 [INFO]   Backfilling GBP_USD 15m from 2023-01-01
+2026-03-26 05:55:14,727 [INFO] Saved 80369 rows -> data/forex/GBP_USD_15m.parquet
+2026-03-26 05:55:14,732 [INFO]   Backfilling GBP_USD 1h from 2023-01-01
+2026-03-26 05:55:18,405 [INFO] Saved 20094 rows -> data/forex/GBP_USD_1h.parquet
+2026-03-26 05:55:18,410 [INFO]   Backfilling GBP_USD 4h from 2023-01-01
+2026-03-26 05:55:19,606 [INFO] Saved 5082 rows -> data/forex/GBP_USD_4h.parquet
+2026-03-26 05:55:19,612 [INFO]   Backfilling GBP_USD 1d from 2023-01-01
+2026-03-26 05:55:20,487 [INFO] Saved 896 rows -> data/forex/GBP_USD_1d.parquet
+2026-03-26 05:55:20,487 [INFO] [3/32] Downloading USD_JPY (forex) — all TFs direct ...
+2026-03-26 05:55:20,511 [INFO]   Backfilling USD_JPY 5m from 2023-01-01
+2026-03-26 05:55:59,233 [INFO] Saved 241028 rows -> data/forex/USD_JPY_5m.parquet
+2026-03-26 05:55:59,243 [INFO]   Backfilling USD_JPY 15m from 2023-01-01
+2026-03-26 05:56:13,027 [INFO] Saved 80372 rows -> data/forex/USD_JPY_15m.parquet
+2026-03-26 05:56:13,032 [INFO]   Backfilling USD_JPY 1h from 2023-01-01
+2026-03-26 05:56:16,614 [INFO] Saved 20094 rows -> data/forex/USD_JPY_1h.parquet
+2026-03-26 05:56:16,620 [INFO]   Backfilling USD_JPY 4h from 2023-01-01
+2026-03-26 05:56:17,562 [INFO] Saved 5082 rows -> data/forex/USD_JPY_4h.parquet
+2026-03-26 05:56:17,568 [INFO]   Backfilling USD_JPY 1d from 2023-01-01
+2026-03-26 05:56:18,480 [INFO] Saved 896 rows -> data/forex/USD_JPY_1d.parquet
+2026-03-26 05:56:18,481 [INFO] [4/32] Downloading AUD_USD (forex) — all TFs direct ...
+2026-03-26 05:56:18,495 [INFO]   Backfilling AUD_USD 5m from 2023-01-01
+2026-03-26 05:56:57,786 [INFO] Saved 241022 rows -> data/forex/AUD_USD_5m.parquet
+2026-03-26 05:56:57,794 [INFO]   Backfilling AUD_USD 15m from 2023-01-01
+2026-03-26 05:57:11,133 [INFO] Saved 80371 rows -> data/forex/AUD_USD_15m.parquet
+2026-03-26 05:57:11,140 [INFO]   Backfilling AUD_USD 1h from 2023-01-01
+2026-03-26 05:57:14,522 [INFO] Saved 20094 rows -> data/forex/AUD_USD_1h.parquet
+2026-03-26 05:57:14,527 [INFO]   Backfilling AUD_USD 4h from 2023-01-01
+2026-03-26 05:57:15,507 [INFO] Saved 5082 rows -> data/forex/AUD_USD_4h.parquet
+2026-03-26 05:57:15,512 [INFO]   Backfilling AUD_USD 1d from 2023-01-01
+2026-03-26 05:57:16,306 [INFO] Saved 896 rows -> data/forex/AUD_USD_1d.parquet
+2026-03-26 05:57:16,306 [INFO] [5/32] Downloading USD_CHF (forex) — all TFs direct ...
+2026-03-26 05:57:16,321 [INFO]   Backfilling USD_CHF 5m from 2023-01-01
+2026-03-26 05:57:55,175 [INFO] Saved 240866 rows -> data/forex/USD_CHF_5m.parquet
+2026-03-26 05:57:55,183 [INFO]   Backfilling USD_CHF 15m from 2023-01-01
+2026-03-26 05:58:08,694 [INFO] Saved 80367 rows -> data/forex/USD_CHF_15m.parquet
+2026-03-26 05:58:08,701 [INFO]   Backfilling USD_CHF 1h from 2023-01-01
+2026-03-26 05:58:11,989 [INFO] Saved 20094 rows -> data/forex/USD_CHF_1h.parquet
+2026-03-26 05:58:11,994 [INFO]   Backfilling USD_CHF 4h from 2023-01-01
+2026-03-26 05:58:12,961 [INFO] Saved 5082 rows -> data/forex/USD_CHF_4h.parquet
+2026-03-26 05:58:12,967 [INFO]   Backfilling USD_CHF 1d from 2023-01-01
+2026-03-26 05:58:13,803 [INFO] Saved 896 rows -> data/forex/USD_CHF_1d.parquet
+2026-03-26 05:58:13,803 [INFO] [6/32] Downloading USD_CAD (forex) — all TFs direct ...
+2026-03-26 05:58:13,819 [INFO]   Backfilling USD_CAD 5m from 2023-01-01
+2026-03-26 05:58:52,211 [INFO] Saved 241026 rows -> data/forex/USD_CAD_5m.parquet
+2026-03-26 05:58:52,219 [INFO]   Backfilling USD_CAD 15m from 2023-01-01
+2026-03-26 05:59:05,802 [INFO] Saved 80371 rows -> data/forex/USD_CAD_15m.parquet
+2026-03-26 05:59:05,807 [INFO]   Backfilling USD_CAD 1h from 2023-01-01
+2026-03-26 05:59:09,234 [INFO] Saved 20094 rows -> data/forex/USD_CAD_1h.parquet
+2026-03-26 05:59:09,239 [INFO]   Backfilling USD_CAD 4h from 2023-01-01
+2026-03-26 05:59:10,162 [INFO] Saved 5082 rows -> data/forex/USD_CAD_4h.parquet
+2026-03-26 05:59:10,166 [INFO]   Backfilling USD_CAD 1d from 2023-01-01
+2026-03-26 05:59:11,082 [INFO] Saved 896 rows -> data/forex/USD_CAD_1d.parquet
+2026-03-26 05:59:11,083 [INFO] [7/32] Downloading NZD_USD (forex) — all TFs direct ...
+2026-03-26 05:59:11,098 [INFO]   Backfilling NZD_USD 5m from 2023-01-01
+2026-03-26 05:59:50,619 [INFO] Saved 240970 rows -> data/forex/NZD_USD_5m.parquet
+2026-03-26 05:59:50,626 [INFO]   Backfilling NZD_USD 15m from 2023-01-01
+2026-03-26 06:00:06,270 [INFO] Saved 80370 rows -> data/forex/NZD_USD_15m.parquet
+2026-03-26 06:00:06,276 [INFO]   Backfilling NZD_USD 1h from 2023-01-01
+2026-03-26 06:00:10,083 [INFO] Saved 20098 rows -> data/forex/NZD_USD_1h.parquet
+2026-03-26 06:00:10,088 [INFO]   Backfilling NZD_USD 4h from 2023-01-01
+2026-03-26 06:00:11,369 [INFO] Saved 5084 rows -> data/forex/NZD_USD_4h.parquet
+2026-03-26 06:00:11,375 [INFO]   Backfilling NZD_USD 1d from 2023-01-01
+2026-03-26 06:00:12,199 [INFO] Saved 898 rows -> data/forex/NZD_USD_1d.parquet
+2026-03-26 06:00:12,199 [INFO] [8/32] Downloading EUR_GBP (forex) — all TFs direct ...
+2026-03-26 06:00:12,216 [INFO]   Backfilling EUR_GBP 5m from 2023-01-01
+2026-03-26 06:00:53,538 [INFO] Saved 241042 rows -> data/forex/EUR_GBP_5m.parquet
+2026-03-26 06:00:53,547 [INFO]   Backfilling EUR_GBP 15m from 2023-01-01
+2026-03-26 06:01:06,913 [INFO] Saved 80370 rows -> data/forex/EUR_GBP_15m.parquet
+2026-03-26 06:01:06,921 [INFO]   Backfilling EUR_GBP 1h from 2023-01-01
+2026-03-26 06:01:10,250 [INFO] Saved 20094 rows -> data/forex/EUR_GBP_1h.parquet
+2026-03-26 06:01:10,255 [INFO]   Backfilling EUR_GBP 4h from 2023-01-01
+2026-03-26 06:01:11,384 [INFO] Saved 5082 rows -> data/forex/EUR_GBP_4h.parquet
+2026-03-26 06:01:11,388 [INFO]   Backfilling EUR_GBP 1d from 2023-01-01
+2026-03-26 06:01:12,202 [INFO] Saved 896 rows -> data/forex/EUR_GBP_1d.parquet
+2026-03-26 06:01:12,202 [INFO] [9/32] Downloading EUR_JPY (forex) — all TFs direct ...
+2026-03-26 06:01:12,217 [INFO]   Backfilling EUR_JPY 5m from 2023-01-01
+2026-03-26 06:01:50,990 [INFO] Saved 241031 rows -> data/forex/EUR_JPY_5m.parquet
+2026-03-26 06:01:51,000 [INFO]   Backfilling EUR_JPY 15m from 2023-01-01
+2026-03-26 06:02:04,321 [INFO] Saved 80368 rows -> data/forex/EUR_JPY_15m.parquet
+2026-03-26 06:02:04,328 [INFO]   Backfilling EUR_JPY 1h from 2023-01-01
+2026-03-26 06:02:07,700 [INFO] Saved 20094 rows -> data/forex/EUR_JPY_1h.parquet
+2026-03-26 06:02:07,704 [INFO]   Backfilling EUR_JPY 4h from 2023-01-01
+2026-03-26 06:02:08,700 [INFO] Saved 5082 rows -> data/forex/EUR_JPY_4h.parquet
+2026-03-26 06:02:08,705 [INFO]   Backfilling EUR_JPY 1d from 2023-01-01
+2026-03-26 06:02:09,597 [INFO] Saved 896 rows -> data/forex/EUR_JPY_1d.parquet
+2026-03-26 06:02:09,597 [INFO] [10/32] Downloading EUR_CHF (forex) — all TFs direct ...
+2026-03-26 06:02:09,613 [INFO]   Backfilling EUR_CHF 5m from 2023-01-01
+2026-03-26 06:02:48,054 [INFO] Saved 240868 rows -> data/forex/EUR_CHF_5m.parquet
+2026-03-26 06:02:48,062 [INFO]   Backfilling EUR_CHF 15m from 2023-01-01
+2026-03-26 06:03:01,274 [INFO] Saved 80360 rows -> data/forex/EUR_CHF_15m.parquet
+2026-03-26 06:03:01,281 [INFO]   Backfilling EUR_CHF 1h from 2023-01-01
+2026-03-26 06:03:04,628 [INFO] Saved 20094 rows -> data/forex/EUR_CHF_1h.parquet
+2026-03-26 06:03:04,633 [INFO]   Backfilling EUR_CHF 4h from 2023-01-01
+2026-03-26 06:03:05,697 [INFO] Saved 5082 rows -> data/forex/EUR_CHF_4h.parquet
+2026-03-26 06:03:05,703 [INFO]   Backfilling EUR_CHF 1d from 2023-01-01
+2026-03-26 06:03:06,511 [INFO] Saved 896 rows -> data/forex/EUR_CHF_1d.parquet
+2026-03-26 06:03:06,512 [INFO] [11/32] Downloading EUR_AUD (forex) — all TFs direct ...
+2026-03-26 06:03:06,526 [INFO]   Backfilling EUR_AUD 5m from 2023-01-01
+2026-03-26 06:03:45,391 [INFO] Saved 240983 rows -> data/forex/EUR_AUD_5m.parquet
+2026-03-26 06:03:45,400 [INFO]   Backfilling EUR_AUD 15m from 2023-01-01
+2026-03-26 06:03:58,850 [INFO] Saved 80355 rows -> data/forex/EUR_AUD_15m.parquet
+2026-03-26 06:03:58,856 [INFO]   Backfilling EUR_AUD 1h from 2023-01-01
+2026-03-26 06:04:02,477 [INFO] Saved 20093 rows -> data/forex/EUR_AUD_1h.parquet
+2026-03-26 06:04:02,483 [INFO]   Backfilling EUR_AUD 4h from 2023-01-01
+2026-03-26 06:04:03,432 [INFO] Saved 5082 rows -> data/forex/EUR_AUD_4h.parquet
+2026-03-26 06:04:03,437 [INFO]   Backfilling EUR_AUD 1d from 2023-01-01
+2026-03-26 06:04:04,274 [INFO] Saved 896 rows -> data/forex/EUR_AUD_1d.parquet
+2026-03-26 06:04:04,274 [INFO] [12/32] Downloading EUR_CAD (forex) — all TFs direct ...
+2026-03-26 06:04:04,287 [INFO]   Backfilling EUR_CAD 5m from 2023-01-01
+2026-03-26 06:04:42,987 [INFO] Saved 240953 rows -> data/forex/EUR_CAD_5m.parquet
+2026-03-26 06:04:42,994 [INFO]   Backfilling EUR_CAD 15m from 2023-01-01
+2026-03-26 06:04:56,546 [INFO] Saved 80358 rows -> data/forex/EUR_CAD_15m.parquet
+2026-03-26 06:04:56,552 [INFO]   Backfilling EUR_CAD 1h from 2023-01-01
+2026-03-26 06:05:00,005 [INFO] Saved 20094 rows -> data/forex/EUR_CAD_1h.parquet
+2026-03-26 06:05:00,012 [INFO]   Backfilling EUR_CAD 4h from 2023-01-01
+2026-03-26 06:05:01,061 [INFO] Saved 5082 rows -> data/forex/EUR_CAD_4h.parquet
+2026-03-26 06:05:01,068 [INFO]   Backfilling EUR_CAD 1d from 2023-01-01
+2026-03-26 06:05:01,900 [INFO] Saved 896 rows -> data/forex/EUR_CAD_1d.parquet
+2026-03-26 06:05:01,901 [INFO] [13/32] Downloading EUR_NZD (forex) — all TFs direct ...
+2026-03-26 06:05:01,913 [INFO]   Backfilling EUR_NZD 5m from 2023-01-01
+2026-03-26 06:05:40,955 [INFO] Saved 240795 rows -> data/forex/EUR_NZD_5m.parquet
+2026-03-26 06:05:40,962 [INFO]   Backfilling EUR_NZD 15m from 2023-01-01
+2026-03-26 06:05:54,271 [INFO] Saved 80341 rows -> data/forex/EUR_NZD_15m.parquet
+2026-03-26 06:05:54,277 [INFO]   Backfilling EUR_NZD 1h from 2023-01-01
+2026-03-26 06:05:57,672 [INFO] Saved 20094 rows -> data/forex/EUR_NZD_1h.parquet
+2026-03-26 06:05:57,679 [INFO]   Backfilling EUR_NZD 4h from 2023-01-01
+2026-03-26 06:05:58,935 [INFO] Saved 5084 rows -> data/forex/EUR_NZD_4h.parquet
+2026-03-26 06:05:58,940 [INFO]   Backfilling EUR_NZD 1d from 2023-01-01
+2026-03-26 06:05:59,750 [INFO] Saved 898 rows -> data/forex/EUR_NZD_1d.parquet
+2026-03-26 06:05:59,750 [INFO] [14/32] Downloading GBP_JPY (forex) — all TFs direct ...
+2026-03-26 06:05:59,767 [INFO]   Backfilling GBP_JPY 5m from 2023-01-01
+2026-03-26 06:06:40,243 [INFO] Saved 241021 rows -> data/forex/GBP_JPY_5m.parquet
+2026-03-26 06:06:40,251 [INFO]   Backfilling GBP_JPY 15m from 2023-01-01
+2026-03-26 06:06:54,508 [INFO] Saved 80366 rows -> data/forex/GBP_JPY_15m.parquet
+2026-03-26 06:06:54,513 [INFO]   Backfilling GBP_JPY 1h from 2023-01-01
+2026-03-26 06:06:58,186 [INFO] Saved 20094 rows -> data/forex/GBP_JPY_1h.parquet
+2026-03-26 06:06:58,191 [INFO]   Backfilling GBP_JPY 4h from 2023-01-01
+2026-03-26 06:06:59,232 [INFO] Saved 5082 rows -> data/forex/GBP_JPY_4h.parquet
+2026-03-26 06:06:59,237 [INFO]   Backfilling GBP_JPY 1d from 2023-01-01
+2026-03-26 06:07:00,027 [INFO] Saved 896 rows -> data/forex/GBP_JPY_1d.parquet
+2026-03-26 06:07:00,027 [INFO] [15/32] Downloading GBP_CHF (forex) — all TFs direct ...
+2026-03-26 06:07:00,042 [INFO]   Backfilling GBP_CHF 5m from 2023-01-01
+2026-03-26 06:07:40,207 [INFO] Saved 240162 rows -> data/forex/GBP_CHF_5m.parquet
+2026-03-26 06:07:40,215 [INFO]   Backfilling GBP_CHF 15m from 2023-01-01
+2026-03-26 06:07:54,228 [INFO] Saved 80229 rows -> data/forex/GBP_CHF_15m.parquet
+2026-03-26 06:07:54,233 [INFO]   Backfilling GBP_CHF 1h from 2023-01-01
+2026-03-26 06:07:58,168 [INFO] Saved 20094 rows -> data/forex/GBP_CHF_1h.parquet
+2026-03-26 06:07:58,173 [INFO]   Backfilling GBP_CHF 4h from 2023-01-01
+2026-03-26 06:07:59,165 [INFO] Saved 5082 rows -> data/forex/GBP_CHF_4h.parquet
+2026-03-26 06:07:59,170 [INFO]   Backfilling GBP_CHF 1d from 2023-01-01
+2026-03-26 06:07:59,927 [INFO] Saved 896 rows -> data/forex/GBP_CHF_1d.parquet
+2026-03-26 06:07:59,927 [INFO] [16/32] Downloading GBP_AUD (forex) — all TFs direct ...
+2026-03-26 06:07:59,940 [INFO]   Backfilling GBP_AUD 5m from 2023-01-01
+2026-03-26 06:08:40,323 [INFO] Saved 240661 rows -> data/forex/GBP_AUD_5m.parquet
+2026-03-26 06:08:40,330 [INFO]   Backfilling GBP_AUD 15m from 2023-01-01
+2026-03-26 06:08:54,344 [INFO] Saved 80299 rows -> data/forex/GBP_AUD_15m.parquet
+2026-03-26 06:08:54,353 [INFO]   Backfilling GBP_AUD 1h from 2023-01-01
+2026-03-26 06:08:58,074 [INFO] Saved 20090 rows -> data/forex/GBP_AUD_1h.parquet
+2026-03-26 06:08:58,080 [INFO]   Backfilling GBP_AUD 4h from 2023-01-01
+2026-03-26 06:08:59,448 [INFO] Saved 5082 rows -> data/forex/GBP_AUD_4h.parquet
+2026-03-26 06:08:59,454 [INFO]   Backfilling GBP_AUD 1d from 2023-01-01
+2026-03-26 06:09:00,268 [INFO] Saved 896 rows -> data/forex/GBP_AUD_1d.parquet
+2026-03-26 06:09:00,268 [INFO] [17/32] Downloading GBP_CAD (forex) — all TFs direct ...
+2026-03-26 06:09:00,284 [INFO]   Backfilling GBP_CAD 5m from 2023-01-01
+2026-03-26 06:09:40,811 [INFO] Saved 240863 rows -> data/forex/GBP_CAD_5m.parquet
+2026-03-26 06:09:40,818 [INFO]   Backfilling GBP_CAD 15m from 2023-01-01
+2026-03-26 06:09:53,936 [INFO] Saved 80336 rows -> data/forex/GBP_CAD_15m.parquet
+2026-03-26 06:09:53,943 [INFO]   Backfilling GBP_CAD 1h from 2023-01-01
+2026-03-26 06:09:57,373 [INFO] Saved 20094 rows -> data/forex/GBP_CAD_1h.parquet
+2026-03-26 06:09:57,379 [INFO]   Backfilling GBP_CAD 4h from 2023-01-01
+2026-03-26 06:09:58,398 [INFO] Saved 5082 rows -> data/forex/GBP_CAD_4h.parquet
+2026-03-26 06:09:58,403 [INFO]   Backfilling GBP_CAD 1d from 2023-01-01
+2026-03-26 06:09:59,208 [INFO] Saved 896 rows -> data/forex/GBP_CAD_1d.parquet
+2026-03-26 06:09:59,208 [INFO] [18/32] Downloading GBP_NZD (forex) — all TFs direct ...
+2026-03-26 06:09:59,221 [INFO]   Backfilling GBP_NZD 5m from 2023-01-01
+2026-03-26 06:10:39,774 [INFO] Saved 240438 rows -> data/forex/GBP_NZD_5m.parquet
+2026-03-26 06:10:39,781 [INFO]   Backfilling GBP_NZD 15m from 2023-01-01
+2026-03-26 06:10:53,272 [INFO] Saved 80288 rows -> data/forex/GBP_NZD_15m.parquet
+2026-03-26 06:10:53,278 [INFO]   Backfilling GBP_NZD 1h from 2023-01-01
+2026-03-26 06:10:56,706 [INFO] Saved 20093 rows -> data/forex/GBP_NZD_1h.parquet
+2026-03-26 06:10:56,711 [INFO]   Backfilling GBP_NZD 4h from 2023-01-01
+2026-03-26 06:10:57,754 [INFO] Saved 5084 rows -> data/forex/GBP_NZD_4h.parquet
+2026-03-26 06:10:57,759 [INFO]   Backfilling GBP_NZD 1d from 2023-01-01
+2026-03-26 06:10:58,548 [INFO] Saved 898 rows -> data/forex/GBP_NZD_1d.parquet
+2026-03-26 06:10:58,548 [INFO] [19/32] Downloading AUD_JPY (forex) — all TFs direct ...
+2026-03-26 06:10:58,564 [INFO]   Backfilling AUD_JPY 5m from 2023-01-01
+2026-03-26 06:11:39,417 [INFO] Saved 241029 rows -> data/forex/AUD_JPY_5m.parquet
+2026-03-26 06:11:39,426 [INFO]   Backfilling AUD_JPY 15m from 2023-01-01
+2026-03-26 06:11:53,407 [INFO] Saved 80365 rows -> data/forex/AUD_JPY_15m.parquet
+2026-03-26 06:11:53,414 [INFO]   Backfilling AUD_JPY 1h from 2023-01-01
+2026-03-26 06:11:56,879 [INFO] Saved 20094 rows -> data/forex/AUD_JPY_1h.parquet
+2026-03-26 06:11:56,884 [INFO]   Backfilling AUD_JPY 4h from 2023-01-01
+2026-03-26 06:11:57,902 [INFO] Saved 5082 rows -> data/forex/AUD_JPY_4h.parquet
+2026-03-26 06:11:57,908 [INFO]   Backfilling AUD_JPY 1d from 2023-01-01
+2026-03-26 06:11:58,728 [INFO] Saved 896 rows -> data/forex/AUD_JPY_1d.parquet
+2026-03-26 06:11:58,728 [INFO] [20/32] Downloading AUD_CHF (forex) — all TFs direct ...
+2026-03-26 06:11:58,744 [INFO]   Backfilling AUD_CHF 5m from 2023-01-01
+2026-03-26 06:12:38,733 [INFO] Saved 240293 rows -> data/forex/AUD_CHF_5m.parquet
+2026-03-26 06:12:38,741 [INFO]   Backfilling AUD_CHF 15m from 2023-01-01
+2026-03-26 06:12:52,170 [INFO] Saved 80262 rows -> data/forex/AUD_CHF_15m.parquet
+2026-03-26 06:12:52,175 [INFO]   Backfilling AUD_CHF 1h from 2023-01-01
+2026-03-26 06:12:55,650 [INFO] Saved 20093 rows -> data/forex/AUD_CHF_1h.parquet
+2026-03-26 06:12:55,655 [INFO]   Backfilling AUD_CHF 4h from 2023-01-01
+2026-03-26 06:12:56,612 [INFO] Saved 5082 rows -> data/forex/AUD_CHF_4h.parquet
+2026-03-26 06:12:56,617 [INFO]   Backfilling AUD_CHF 1d from 2023-01-01
+2026-03-26 06:12:57,439 [INFO] Saved 896 rows -> data/forex/AUD_CHF_1d.parquet
+2026-03-26 06:12:57,439 [INFO] [21/32] Downloading AUD_CAD (forex) — all TFs direct ...
+2026-03-26 06:12:57,455 [INFO]   Backfilling AUD_CAD 5m from 2023-01-01
+2026-03-26 06:13:38,219 [INFO] Saved 240888 rows -> data/forex/AUD_CAD_5m.parquet
+2026-03-26 06:13:38,227 [INFO]   Backfilling AUD_CAD 15m from 2023-01-01
+2026-03-26 06:13:51,868 [INFO] Saved 80361 rows -> data/forex/AUD_CAD_15m.parquet
+2026-03-26 06:13:51,875 [INFO]   Backfilling AUD_CAD 1h from 2023-01-01
+2026-03-26 06:13:55,173 [INFO] Saved 20094 rows -> data/forex/AUD_CAD_1h.parquet
+2026-03-26 06:13:55,179 [INFO]   Backfilling AUD_CAD 4h from 2023-01-01
+2026-03-26 06:13:56,134 [INFO] Saved 5082 rows -> data/forex/AUD_CAD_4h.parquet
+2026-03-26 06:13:56,140 [INFO]   Backfilling AUD_CAD 1d from 2023-01-01
+2026-03-26 06:13:56,906 [INFO] Saved 896 rows -> data/forex/AUD_CAD_1d.parquet
+2026-03-26 06:13:56,906 [INFO] [22/32] Downloading AUD_NZD (forex) — all TFs direct ...
+2026-03-26 06:13:56,921 [INFO]   Backfilling AUD_NZD 5m from 2023-01-01
+2026-03-26 06:14:38,323 [INFO] Saved 240914 rows -> data/forex/AUD_NZD_5m.parquet
+2026-03-26 06:14:38,330 [INFO]   Backfilling AUD_NZD 15m from 2023-01-01
+2026-03-26 06:14:52,058 [INFO] Saved 80357 rows -> data/forex/AUD_NZD_15m.parquet
+2026-03-26 06:14:52,064 [INFO]   Backfilling AUD_NZD 1h from 2023-01-01
+2026-03-26 06:14:55,485 [INFO] Saved 20096 rows -> data/forex/AUD_NZD_1h.parquet
+2026-03-26 06:14:55,491 [INFO]   Backfilling AUD_NZD 4h from 2023-01-01
+2026-03-26 06:14:56,621 [INFO] Saved 5084 rows -> data/forex/AUD_NZD_4h.parquet
+2026-03-26 06:14:56,626 [INFO]   Backfilling AUD_NZD 1d from 2023-01-01
+2026-03-26 06:14:57,455 [INFO] Saved 898 rows -> data/forex/AUD_NZD_1d.parquet
+2026-03-26 06:14:57,455 [INFO] [23/32] Downloading NZD_JPY (forex) — all TFs direct ...
+2026-03-26 06:14:57,471 [INFO]   Backfilling NZD_JPY 5m from 2023-01-01
+2026-03-26 06:15:02,659 [WARNING] Error fetching NZD_JPY M5 (attempt 1/5): v20 REST request to https://api-fxpractice.oanda.com:443/v3/instruments/NZD_JPY/candles has timed out (read) — retrying in 2s
+2026-03-26 06:15:43,701 [INFO] Saved 240776 rows -> data/forex/NZD_JPY_5m.parquet
+2026-03-26 06:15:43,712 [INFO]   Backfilling NZD_JPY 15m from 2023-01-01
+2026-03-26 06:15:56,813 [INFO] Saved 80332 rows -> data/forex/NZD_JPY_15m.parquet
+2026-03-26 06:15:56,819 [INFO]   Backfilling NZD_JPY 1h from 2023-01-01
+2026-03-26 06:16:00,835 [INFO] Saved 20095 rows -> data/forex/NZD_JPY_1h.parquet
+2026-03-26 06:16:00,841 [INFO]   Backfilling NZD_JPY 4h from 2023-01-01
+2026-03-26 06:16:01,854 [INFO] Saved 5084 rows -> data/forex/NZD_JPY_4h.parquet
+2026-03-26 06:16:01,861 [INFO]   Backfilling NZD_JPY 1d from 2023-01-01
+2026-03-26 06:16:02,677 [INFO] Saved 898 rows -> data/forex/NZD_JPY_1d.parquet
+2026-03-26 06:16:02,677 [INFO] [24/32] Downloading NZD_CHF (forex) — all TFs direct ...
+2026-03-26 06:16:02,692 [INFO]   Backfilling NZD_CHF 5m from 2023-01-01
+2026-03-26 06:16:44,704 [INFO] Saved 239244 rows -> data/forex/NZD_CHF_5m.parquet
+2026-03-26 06:16:44,712 [INFO]   Backfilling NZD_CHF 15m from 2023-01-01
+2026-03-26 06:16:58,424 [INFO] Saved 80062 rows -> data/forex/NZD_CHF_15m.parquet
+2026-03-26 06:16:58,429 [INFO]   Backfilling NZD_CHF 1h from 2023-01-01
+2026-03-26 06:17:01,998 [INFO] Saved 20086 rows -> data/forex/NZD_CHF_1h.parquet
+2026-03-26 06:17:02,006 [INFO]   Backfilling NZD_CHF 4h from 2023-01-01
+2026-03-26 06:17:02,975 [INFO] Saved 5084 rows -> data/forex/NZD_CHF_4h.parquet
+2026-03-26 06:17:02,980 [INFO]   Backfilling NZD_CHF 1d from 2023-01-01
+2026-03-26 06:17:03,764 [INFO] Saved 898 rows -> data/forex/NZD_CHF_1d.parquet
+2026-03-26 06:17:03,764 [INFO] [25/32] Downloading NZD_CAD (forex) — all TFs direct ...
+2026-03-26 06:17:03,777 [INFO]   Backfilling NZD_CAD 5m from 2023-01-01
+2026-03-26 06:17:44,762 [INFO] Saved 240422 rows -> data/forex/NZD_CAD_5m.parquet
+2026-03-26 06:17:44,770 [INFO]   Backfilling NZD_CAD 15m from 2023-01-01
+2026-03-26 06:17:58,643 [INFO] Saved 80326 rows -> data/forex/NZD_CAD_15m.parquet
+2026-03-26 06:17:58,650 [INFO]   Backfilling NZD_CAD 1h from 2023-01-01
+2026-03-26 06:18:02,412 [INFO] Saved 20095 rows -> data/forex/NZD_CAD_1h.parquet
+2026-03-26 06:18:02,417 [INFO]   Backfilling NZD_CAD 4h from 2023-01-01
+2026-03-26 06:18:03,669 [INFO] Saved 5084 rows -> data/forex/NZD_CAD_4h.parquet
+2026-03-26 06:18:03,675 [INFO]   Backfilling NZD_CAD 1d from 2023-01-01
+2026-03-26 06:18:04,570 [INFO] Saved 898 rows -> data/forex/NZD_CAD_1d.parquet
+2026-03-26 06:18:04,570 [INFO] [26/32] Downloading CAD_JPY (forex) — all TFs direct ...
+2026-03-26 06:18:04,587 [INFO]   Backfilling CAD_JPY 5m from 2023-01-01
+2026-03-26 06:18:46,841 [INFO] Saved 240991 rows -> data/forex/CAD_JPY_5m.parquet
+2026-03-26 06:18:46,853 [INFO]   Backfilling CAD_JPY 15m from 2023-01-01
+2026-03-26 06:19:00,312 [INFO] Saved 80370 rows -> data/forex/CAD_JPY_15m.parquet
+2026-03-26 06:19:00,319 [INFO]   Backfilling CAD_JPY 1h from 2023-01-01
+2026-03-26 06:19:03,764 [INFO] Saved 20094 rows -> data/forex/CAD_JPY_1h.parquet
+2026-03-26 06:19:03,770 [INFO]   Backfilling CAD_JPY 4h from 2023-01-01
+2026-03-26 06:19:04,820 [INFO] Saved 5082 rows -> data/forex/CAD_JPY_4h.parquet
+2026-03-26 06:19:04,826 [INFO]   Backfilling CAD_JPY 1d from 2023-01-01
+2026-03-26 06:19:05,665 [INFO] Saved 896 rows -> data/forex/CAD_JPY_1d.parquet
+2026-03-26 06:19:05,666 [INFO] [27/32] Downloading CAD_CHF (forex) — all TFs direct ...
+2026-03-26 06:19:05,677 [INFO]   Backfilling CAD_CHF 5m from 2023-01-01
+2026-03-26 06:19:47,042 [INFO] Saved 239514 rows -> data/forex/CAD_CHF_5m.parquet
+2026-03-26 06:19:47,051 [INFO]   Backfilling CAD_CHF 15m from 2023-01-01
+2026-03-26 06:20:00,637 [INFO] Saved 80197 rows -> data/forex/CAD_CHF_15m.parquet
+2026-03-26 06:20:00,642 [INFO]   Backfilling CAD_CHF 1h from 2023-01-01
+2026-03-26 06:20:04,354 [INFO] Saved 20091 rows -> data/forex/CAD_CHF_1h.parquet
+2026-03-26 06:20:04,359 [INFO]   Backfilling CAD_CHF 4h from 2023-01-01
+2026-03-26 06:20:05,335 [INFO] Saved 5082 rows -> data/forex/CAD_CHF_4h.parquet
+2026-03-26 06:20:05,340 [INFO]   Backfilling CAD_CHF 1d from 2023-01-01
+2026-03-26 06:20:06,135 [INFO] Saved 896 rows -> data/forex/CAD_CHF_1d.parquet
+2026-03-26 06:20:06,135 [INFO] [28/32] Downloading CHF_JPY (forex) — all TFs direct ...
+2026-03-26 06:20:06,151 [INFO]   Backfilling CHF_JPY 5m from 2023-01-01
+2026-03-26 06:20:46,556 [INFO] Saved 239750 rows -> data/forex/CHF_JPY_5m.parquet
+2026-03-26 06:20:46,563 [INFO]   Backfilling CHF_JPY 15m from 2023-01-01
+2026-03-26 06:21:00,448 [INFO] Saved 80157 rows -> data/forex/CHF_JPY_15m.parquet
+2026-03-26 06:21:00,453 [INFO]   Backfilling CHF_JPY 1h from 2023-01-01
+2026-03-26 06:21:03,832 [INFO] Saved 20092 rows -> data/forex/CHF_JPY_1h.parquet
+2026-03-26 06:21:03,838 [INFO]   Backfilling CHF_JPY 4h from 2023-01-01
+2026-03-26 06:21:04,853 [INFO] Saved 5082 rows -> data/forex/CHF_JPY_4h.parquet
+2026-03-26 06:21:04,858 [INFO]   Backfilling CHF_JPY 1d from 2023-01-01
+2026-03-26 06:21:05,629 [INFO] Saved 896 rows -> data/forex/CHF_JPY_1d.parquet
+2026-03-26 06:21:05,629 [INFO] [29/32] Downloading XAU_USD (commodities) — all TFs direct ...
+2026-03-26 06:21:05,643 [INFO]   Backfilling XAU_USD 5m from 2023-01-01
+2026-03-26 06:21:49,008 [INFO] Saved 229098 rows -> data/commodities/XAU_USD_5m.parquet
+2026-03-26 06:21:49,016 [INFO]   Backfilling XAU_USD 15m from 2023-01-01
+2026-03-26 06:22:04,398 [INFO] Saved 76374 rows -> data/commodities/XAU_USD_15m.parquet
+2026-03-26 06:22:04,405 [INFO]   Backfilling XAU_USD 1h from 2023-01-01
+2026-03-26 06:22:08,300 [INFO] Saved 19106 rows -> data/commodities/XAU_USD_1h.parquet
+2026-03-26 06:22:08,307 [INFO]   Backfilling XAU_USD 4h from 2023-01-01
+2026-03-26 06:22:09,257 [INFO] Saved 5055 rows -> data/commodities/XAU_USD_4h.parquet
+2026-03-26 06:22:09,262 [INFO]   Backfilling XAU_USD 1d from 2023-01-01
+2026-03-26 06:22:10,042 [INFO] Saved 892 rows -> data/commodities/XAU_USD_1d.parquet
+2026-03-26 06:22:10,042 [INFO] [30/32] Downloading XAG_USD (commodities) — all TFs direct ...
+2026-03-26 06:22:10,056 [INFO]   Backfilling XAG_USD 5m from 2023-01-01
+2026-03-26 06:22:49,725 [INFO] Saved 228907 rows -> data/commodities/XAG_USD_5m.parquet
+2026-03-26 06:22:49,733 [INFO]   Backfilling XAG_USD 15m from 2023-01-01
+2026-03-26 06:23:03,247 [INFO] Saved 76355 rows -> data/commodities/XAG_USD_15m.parquet
+2026-03-26 06:23:03,253 [INFO]   Backfilling XAG_USD 1h from 2023-01-01
+2026-03-26 06:23:06,562 [INFO] Saved 19104 rows -> data/commodities/XAG_USD_1h.parquet
+2026-03-26 06:23:06,566 [INFO]   Backfilling XAG_USD 4h from 2023-01-01
+2026-03-26 06:23:08,161 [INFO] Saved 5054 rows -> data/commodities/XAG_USD_4h.parquet
+2026-03-26 06:23:08,166 [INFO]   Backfilling XAG_USD 1d from 2023-01-01
+2026-03-26 06:23:08,930 [INFO] Saved 891 rows -> data/commodities/XAG_USD_1d.parquet
+2026-03-26 06:23:08,931 [INFO] [31/32] Downloading WTICO_USD (commodities) — all TFs direct ...
+2026-03-26 06:23:08,945 [INFO]   Backfilling WTICO_USD 5m from 2023-01-01
+2026-03-26 06:23:48,578 [INFO] Saved 228698 rows -> data/commodities/WTICO_USD_5m.parquet
+2026-03-26 06:23:48,586 [INFO]   Backfilling WTICO_USD 15m from 2023-01-01
+2026-03-26 06:24:02,137 [INFO] Saved 76312 rows -> data/commodities/WTICO_USD_15m.parquet
+2026-03-26 06:24:02,143 [INFO]   Backfilling WTICO_USD 1h from 2023-01-01
+2026-03-26 06:24:05,877 [INFO] Saved 19094 rows -> data/commodities/WTICO_USD_1h.parquet
+2026-03-26 06:24:05,884 [INFO]   Backfilling WTICO_USD 4h from 2023-01-01
+2026-03-26 06:24:06,847 [INFO] Saved 5053 rows -> data/commodities/WTICO_USD_4h.parquet
+2026-03-26 06:24:06,853 [INFO]   Backfilling WTICO_USD 1d from 2023-01-01
+2026-03-26 06:24:07,797 [INFO] Saved 892 rows -> data/commodities/WTICO_USD_1d.parquet
+2026-03-26 06:24:07,797 [INFO] [32/32] Downloading BCO_USD (commodities) — all TFs direct ...
+2026-03-26 06:24:07,814 [INFO]   Backfilling BCO_USD 5m from 2023-01-01
+2026-03-26 06:24:48,498 [INFO] Saved 218711 rows -> data/commodities/BCO_USD_5m.parquet
+2026-03-26 06:24:48,507 [INFO]   Backfilling BCO_USD 15m from 2023-01-01
+2026-03-26 06:25:02,978 [INFO] Saved 73513 rows -> data/commodities/BCO_USD_15m.parquet
+2026-03-26 06:25:02,983 [INFO]   Backfilling BCO_USD 1h from 2023-01-01
+2026-03-26 06:25:06,318 [INFO] Saved 18412 rows -> data/commodities/BCO_USD_1h.parquet
+2026-03-26 06:25:06,324 [INFO]   Backfilling BCO_USD 4h from 2023-01-01
+2026-03-26 06:25:07,349 [INFO] Saved 5049 rows -> data/commodities/BCO_USD_4h.parquet
+2026-03-26 06:25:07,354 [INFO]   Backfilling BCO_USD 1d from 2023-01-01
+2026-03-26 06:25:08,179 [INFO] Saved 891 rows -> data/commodities/BCO_USD_1d.parquet
+2026-03-26 06:25:08,180 [INFO] Done! Forex data in data/forex, Commodities data in data/commodities

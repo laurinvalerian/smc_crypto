@@ -1,0 +1,280 @@
+2026-03-26 06:59:04,242 [INFO] Connecting to exchange ...
+2026-03-26 06:59:04,611 [INFO] Fetching 24h ticker volume for 555 symbols ...
+2026-03-26 06:59:06,540 [INFO] Top 30 USDT-M Futures coins by 24h volume
+2026-03-26 06:59:06,541 [INFO] Top 10: ['BTC', 'ETH', 'XAU', 'XAG', 'SOL', 'TAO', 'SIREN', 'XRP', 'DOGE', 'RIVER']
+2026-03-26 06:59:06,541 [INFO] Downloading 5 TFs directly (no 1m resample) with 3 workers
+Downloading all TFs:   0%|          | 0/30 [00:00<?, ?it/s]2026-03-26 06:59:07,227 [INFO] Backfilling XAU/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:59:07,276 [INFO] Finished: done:BTC/USDT:USDT
+Downloading all TFs:   3%|▎         | 1/30 [00:00<00:21,  1.37it/s]2026-03-26 06:59:07,292 [INFO] Finished: done:ETH/USDT:USDT
+2026-03-26 06:59:07,830 [INFO] Backfilling XAG/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:59:07,926 [INFO] Finished: done:SOL/USDT:USDT
+Downloading all TFs:  10%|█         | 3/30 [00:01<00:11,  2.31it/s]2026-03-26 06:59:08,170 [INFO] Saved 30226 rows → data/crypto/XAUUSDT_5m.parquet
+2026-03-26 06:59:08,174 [INFO] Backfilling XAU/USDT:USDT 15m from 2023-01-01
+2026-03-26 06:59:08,672 [INFO] Saved 22427 rows → data/crypto/XAGUSDT_5m.parquet
+2026-03-26 06:59:08,702 [INFO] Backfilling XAG/USDT:USDT 15m from 2023-01-01
+2026-03-26 06:59:08,774 [INFO] Saved 10076 rows → data/crypto/XAUUSDT_15m.parquet
+2026-03-26 06:59:08,778 [INFO] Backfilling XAU/USDT:USDT 1h from 2023-01-01
+2026-03-26 06:59:09,194 [INFO] Saved 7476 rows → data/crypto/XAGUSDT_15m.parquet
+2026-03-26 06:59:09,212 [INFO] Backfilling XAG/USDT:USDT 1h from 2023-01-01
+2026-03-26 06:59:09,227 [INFO] Saved 2519 rows → data/crypto/XAUUSDT_1h.parquet
+2026-03-26 06:59:09,229 [INFO] Backfilling XAU/USDT:USDT 4h from 2023-01-01
+2026-03-26 06:59:09,650 [INFO] Saved 1869 rows → data/crypto/XAGUSDT_1h.parquet
+2026-03-26 06:59:09,653 [INFO] Backfilling XAG/USDT:USDT 4h from 2023-01-01
+2026-03-26 06:59:09,654 [INFO] Saved 630 rows → data/crypto/XAUUSDT_4h.parquet
+2026-03-26 06:59:09,657 [INFO] Backfilling XAU/USDT:USDT 1d from 2023-01-01
+2026-03-26 06:59:10,061 [INFO] Saved 106 rows → data/crypto/XAUUSDT_1d.parquet
+2026-03-26 06:59:10,071 [INFO] Finished: done:XAU/USDT:USDT
+Downloading all TFs:  13%|█▎        | 4/30 [00:03<00:26,  1.02s/it]2026-03-26 06:59:10,078 [INFO] Saved 468 rows → data/crypto/XAGUSDT_4h.parquet
+2026-03-26 06:59:10,082 [INFO] Backfilling XAG/USDT:USDT 1d from 2023-01-01
+2026-03-26 06:59:10,450 [INFO] Backfilling SIREN/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:59:10,478 [INFO] Saved 79 rows → data/crypto/XAGUSDT_1d.parquet
+2026-03-26 06:59:10,492 [INFO] Finished: done:XAG/USDT:USDT
+Downloading all TFs:  17%|█▋        | 5/30 [00:03<00:20,  1.21it/s]2026-03-26 06:59:10,869 [INFO] Backfilling XRP/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:59:12,520 [INFO] Saved 106247 rows → data/crypto/SIRENUSDT_5m.parquet
+2026-03-26 06:59:12,525 [INFO] Backfilling SIREN/USDT:USDT 15m from 2023-01-01
+2026-03-26 06:59:13,495 [INFO] Saved 35416 rows → data/crypto/SIRENUSDT_15m.parquet
+2026-03-26 06:59:13,499 [INFO] Backfilling SIREN/USDT:USDT 1h from 2023-01-01
+2026-03-26 06:59:14,086 [INFO] Saved 8854 rows → data/crypto/SIRENUSDT_1h.parquet
+2026-03-26 06:59:14,090 [INFO] Backfilling SIREN/USDT:USDT 4h from 2023-01-01
+2026-03-26 06:59:14,549 [INFO] Saved 2214 rows → data/crypto/SIRENUSDT_4h.parquet
+2026-03-26 06:59:14,552 [INFO] Backfilling SIREN/USDT:USDT 1d from 2023-01-01
+2026-03-26 06:59:14,954 [INFO] Saved 370 rows → data/crypto/SIRENUSDT_1d.parquet
+2026-03-26 06:59:14,967 [INFO] Finished: done:SIREN/USDT:USDT
+Downloading all TFs:  20%|██        | 6/30 [00:08<00:47,  2.00s/it]2026-03-26 06:59:15,327 [INFO] Backfilling DOGE/USDT:USDT 5m from 2023-01-01
+2026-03-26 07:00:44,170 [INFO] Saved 205542 rows → data/crypto/TAOUSDT_5m.parquet
+2026-03-26 07:01:01,479 [INFO] Saved 339924 rows → data/crypto/XRPUSDT_5m.parquet
+2026-03-26 07:01:01,485 [INFO] Backfilling XRP/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:01:04,989 [INFO] Saved 339924 rows → data/crypto/DOGEUSDT_5m.parquet
+2026-03-26 07:01:04,998 [INFO] Backfilling DOGE/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:01:16,580 [INFO] Saved 68514 rows → data/crypto/TAOUSDT_15m.parquet
+2026-03-26 07:01:24,104 [INFO] Saved 17129 rows → data/crypto/TAOUSDT_1h.parquet
+2026-03-26 07:01:26,176 [INFO] Saved 4283 rows → data/crypto/TAOUSDT_4h.parquet
+2026-03-26 07:01:26,594 [INFO] Saved 715 rows → data/crypto/TAOUSDT_1d.parquet
+2026-03-26 07:01:26,607 [INFO] Finished: done:TAO/USDT:USDT
+Downloading all TFs:  23%|██▎       | 7/30 [02:20<16:23, 42.75s/it]2026-03-26 07:01:35,598 [INFO] Saved 113308 rows → data/crypto/XRPUSDT_15m.parquet
+2026-03-26 07:01:35,603 [INFO] Backfilling XRP/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:01:39,646 [INFO] Saved 113308 rows → data/crypto/DOGEUSDT_15m.parquet
+2026-03-26 07:01:39,653 [INFO] Backfilling DOGE/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:01:44,214 [INFO] Saved 28327 rows → data/crypto/XRPUSDT_1h.parquet
+2026-03-26 07:01:44,218 [INFO] Backfilling XRP/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:01:46,826 [INFO] Saved 7082 rows → data/crypto/XRPUSDT_4h.parquet
+2026-03-26 07:01:46,829 [INFO] Backfilling XRP/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:01:47,346 [INFO] Saved 45987 rows → data/crypto/RIVERUSDT_5m.parquet
+2026-03-26 07:01:47,734 [INFO] Saved 1181 rows → data/crypto/XRPUSDT_1d.parquet
+2026-03-26 07:01:47,746 [INFO] Finished: done:XRP/USDT:USDT
+Downloading all TFs:  27%|██▋       | 8/30 [02:41<13:13, 36.05s/it]2026-03-26 07:01:48,151 [INFO] Saved 28327 rows → data/crypto/DOGEUSDT_1h.parquet
+2026-03-26 07:01:48,155 [INFO] Backfilling DOGE/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:01:50,786 [INFO] Saved 7082 rows → data/crypto/DOGEUSDT_4h.parquet
+2026-03-26 07:01:50,790 [INFO] Backfilling DOGE/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:01:51,611 [INFO] Saved 1181 rows → data/crypto/DOGEUSDT_1d.parquet
+2026-03-26 07:01:51,624 [INFO] Finished: done:DOGE/USDT:USDT
+Downloading all TFs:  30%|███       | 9/30 [02:45<09:09, 26.18s/it]2026-03-26 07:01:54,307 [INFO] Saved 15329 rows → data/crypto/RIVERUSDT_15m.parquet
+2026-03-26 07:01:55,950 [INFO] Saved 3833 rows → data/crypto/RIVERUSDT_1h.parquet
+2026-03-26 07:01:56,365 [INFO] Saved 959 rows → data/crypto/RIVERUSDT_4h.parquet
+2026-03-26 07:01:56,759 [INFO] Saved 161 rows → data/crypto/RIVERUSDT_1d.parquet
+2026-03-26 07:01:56,771 [INFO] Finished: done:RIVER/USDT:USDT
+Downloading all TFs:  33%|███▎      | 10/30 [02:50<06:35, 19.77s/it]2026-03-26 07:01:57,172 [INFO] Backfilling BNB/USDT:USDT 5m from 2023-01-01
+2026-03-26 07:02:29,670 [INFO] Saved 86358 rows → data/crypto/HYPEUSDT_5m.parquet
+2026-03-26 07:02:41,202 [INFO] Saved 122649 rows → data/crypto/PIPPINUSDT_5m.parquet
+2026-03-26 07:02:42,468 [INFO] Saved 28786 rows → data/crypto/HYPEUSDT_15m.parquet
+2026-03-26 07:02:45,788 [INFO] Saved 7197 rows → data/crypto/HYPEUSDT_1h.parquet
+2026-03-26 07:02:46,625 [INFO] Saved 1800 rows → data/crypto/HYPEUSDT_4h.parquet
+2026-03-26 07:02:47,037 [INFO] Saved 301 rows → data/crypto/HYPEUSDT_1d.parquet
+2026-03-26 07:02:47,050 [INFO] Finished: done:HYPE/USDT:USDT
+Downloading all TFs:  37%|███▋      | 11/30 [03:40<09:11, 29.02s/it]2026-03-26 07:02:58,665 [INFO] Saved 40883 rows → data/crypto/PIPPINUSDT_15m.parquet
+2026-03-26 07:03:03,304 [INFO] Saved 10221 rows → data/crypto/PIPPINUSDT_1h.parquet
+2026-03-26 07:03:04,578 [INFO] Saved 2556 rows → data/crypto/PIPPINUSDT_4h.parquet
+2026-03-26 07:03:04,990 [INFO] Saved 427 rows → data/crypto/PIPPINUSDT_1d.parquet
+2026-03-26 07:03:05,004 [INFO] Finished: done:PIPPIN/USDT:USDT
+Downloading all TFs:  40%|████      | 12/30 [03:58<07:42, 25.68s/it]2026-03-26 07:03:42,940 [INFO] Saved 339924 rows → data/crypto/BNBUSDT_5m.parquet
+2026-03-26 07:03:42,948 [INFO] Backfilling BNB/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:03:51,310 [INFO] Saved 104790 rows → data/crypto/PAXGUSDT_5m.parquet
+2026-03-26 07:04:06,344 [INFO] Saved 34930 rows → data/crypto/PAXGUSDT_15m.parquet
+2026-03-26 07:04:10,131 [INFO] Saved 8733 rows → data/crypto/PAXGUSDT_1h.parquet
+2026-03-26 07:04:11,362 [INFO] Saved 2184 rows → data/crypto/PAXGUSDT_4h.parquet
+2026-03-26 07:04:11,759 [INFO] Saved 365 rows → data/crypto/PAXGUSDT_1d.parquet
+2026-03-26 07:04:11,772 [INFO] Finished: done:PAXG/USDT:USDT
+Downloading all TFs:  43%|████▎     | 13/30 [05:05<10:47, 38.07s/it]2026-03-26 07:04:16,895 [INFO] Saved 113308 rows → data/crypto/BNBUSDT_15m.parquet
+2026-03-26 07:04:16,907 [INFO] Backfilling BNB/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:04:25,223 [INFO] Saved 28327 rows → data/crypto/BNBUSDT_1h.parquet
+2026-03-26 07:04:25,227 [INFO] Backfilling BNB/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:04:27,831 [INFO] Saved 7082 rows → data/crypto/BNBUSDT_4h.parquet
+2026-03-26 07:04:27,835 [INFO] Backfilling BNB/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:04:28,676 [INFO] Saved 1181 rows → data/crypto/BNBUSDT_1d.parquet
+2026-03-26 07:04:28,692 [INFO] Finished: done:BNB/USDT:USDT
+Downloading all TFs:  47%|████▋     | 14/30 [05:22<08:27, 31.70s/it]2026-03-26 07:05:20,737 [INFO] Saved 339924 rows → data/crypto/ZECUSDT_5m.parquet
+2026-03-26 07:05:21,136 [INFO] Saved 106491 rows → data/crypto/BRUSDT_5m.parquet
+2026-03-26 07:05:37,315 [INFO] Saved 35497 rows → data/crypto/BRUSDT_15m.parquet
+2026-03-26 07:05:41,115 [INFO] Saved 8875 rows → data/crypto/BRUSDT_1h.parquet
+2026-03-26 07:05:42,329 [INFO] Saved 2219 rows → data/crypto/BRUSDT_4h.parquet
+2026-03-26 07:05:42,728 [INFO] Saved 371 rows → data/crypto/BRUSDT_1d.parquet
+2026-03-26 07:05:42,738 [INFO] Finished: done:BR/USDT:USDT
+Downloading all TFs:  50%|█████     | 15/30 [06:36<11:06, 44.44s/it]2026-03-26 07:06:14,543 [INFO] Saved 113308 rows → data/crypto/ZECUSDT_15m.parquet
+2026-03-26 07:06:18,756 [INFO] Saved 75426 rows → data/crypto/MUSDT_5m.parquet
+2026-03-26 07:06:26,806 [INFO] Saved 28327 rows → data/crypto/ZECUSDT_1h.parquet
+2026-03-26 07:06:30,119 [INFO] Saved 7082 rows → data/crypto/ZECUSDT_4h.parquet
+2026-03-26 07:06:30,515 [INFO] Saved 25142 rows → data/crypto/MUSDT_15m.parquet
+2026-03-26 07:06:30,948 [INFO] Saved 1181 rows → data/crypto/ZECUSDT_1d.parquet
+2026-03-26 07:06:30,956 [INFO] Finished: done:ZEC/USDT:USDT
+Downloading all TFs:  53%|█████▎    | 16/30 [07:24<10:38, 45.57s/it]2026-03-26 07:06:31,337 [INFO] Backfilling 1000PEPE/USDT:USDT 5m from 2023-01-01
+2026-03-26 07:06:34,177 [INFO] Saved 6286 rows → data/crypto/MUSDT_1h.parquet
+2026-03-26 07:06:35,022 [INFO] Saved 1572 rows → data/crypto/MUSDT_4h.parquet
+2026-03-26 07:06:35,416 [INFO] Saved 263 rows → data/crypto/MUSDT_1d.parquet
+2026-03-26 07:06:35,430 [INFO] Finished: done:M/USDT:USDT
+Downloading all TFs:  57%|█████▋    | 17/30 [07:28<07:11, 33.23s/it]2026-03-26 07:06:37,592 [INFO] Saved 304014 rows → data/crypto/1000PEPEUSDT_5m.parquet
+2026-03-26 07:06:37,600 [INFO] Backfilling 1000PEPE/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:06:40,016 [INFO] Saved 101338 rows → data/crypto/1000PEPEUSDT_15m.parquet
+2026-03-26 07:06:40,022 [INFO] Backfilling 1000PEPE/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:06:40,071 [INFO] Saved 339924 rows → data/crypto/ONTUSDT_5m.parquet
+2026-03-26 07:06:40,900 [INFO] Saved 25334 rows → data/crypto/1000PEPEUSDT_1h.parquet
+2026-03-26 07:06:40,903 [INFO] Backfilling 1000PEPE/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:06:41,424 [INFO] Saved 6334 rows → data/crypto/1000PEPEUSDT_4h.parquet
+2026-03-26 07:06:41,426 [INFO] Backfilling 1000PEPE/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:06:41,852 [INFO] Saved 1057 rows → data/crypto/1000PEPEUSDT_1d.parquet
+2026-03-26 07:06:41,867 [INFO] Finished: done:1000PEPE/USDT:USDT
+Downloading all TFs:  60%|██████    | 18/30 [07:35<05:02, 25.18s/it]2026-03-26 07:06:47,640 [INFO] Saved 9408 rows → data/crypto/OPNUSDT_5m.parquet
+2026-03-26 07:06:49,357 [INFO] Saved 3136 rows → data/crypto/OPNUSDT_15m.parquet
+2026-03-26 07:06:49,788 [INFO] Saved 784 rows → data/crypto/OPNUSDT_1h.parquet
+2026-03-26 07:06:50,205 [INFO] Saved 197 rows → data/crypto/OPNUSDT_4h.parquet
+2026-03-26 07:06:50,614 [INFO] Saved 34 rows → data/crypto/OPNUSDT_1d.parquet
+2026-03-26 07:06:50,628 [INFO] Finished: done:OPN/USDT:USDT
+Downloading all TFs:  63%|██████▎   | 19/30 [07:44<03:42, 20.25s/it]2026-03-26 07:06:57,028 [INFO] Saved 339924 rows → data/crypto/ADAUSDT_5m.parquet
+2026-03-26 07:06:59,200 [INFO] Saved 113308 rows → data/crypto/ADAUSDT_15m.parquet
+2026-03-26 07:06:59,232 [INFO] Finished: done:ADA/USDT:USDT
+Downloading all TFs:  67%|██████▋   | 20/30 [07:52<02:47, 16.76s/it]2026-03-26 07:07:29,708 [INFO] Saved 113308 rows → data/crypto/ONTUSDT_15m.parquet
+2026-03-26 07:07:32,820 [INFO] Saved 66984 rows → data/crypto/PROVEUSDT_5m.parquet
+2026-03-26 07:07:41,877 [INFO] Saved 28327 rows → data/crypto/ONTUSDT_1h.parquet
+2026-03-26 07:07:42,556 [INFO] Saved 22328 rows → data/crypto/PROVEUSDT_15m.parquet
+2026-03-26 07:07:45,094 [INFO] Saved 5582 rows → data/crypto/PROVEUSDT_1h.parquet
+2026-03-26 07:07:45,270 [INFO] Saved 7082 rows → data/crypto/ONTUSDT_4h.parquet
+2026-03-26 07:07:45,916 [INFO] Saved 1396 rows → data/crypto/PROVEUSDT_4h.parquet
+2026-03-26 07:07:46,073 [INFO] Saved 1181 rows → data/crypto/ONTUSDT_1d.parquet
+2026-03-26 07:07:46,087 [INFO] Finished: done:ONT/USDT:USDT
+Downloading all TFs:  70%|███████   | 21/30 [08:39<03:52, 25.79s/it]2026-03-26 07:07:46,308 [INFO] Saved 234 rows → data/crypto/PROVEUSDT_1d.parquet
+2026-03-26 07:07:46,323 [INFO] Finished: done:PROVE/USDT:USDT
+Downloading all TFs:  73%|███████▎  | 22/30 [08:39<02:24, 18.12s/it]2026-03-26 07:07:46,693 [INFO] Backfilling SUI/USDT:USDT 5m from 2023-01-01
+2026-03-26 07:07:55,020 [INFO] Saved 12866 rows → data/crypto/CRCLUSDT_5m.parquet
+2026-03-26 07:07:57,212 [INFO] Saved 4289 rows → data/crypto/CRCLUSDT_15m.parquet
+2026-03-26 07:07:58,043 [INFO] Saved 1073 rows → data/crypto/CRCLUSDT_1h.parquet
+2026-03-26 07:07:58,454 [INFO] Saved 269 rows → data/crypto/CRCLUSDT_4h.parquet
+2026-03-26 07:07:58,859 [INFO] Saved 46 rows → data/crypto/CRCLUSDT_1d.parquet
+2026-03-26 07:07:58,872 [INFO] Finished: done:CRCL/USDT:USDT
+Downloading all TFs:  77%|███████▋  | 23/30 [08:52<01:55, 16.45s/it]2026-03-26 07:07:59,263 [INFO] Backfilling DOT/USDT:USDT 5m from 2023-01-01
+2026-03-26 07:08:15,534 [INFO] Saved 208158 rows → data/crypto/ENAUSDT_5m.parquet
+2026-03-26 07:08:46,035 [INFO] Saved 69386 rows → data/crypto/ENAUSDT_15m.parquet
+2026-03-26 07:08:53,708 [INFO] Saved 17347 rows → data/crypto/ENAUSDT_1h.parquet
+2026-03-26 07:08:56,158 [INFO] Saved 4337 rows → data/crypto/ENAUSDT_4h.parquet
+2026-03-26 07:08:56,561 [INFO] Saved 724 rows → data/crypto/ENAUSDT_1d.parquet
+2026-03-26 07:08:56,575 [INFO] Finished: done:ENA/USDT:USDT
+Downloading all TFs:  80%|████████  | 24/30 [09:50<02:52, 28.83s/it]2026-03-26 07:09:15,438 [INFO] Saved 304596 rows → data/crypto/SUIUSDT_5m.parquet
+2026-03-26 07:09:15,446 [INFO] Backfilling SUI/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:09:42,549 [INFO] Saved 339924 rows → data/crypto/DOTUSDT_5m.parquet
+2026-03-26 07:09:42,556 [INFO] Backfilling DOT/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:09:48,039 [INFO] Saved 101532 rows → data/crypto/SUIUSDT_15m.parquet
+2026-03-26 07:09:48,045 [INFO] Backfilling SUI/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:09:55,050 [INFO] Saved 25383 rows → data/crypto/SUIUSDT_1h.parquet
+2026-03-26 07:09:55,055 [INFO] Backfilling SUI/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:09:58,303 [INFO] Saved 6346 rows → data/crypto/SUIUSDT_4h.parquet
+2026-03-26 07:09:58,308 [INFO] Backfilling SUI/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:09:59,146 [INFO] Saved 1059 rows → data/crypto/SUIUSDT_1d.parquet
+2026-03-26 07:09:59,159 [INFO] Finished: done:SUI/USDT:USDT
+Downloading all TFs:  83%|████████▎ | 25/30 [10:52<03:14, 38.95s/it]2026-03-26 07:10:16,494 [INFO] Saved 113308 rows → data/crypto/DOTUSDT_15m.parquet
+2026-03-26 07:10:16,505 [INFO] Backfilling DOT/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:10:25,025 [INFO] Saved 28327 rows → data/crypto/DOTUSDT_1h.parquet
+2026-03-26 07:10:25,029 [INFO] Backfilling DOT/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:10:27,615 [INFO] Saved 7082 rows → data/crypto/DOTUSDT_4h.parquet
+2026-03-26 07:10:27,619 [INFO] Backfilling DOT/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:10:28,454 [INFO] Saved 1181 rows → data/crypto/DOTUSDT_1d.parquet
+2026-03-26 07:10:28,468 [INFO] Finished: done:DOT/USDT:USDT
+Downloading all TFs:  87%|████████▋ | 26/30 [11:21<02:24, 36.06s/it]2026-03-26 07:10:29,025 [INFO] Backfilling LINK/USDT:USDT 5m from 2023-01-01
+2026-03-26 07:10:38,147 [INFO] Saved 73128 rows → data/crypto/CUSDT_5m.parquet
+2026-03-26 07:10:48,906 [INFO] Saved 24376 rows → data/crypto/CUSDT_15m.parquet
+2026-03-26 07:10:51,852 [INFO] Saved 6094 rows → data/crypto/CUSDT_1h.parquet
+2026-03-26 07:10:52,692 [INFO] Saved 1524 rows → data/crypto/CUSDT_4h.parquet
+2026-03-26 07:10:53,088 [INFO] Saved 255 rows → data/crypto/CUSDT_1d.parquet
+2026-03-26 07:10:53,100 [INFO] Finished: done:C/USDT:USDT
+Downloading all TFs:  90%|█████████ | 27/30 [11:46<01:37, 32.63s/it]2026-03-26 07:10:53,894 [INFO] Saved 231 rows → data/crypto/BSBUSDT_5m.parquet
+2026-03-26 07:10:54,292 [INFO] Saved 77 rows → data/crypto/BSBUSDT_15m.parquet
+2026-03-26 07:10:54,691 [INFO] Saved 20 rows → data/crypto/BSBUSDT_1h.parquet
+2026-03-26 07:10:55,082 [INFO] Saved 6 rows → data/crypto/BSBUSDT_4h.parquet
+2026-03-26 07:10:55,470 [INFO] Saved 2 rows → data/crypto/BSBUSDT_1d.parquet
+2026-03-26 07:10:55,478 [INFO] Finished: done:BSB/USDT:USDT
+Downloading all TFs:  93%|█████████▎| 28/30 [11:48<00:47, 23.55s/it]2026-03-26 07:11:28,040 [INFO] Saved 335286 rows → data/crypto/FETUSDT_5m.parquet
+2026-03-26 07:12:14,425 [INFO] Saved 339924 rows → data/crypto/LINKUSDT_5m.parquet
+2026-03-26 07:12:14,432 [INFO] Backfilling LINK/USDT:USDT 15m from 2023-01-01
+2026-03-26 07:12:18,410 [INFO] Saved 111762 rows → data/crypto/FETUSDT_15m.parquet
+2026-03-26 07:12:30,449 [INFO] Saved 27941 rows → data/crypto/FETUSDT_1h.parquet
+2026-03-26 07:12:33,448 [INFO] Saved 6986 rows → data/crypto/FETUSDT_4h.parquet
+2026-03-26 07:12:34,271 [INFO] Saved 1165 rows → data/crypto/FETUSDT_1d.parquet
+2026-03-26 07:12:34,280 [INFO] Finished: done:FET/USDT:USDT
+Downloading all TFs:  97%|█████████▋| 29/30 [13:27<00:46, 46.13s/it]2026-03-26 07:12:47,845 [INFO] Saved 113308 rows → data/crypto/LINKUSDT_15m.parquet
+2026-03-26 07:12:47,850 [INFO] Backfilling LINK/USDT:USDT 1h from 2023-01-01
+2026-03-26 07:12:56,142 [INFO] Saved 28327 rows → data/crypto/LINKUSDT_1h.parquet
+2026-03-26 07:12:56,146 [INFO] Backfilling LINK/USDT:USDT 4h from 2023-01-01
+2026-03-26 07:12:58,709 [INFO] Saved 7082 rows → data/crypto/LINKUSDT_4h.parquet
+2026-03-26 07:12:58,713 [INFO] Backfilling LINK/USDT:USDT 1d from 2023-01-01
+2026-03-26 07:12:59,550 [INFO] Saved 1181 rows → data/crypto/LINKUSDT_1d.parquet
+2026-03-26 07:12:59,561 [INFO] Finished: done:LINK/USDT:USDT
+Downloading all TFs: 100%|██████████| 30/30 [13:53<00:00, 39.87s/it]Downloading all TFs: 100%|██████████| 30/30 [13:53<00:00, 27.77s/it]
+2026-03-26 07:12:59,562 [INFO] Computing historical volume rankings …
+Computing volume rankings:   0%|          | 0/30 [00:00<?, ?it/s]/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+Computing volume rankings:  17%|█▋        | 5/30 [00:00<00:00, 45.13it/s]/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+Computing volume rankings:  33%|███▎      | 10/30 [00:00<00:00, 47.76it/s]/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+Computing volume rankings:  53%|█████▎    | 16/30 [00:00<00:00, 49.80it/s]/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+Computing volume rankings:  77%|███████▋  | 23/30 [00:00<00:00, 56.91it/s]/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+/root/bot/utils/data_downloader.py:213: UserWarning: Converting to Period representation will drop timezone information.
+  {"month": ts.to_period("M"), "symbol": symbol, "volume_30d": vol}
+Computing volume rankings:  97%|█████████▋| 29/30 [00:00<00:00, 55.00it/s]Computing volume rankings: 100%|██████████| 30/30 [00:00<00:00, 54.57it/s]
+2026-03-26 07:13:00,126 [INFO] Saved 688 rows → data/crypto/volume_rankings.parquet
+2026-03-26 07:13:00,126 [INFO] ✅  Data download complete. Files in data/crypto

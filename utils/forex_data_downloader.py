@@ -238,7 +238,6 @@ def run(
         cfg = yaml.safe_load(f)
 
     start_date = cfg["data"]["start_date"]
-    resample_tfs = cfg["data"]["resample_tfs"]
     forex_dir = Path(cfg["data"].get("forex_dir", "data/forex"))
     commodities_dir = Path(cfg["data"].get("commodities_dir", "data/commodities"))
 
@@ -277,46 +276,73 @@ def run(
         (instr, commodities_dir, "commodities") for instr in commodity_instruments
     ]
 
+    # Download ALL timeframes directly from OANDA (no 1m + resample)
+    download_tfs = ["5m", "15m", "1h", "4h", "1d"]
+
     total = len(all_instruments)
     for idx, (instrument, out_dir, asset_class) in enumerate(all_instruments, 1):
-        logger.info("[%d/%d] Downloading %s (%s) ...", idx, total, instrument, asset_class)
+        logger.info("[%d/%d] Downloading %s (%s) — all TFs direct ...",
+                    idx, total, instrument, asset_class)
 
-        # Download 1m base data
-        out_path = out_dir / f"{instrument}_1m.parquet"
+        for tf in download_tfs:
+            oanda_gran = TF_MAP[tf]
+            tf_seconds = TF_SECONDS[tf]
+            out_path = out_dir / f"{instrument}_{tf}.parquet"
 
-        # Resume support
-        actual_from = from_dt
-        if out_path.exists():
-            existing = pd.read_parquet(out_path, columns=["timestamp"])
-            if not existing.empty:
-                last_ts = existing["timestamp"].max()
-                resume_from = last_ts.to_pydatetime() + timedelta(minutes=1)
-                if resume_from >= to_dt - timedelta(hours=1):
-                    logger.info("Skipping %s (up-to-date)", instrument)
-                    continue
-                logger.info("Resuming %s from %s", instrument, last_ts)
-                actual_from = resume_from
+            # Resume: check both forward AND backward
+            need_forward = True
+            need_backward = False
+            actual_from = from_dt
 
-        df_1m = download_ohlcv_oanda(ctx, instrument, "M1", actual_from, to_dt)
+            if out_path.exists():
+                existing = pd.read_parquet(out_path, columns=["timestamp"])
+                if not existing.empty:
+                    last_ts = existing["timestamp"].max()
+                    first_ts = existing["timestamp"].min()
+                    resume_from = last_ts.to_pydatetime() + timedelta(seconds=tf_seconds)
+                    if resume_from >= to_dt - timedelta(seconds=tf_seconds):
+                        need_forward = False
+                    else:
+                        actual_from = resume_from
+                    # Check if we need older data (backfill)
+                    first_dt = first_ts.to_pydatetime().replace(tzinfo=from_dt.tzinfo)
+                    if from_dt < first_dt - timedelta(seconds=tf_seconds):
+                        need_backward = True
 
-        if df_1m.empty:
-            logger.warning("No data for %s — skipping", instrument)
-            continue
+            if not need_forward and not need_backward:
+                continue  # This TF is up-to-date
 
-        # Merge with existing if resuming
-        if out_path.exists() and actual_from != from_dt:
-            old_df = pd.read_parquet(out_path)
-            df_1m = pd.concat([old_df, df_1m]).drop_duplicates(
-                subset=["timestamp"]
-            ).sort_values("timestamp").reset_index(drop=True)
+            dfs_to_merge = []
 
-        save_parquet(df_1m, out_path)
+            # Backfill older data
+            if need_backward and out_path.exists():
+                existing = pd.read_parquet(out_path, columns=["timestamp"])
+                first_ts = existing["timestamp"].min()
+                backfill_to = first_ts.to_pydatetime().replace(tzinfo=from_dt.tzinfo)
+                logger.info("  Backfilling %s %s from %s", instrument, tf, from_dt.date())
+                df_back = download_ohlcv_oanda(ctx, instrument, oanda_gran, from_dt, backfill_to)
+                if not df_back.empty:
+                    dfs_to_merge.append(df_back)
 
-        # Resample to higher timeframes
-        for tf in resample_tfs:
-            tf_df = resample_ohlcv(df_1m, tf)
-            tf_path = out_dir / f"{instrument}_{tf}.parquet"
-            save_parquet(tf_df, tf_path)
+            # Forward data
+            if need_forward:
+                df_fwd = download_ohlcv_oanda(ctx, instrument, oanda_gran, actual_from, to_dt)
+                if not df_fwd.empty:
+                    dfs_to_merge.append(df_fwd)
+
+            if not dfs_to_merge:
+                continue
+
+            df_new = pd.concat(dfs_to_merge, ignore_index=True)
+
+            # Merge with existing
+            if out_path.exists():
+                old_df = pd.read_parquet(out_path)
+                df_new = pd.concat([old_df, df_new]).drop_duplicates(
+                    subset=["timestamp"]
+                ).sort_values("timestamp").reset_index(drop=True)
+
+            save_parquet(df_new, out_path)
 
     logger.info("Done! Forex data in %s, Commodities data in %s", forex_dir, commodities_dir)
 

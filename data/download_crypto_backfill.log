@@ -1,0 +1,58 @@
+2026-03-26 06:54:10,706 [INFO] Connecting to exchange ...
+2026-03-26 06:54:11,066 [INFO] Fetching 24h ticker volume for 555 symbols ...
+2026-03-26 06:54:13,021 [INFO] Top 100 USDT-M Futures coins by 24h volume
+2026-03-26 06:54:13,021 [INFO] Top 10: ['BTC', 'ETH', 'XAU', 'XAG', 'SOL', 'TAO', 'SIREN', 'XRP', 'DOGE', 'RIVER']
+2026-03-26 06:54:13,021 [INFO] Downloading 5 TFs directly (no 1m resample) with 3 workers
+Downloading all TFs:   0%|          | 0/100 [00:00<?, ?it/s]2026-03-26 06:54:13,695 [INFO] Backfilling BTC/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:54:13,695 [INFO] Backfilling ETH/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:54:26,713 [INFO] Saved 30226 rows → data/crypto/XAUUSDT_5m.parquet
+2026-03-26 06:54:31,329 [INFO] Saved 10076 rows → data/crypto/XAUUSDT_15m.parquet
+2026-03-26 06:54:32,546 [INFO] Saved 2519 rows → data/crypto/XAUUSDT_1h.parquet
+2026-03-26 06:54:32,983 [INFO] Saved 630 rows → data/crypto/XAUUSDT_4h.parquet
+2026-03-26 06:54:33,378 [INFO] Saved 106 rows → data/crypto/XAUUSDT_1d.parquet
+2026-03-26 06:54:33,391 [INFO] Finished: done:XAU/USDT:USDT
+Downloading all TFs:   1%|          | 1/100 [00:20<33:36, 20.36s/it]2026-03-26 06:54:43,340 [INFO] Saved 22427 rows → data/crypto/XAGUSDT_5m.parquet
+2026-03-26 06:54:46,633 [INFO] Saved 7476 rows → data/crypto/XAGUSDT_15m.parquet
+2026-03-26 06:54:47,455 [INFO] Saved 1869 rows → data/crypto/XAGUSDT_1h.parquet
+2026-03-26 06:54:47,858 [INFO] Saved 468 rows → data/crypto/XAGUSDT_4h.parquet
+2026-03-26 06:54:48,248 [INFO] Saved 79 rows → data/crypto/XAGUSDT_1d.parquet
+2026-03-26 06:54:48,255 [INFO] Finished: done:XAG/USDT:USDT
+Downloading all TFs:   2%|▏         | 2/100 [00:35<27:58, 17.13s/it]2026-03-26 06:54:48,848 [INFO] Backfilling SOL/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:55:55,732 [INFO] Saved 339923 rows → data/crypto/ETHUSDT_5m.parquet
+2026-03-26 06:55:55,740 [INFO] Backfilling ETH/USDT:USDT 15m from 2023-01-01
+2026-03-26 06:56:03,911 [INFO] Saved 339923 rows → data/crypto/BTCUSDT_5m.parquet
+2026-03-26 06:56:03,917 [INFO] Backfilling BTC/USDT:USDT 15m from 2023-01-01
+2026-03-26 06:56:33,004 [INFO] Saved 339923 rows → data/crypto/SOLUSDT_5m.parquet
+2026-03-26 06:56:33,010 [INFO] Backfilling SOL/USDT:USDT 15m from 2023-01-01
+2026-03-26 06:56:36,453 [INFO] Saved 113308 rows → data/crypto/ETHUSDT_15m.parquet
+2026-03-26 06:56:36,459 [INFO] Backfilling ETH/USDT:USDT 1h from 2023-01-01
+2026-03-26 06:56:39,719 [INFO] Saved 113308 rows → data/crypto/BTCUSDT_15m.parquet
+2026-03-26 06:56:39,723 [INFO] Backfilling BTC/USDT:USDT 1h from 2023-01-01
+2026-03-26 06:56:46,516 [INFO] Saved 28327 rows → data/crypto/ETHUSDT_1h.parquet
+2026-03-26 06:56:46,520 [INFO] Backfilling ETH/USDT:USDT 4h from 2023-01-01
+2026-03-26 06:56:48,239 [INFO] Saved 28327 rows → data/crypto/BTCUSDT_1h.parquet
+2026-03-26 06:56:48,242 [INFO] Backfilling BTC/USDT:USDT 4h from 2023-01-01
+2026-03-26 06:56:49,471 [INFO] Saved 7082 rows → data/crypto/ETHUSDT_4h.parquet
+2026-03-26 06:56:49,474 [INFO] Backfilling ETH/USDT:USDT 1d from 2023-01-01
+2026-03-26 06:56:50,311 [INFO] Saved 1181 rows → data/crypto/ETHUSDT_1d.parquet
+2026-03-26 06:56:50,323 [INFO] Finished: done:ETH/USDT:USDT
+Downloading all TFs:   3%|▎         | 3/100 [02:37<1:45:09, 65.05s/it]2026-03-26 06:56:50,884 [INFO] Saved 7082 rows → data/crypto/BTCUSDT_4h.parquet
+2026-03-26 06:56:50,887 [INFO] Backfilling BTC/USDT:USDT 1d from 2023-01-01
+2026-03-26 06:56:51,705 [INFO] Saved 1181 rows → data/crypto/BTCUSDT_1d.parquet
+2026-03-26 06:56:51,715 [INFO] Finished: done:BTC/USDT:USDT
+Downloading all TFs:   4%|▍         | 4/100 [02:38<1:03:51, 39.92s/it]2026-03-26 06:57:07,313 [INFO] Saved 113308 rows → data/crypto/SOLUSDT_15m.parquet
+2026-03-26 06:57:07,319 [INFO] Backfilling SOL/USDT:USDT 1h from 2023-01-01
+2026-03-26 06:57:15,695 [INFO] Saved 28327 rows → data/crypto/SOLUSDT_1h.parquet
+2026-03-26 06:57:15,700 [INFO] Backfilling SOL/USDT:USDT 4h from 2023-01-01
+2026-03-26 06:57:18,264 [INFO] Saved 7082 rows → data/crypto/SOLUSDT_4h.parquet
+2026-03-26 06:57:18,267 [INFO] Backfilling SOL/USDT:USDT 1d from 2023-01-01
+2026-03-26 06:57:19,109 [INFO] Saved 1181 rows → data/crypto/SOLUSDT_1d.parquet
+2026-03-26 06:57:19,122 [INFO] Finished: done:SOL/USDT:USDT
+Downloading all TFs:   5%|▌         | 5/100 [03:06<56:03, 35.41s/it]  2026-03-26 06:57:19,497 [INFO] Backfilling XRP/USDT:USDT 5m from 2023-01-01
+2026-03-26 06:57:38,255 [INFO] Saved 106247 rows → data/crypto/SIRENUSDT_5m.parquet
+2026-03-26 06:57:53,724 [INFO] Saved 35416 rows → data/crypto/SIRENUSDT_15m.parquet
+2026-03-26 06:57:57,476 [INFO] Saved 8854 rows → data/crypto/SIRENUSDT_1h.parquet
+2026-03-26 06:57:58,709 [INFO] Saved 2214 rows → data/crypto/SIRENUSDT_4h.parquet
+2026-03-26 06:57:59,105 [INFO] Saved 370 rows → data/crypto/SIRENUSDT_1d.parquet
+2026-03-26 06:57:59,116 [INFO] Finished: done:SIREN/USDT:USDT
+Downloading all TFs:   6%|▌         | 6/100 [03:46<57:54, 36.97s/it]2026-03-26 06:57:59,488 [INFO] Backfilling DOGE/USDT:USDT 5m from 2023-01-01
