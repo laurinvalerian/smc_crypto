@@ -61,3 +61,7 @@ backtest/results/signal_cache/
 *.parquet
 
 backtests/results
+
+.omc
+.claude
+venv

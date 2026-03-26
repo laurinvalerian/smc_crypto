@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-03-26T15:10:14.489Z",
+  "updatedAt": "2026-03-26T15:10:34.988Z",
   "missions": [
     {
       "id": "session:dff05d7f-2f2b-4c77-9125-4cfc665dc2fe:none",
@@ -7,14 +7,14 @@
       "name": "none",
       "objective": "Session mission",
       "createdAt": "2026-03-26T15:10:14.489Z",
-      "updatedAt": "2026-03-26T15:10:14.489Z",
+      "updatedAt": "2026-03-26T15:10:34.988Z",
       "status": "running",
-      "workerCount": 1,
+      "workerCount": 3,
       "taskCounts": {
-        "total": 1,
+        "total": 3,
         "pending": 0,
         "blocked": 0,
-        "inProgress": 1,
+        "inProgress": 3,
         "completed": 0,
         "failed": 0
       },
@@ -28,6 +28,26 @@
           "latestUpdate": null,
           "completedSummary": null,
           "updatedAt": "2026-03-26T15:10:14.489Z"
+        },
+        {
+          "name": "Explore:a188ccf",
+          "role": "Explore",
+          "ownership": "a188ccfe174c7fdd2",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-03-26T15:10:26.214Z"
+        },
+        {
+          "name": "Explore:a646efe",
+          "role": "Explore",
+          "ownership": "a646efed63b2cbce8",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-03-26T15:10:34.988Z"
         }
       ],
       "timeline": [
@@ -38,6 +58,22 @@
           "agent": "Explore:a951cc6",
           "detail": "started Explore:a951cc6",
           "sourceKey": "session-start:a951cc6c9e27beb59"
+        },
+        {
+          "id": "session-start:a188ccfe174c7fdd2:2026-03-26T15:10:26.214Z",
+          "at": "2026-03-26T15:10:26.214Z",
+          "kind": "update",
+          "agent": "Explore:a188ccf",
+          "detail": "started Explore:a188ccf",
+          "sourceKey": "session-start:a188ccfe174c7fdd2"
+        },
+        {
+          "id": "session-start:a646efed63b2cbce8:2026-03-26T15:10:34.988Z",
+          "at": "2026-03-26T15:10:34.988Z",
+          "kind": "update",
+          "agent": "Explore:a646efe",
+          "detail": "started Explore:a646efe",
+          "sourceKey": "session-start:a646efed63b2cbce8"
         }
       ]
     }
