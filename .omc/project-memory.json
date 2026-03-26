@@ -207,8 +207,8 @@
   "hotPaths": [
     {
       "path": "",
-      "accessCount": 37,
-      "lastAccessed": 1774537892570,
+      "accessCount": 41,
+      "lastAccessed": 1774537905164,
       "type": "directory"
     },
     {
@@ -230,6 +230,12 @@
       "type": "file"
     },
     {
+      "path": "rl_brain_v2.py",
+      "accessCount": 4,
+      "lastAccessed": 1774537904004,
+      "type": "file"
+    },
+    {
       "path": "rl_brain.py",
       "accessCount": 3,
       "lastAccessed": 1774537890653,
@@ -245,12 +251,6 @@
       "path": "backtest/optuna_backtester.py",
       "accessCount": 3,
       "lastAccessed": 1774537896237,
-      "type": "file"
-    },
-    {
-      "path": "rl_brain_v2.py",
-      "accessCount": 3,
-      "lastAccessed": 1774537896918,
       "type": "file"
     },
     {
@@ -348,6 +348,12 @@
       "accessCount": 1,
       "lastAccessed": 1774537877770,
       "type": "file"
+    },
+    {
+      "path": "utils/data_downloader.py",
+      "accessCount": 1,
+      "lastAccessed": 1774537904949,
+      "type": "directory"
     }
   ],
   "userDirectives": []
