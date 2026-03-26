@@ -1,7 +1,0 @@
-{
-  "tool_name": "Read",
-  "tool_input_preview": "{\"file_path\":\"/root/bot/backtest/generate_rl_data.py\",\"limit\":3000}",
-  "error": "File content (19489 tokens) exceeds maximum allowed tokens (10000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
-  "timestamp": "2026-03-26T15:11:28.357Z",
-  "retry_count": 5
-}
