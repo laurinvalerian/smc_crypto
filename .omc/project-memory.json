@@ -204,6 +204,61 @@
       ]
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 7,
+      "lastAccessed": 1774537720653,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/smc-strategist.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537305080,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/backtester.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537403628,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/live-trader.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537458345,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/exchange-adapter.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537504660,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/risk-manager.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537544977,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/perf-optimizer.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537571277,
+      "type": "file"
+    },
+    {
+      "path": ".claude/agents/trade-reviewer.md",
+      "accessCount": 2,
+      "lastAccessed": 1774537602560,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 1,
+      "lastAccessed": 1774536326267,
+      "type": "directory"
+    }
+  ],
   "userDirectives": []
 }

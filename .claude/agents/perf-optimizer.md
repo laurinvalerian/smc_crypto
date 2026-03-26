@@ -12,7 +12,7 @@ You are an expert in Python performance optimization, particularly for data-inte
 ## Environment Constraints
 
 - **CPU**: 4 cores
-- **RAM**: 8 GB
+- **RAM**: 8 GB + 4GB swap file (`/swapfile`) as safety net
 - **Storage**: SSD
 - **Python**: 3.x with NumPy, Pandas, PyTorch, Optuna
 
@@ -25,17 +25,31 @@ You are an expert in Python performance optimization, particularly for data-inte
 - 30 trials per window (reduced from 500 for this server)
 - 112 symbols × multi-TF data loading is the bottleneck
 
+### V16 Bruteforce Parallelization
+- `_eval_combo_worker()` + `multiprocessing.Pool(4)` = 400% CPU utilization
+- 3,024 combos per asset-class, signal caches reused
+- Only grid evaluation is parallelized (signal generation stays serial per window)
+
+### OOM Prevention (V11b Fixes)
+- **Problem**: Process killed at ~4.8GB during signal generation (111 instruments × 6 TFs)
+- **Fix 1**: 4GB swap file created (`/swapfile`) as safety net
+- **Fix 2**: Signal generation in batches of 30 instruments with `gc.collect()` between batches
+- **Fix 3**: Explicit cleanup of Optuna Study + DataFrames between walk-forward windows
+- Circuit Breaker logger set to CRITICAL during simulation (prevents log I/O overhead)
+
 ### Data Loading
 - Parquet format for compressed columnar storage
 - OHLCV cache with 5min TTL in ranker (prevents API overload)
 - Top-30 crypto selected by file size (proxy for liquidity) to reduce symbol count
 - Batch scanning: 10 parallel instruments in ranker
+- History loading in batches of 10 (rate-limit friendly)
 
 ### Memory Management
 - 100+ PaperBot instances in live trading — each holds candle buffers
 - Multi-TF data for 5 timeframes per symbol
 - PyTorch model is small (24-dim input, 128 hidden) — negligible memory
 - Pandas DataFrames for OHLCV: watch for copy-on-write patterns
+- `_HTFArrays` dataclass precomputes higher-TF arrays (~0.2ms/call) — avoids recomputation
 
 ### Concurrency
 - Async/await for WebSocket streams (non-blocking I/O)
@@ -58,3 +72,5 @@ You are an expert in Python performance optimization, particularly for data-inte
 3. **Keep n_jobs settings** — Changing parallelism without understanding deadlock risk is dangerous
 4. **Signal precomputation integrity** — Cached signals must be identical to on-the-fly generation
 5. **Don't reduce warmup periods** — EMA200 needs 250 bars, no shortcuts
+6. **Batch size 30** for signal generation — tested safe on 8GB, larger batches risk OOM
+7. **gc.collect() between batches** — explicit cleanup prevents memory accumulation
