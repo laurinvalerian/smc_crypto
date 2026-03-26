@@ -49,6 +49,11 @@ RESULTS_DIR = Path("backtest/results/rl")
 META_COLS = {"timestamp", "symbol", "asset_class", "window",
              "label_action", "label_rr", "label_outcome", "label_profitable"}
 
+# Features to exclude from entry_quality task (data leaks)
+# has_entry_zone: circular — teacher labels entries, causal entry_zone correlates
+# alignment_score: aggregated score from rule-based system, not a raw feature
+ENTRY_QUALITY_EXCLUDE = {"has_entry_zone", "alignment_score"}
+
 # Asset class encoding for model
 ASSET_CLASS_MAP = {"crypto": 0, "forex": 1, "stocks": 2, "commodities": 3}
 
@@ -81,19 +86,22 @@ def load_training_data(
             float_cols = df.select_dtypes(include=["float64"]).columns
             df[float_cols] = df[float_cols].astype(np.float32)
 
-            # Subsample no-trade bars PER CLASS during loading
-            if subsample_notrade > 0:
+            # Subsample or drop no-trade bars PER CLASS during loading
+            if subsample_notrade == 0:
+                # Only keep entry bars
+                df = df[df["label_action"] > 0].copy()
+            elif subsample_notrade > 0:
                 entries = df[df["label_action"] > 0]
                 no_trade = df[df["label_action"] == 0]
                 max_nt = int(len(entries) * subsample_notrade)
                 if len(no_trade) > max_nt:
                     no_trade = no_trade.sample(n=max_nt, random_state=42)
                 df = pd.concat([entries, no_trade], ignore_index=True)
+                del entries, no_trade
 
             logger.info("Loaded %s: %d→%d samples (%d entries)",
                         ac, raw_len, len(df), n_ent)
             dfs.append(df)
-            del entries, no_trade
             gc.collect()
         else:
             logger.warning("No data for %s at %s", ac, path)
@@ -109,9 +117,10 @@ def load_training_data(
     return combined
 
 
-def prepare_features(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+def prepare_features(df: pd.DataFrame, task: str = "binary") -> tuple[np.ndarray, list[str]]:
     """Extract feature matrix from DataFrame."""
-    feat_cols = [c for c in df.columns if c not in META_COLS]
+    exclude = META_COLS | (ENTRY_QUALITY_EXCLUDE if task == "entry_quality" else set())
+    feat_cols = [c for c in df.columns if c not in exclude]
     X = df[feat_cols].values.astype(np.float32)
     # Replace NaN/inf
     X = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -159,7 +168,7 @@ def train_xgboost(
     import xgboost as xgb
 
     n_classes = len(np.unique(y_train))
-    if task == "binary" or n_classes == 2:
+    if task in ("binary", "entry_quality") or n_classes == 2:
         objective = "binary:logistic"
         eval_metric = "auc"
     else:
@@ -167,7 +176,7 @@ def train_xgboost(
         eval_metric = "mlogloss"
 
     # Handle class imbalance
-    if task == "binary":
+    if task in ("binary", "entry_quality"):
         n_pos = (y_train == 1).sum()
         n_neg = (y_train == 0).sum()
         scale = n_neg / max(n_pos, 1)
@@ -180,7 +189,7 @@ def train_xgboost(
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        scale_pos_weight=scale if task == "binary" else 1.0,
+        scale_pos_weight=scale if task in ("binary", "entry_quality") else 1.0,
         min_child_weight=10,
         gamma=0.1,
         reg_alpha=0.1,
@@ -230,7 +239,7 @@ def evaluate_model(
 
     # Standard ML metrics
     metrics["accuracy"] = accuracy_score(y_test, y_pred)
-    if task == "binary":
+    if task in ("binary", "entry_quality"):
         metrics["precision"] = precision_score(y_test, y_pred, zero_division=0)
         metrics["recall"] = recall_score(y_test, y_pred, zero_division=0)
         metrics["f1"] = f1_score(y_test, y_pred, zero_division=0)
@@ -380,9 +389,12 @@ def run_walk_forward(
     Walk-forward training with expanding window:
     - Train on W0..W(n-2), validate on W(n-1), test on W(n)
     - With 12 windows: Train W0-W9, Val W10, Test W11
-    - Subsamples no-trade bars to fit in 8GB RAM
+    - "entry_quality" task: only entry bars, predict win vs loss (RECOMMENDED)
+    - "binary" task: all bars, predict profitable vs not
     """
-    data = load_training_data(classes)
+    # For entry_quality, load entries only (saves massive RAM)
+    subsample_ratio = 0.0 if task == "entry_quality" else 2.0
+    data = load_training_data(classes, subsample_notrade=subsample_ratio)
 
     # Discover all windows present in data
     all_windows = sorted(data["window"].unique())
@@ -417,6 +429,14 @@ def run_walk_forward(
     test_data = data[data["window"] == test_window].copy()
     del data; gc.collect()
 
+    # For entry_quality: keep only bars where teacher identified an entry
+    if task == "entry_quality":
+        train_data = train_data[train_data["label_action"] > 0].copy()
+        val_data = val_data[val_data["label_action"] > 0].copy()
+        test_data = test_data[test_data["label_action"] > 0].copy()
+        logger.info("Entry-only filter: Train=%d, Val=%d, Test=%d",
+                    len(train_data), len(val_data), len(test_data))
+
     logger.info("Sizes: Train=%d, Val=%d, Test=%d",
                 len(train_data), len(val_data), len(test_data))
 
@@ -424,19 +444,33 @@ def run_walk_forward(
         logger.error("Not enough data for walk-forward!")
         return {}
 
-    X_train, feat_names = prepare_features(train_data)
-    y_train = prepare_labels(train_data, task)
-    X_val, _ = prepare_features(val_data)
-    y_val = prepare_labels(val_data, task)
-    X_test, _ = prepare_features(test_data)
-    y_test = prepare_labels(test_data, task)
+    # For entry_quality: label = win(1) vs loss(0), using label_outcome
+    if task == "entry_quality":
+        y_train_labels = (train_data["label_outcome"].values == 1).astype(np.int32)
+        y_val_labels = (val_data["label_outcome"].values == 1).astype(np.int32)
+        y_test_labels = (test_data["label_outcome"].values == 1).astype(np.int32)
+    else:
+        y_train_labels = prepare_labels(train_data, task)
+        y_val_labels = prepare_labels(val_data, task)
+        y_test_labels = prepare_labels(test_data, task)
 
-    # Sample weights: RR-weighted for entries, low weight for no-trade
-    weights = np.ones(len(train_data), dtype=np.float32)
-    entry_mask = train_data["label_action"].values > 0
-    rr_vals = np.abs(train_data["label_rr"].values)
-    weights[entry_mask] = np.clip(rr_vals[entry_mask], 0.5, 5.0)
-    weights[~entry_mask] = 0.1
+    X_train, feat_names = prepare_features(train_data, task)
+    y_train = y_train_labels
+    X_val, _ = prepare_features(val_data, task)
+    y_val = y_val_labels
+    X_test, _ = prepare_features(test_data, task)
+    y_test = y_test_labels
+
+    # Sample weights: RR-weighted for wins, uniform for losses
+    weights = np.ones(len(y_train), dtype=np.float32)
+    if task == "entry_quality":
+        rr_vals = np.abs(train_data["label_rr"].values)
+        weights[y_train == 1] = np.clip(rr_vals[y_train == 1], 1.0, 5.0)
+    else:
+        entry_mask = train_data["label_action"].values > 0
+        rr_vals = np.abs(train_data["label_rr"].values)
+        weights[entry_mask] = np.clip(rr_vals[entry_mask], 0.5, 5.0)
+        weights[~entry_mask] = 0.1
 
     # Free DataFrames after extracting arrays
     train_meta = train_data[list(META_COLS & set(train_data.columns))].copy()
@@ -460,7 +494,7 @@ def run_walk_forward(
     train_acc = accuracy_score(y_train, train_pred)
     test_acc = metrics.get("accuracy", 0)
     try:
-        train_auc = roc_auc_score(y_train, train_proba[:, 1]) if task == "binary" else 0
+        train_auc = roc_auc_score(y_train, train_proba[:, 1]) if task in ("binary", "entry_quality") else 0
     except Exception:
         train_auc = 0
     test_auc = metrics.get("auc", 0)
@@ -577,8 +611,9 @@ def main():
                         help="Use walk-forward validation")
     parser.add_argument("--model", choices=["xgboost", "nn"], default="xgboost",
                         help="Model type (default: xgboost)")
-    parser.add_argument("--task", choices=["binary", "direction"], default="binary",
-                        help="Prediction task (default: binary)")
+    parser.add_argument("--task", choices=["binary", "direction", "entry_quality"],
+                        default="entry_quality",
+                        help="Prediction task (default: entry_quality)")
     parser.add_argument("--classes", nargs="+",
                         choices=["crypto", "forex", "stocks", "commodities"],
                         help="Asset classes to include")

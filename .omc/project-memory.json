@@ -1,0 +1,209 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1774527253309,
+  "projectRoot": "/root/bot",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1774527253263,
+      "keyFiles": [
+        "live_multi_bot.cpython-312.pyc",
+        "paper_grid.cpython-312.pyc",
+        "rl_brain.cpython-312.pyc",
+        "rl_brain_v2.cpython-312.pyc"
+      ]
+    },
+    "backtest": {
+      "path": "backtest",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1774527253269,
+      "keyFiles": [
+        "__init__.py",
+        "generate_rl_data.py",
+        "optuna_backtester.py"
+      ]
+    },
+    "config": {
+      "path": "config",
+      "purpose": "Configuration files",
+      "fileCount": 2,
+      "lastAccessed": 1774527253277,
+      "keyFiles": [
+        "__init__.py",
+        "default_config.yaml"
+      ]
+    },
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 5,
+      "lastAccessed": 1774527253280,
+      "keyFiles": [
+        "download_crypto.log",
+        "download_crypto_backfill.log",
+        "download_crypto_top30.log",
+        "download_forex.log",
+        "download_stocks.log"
+      ]
+    },
+    "docker": {
+      "path": "docker",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1774527253281,
+      "keyFiles": []
+    },
+    "exchanges": {
+      "path": "exchanges",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1774527253283,
+      "keyFiles": [
+        "__init__.py",
+        "alpaca_adapter.py",
+        "base.py",
+        "binance_adapter.py",
+        "models.py"
+      ]
+    },
+    "filters": {
+      "path": "filters",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1774527253284,
+      "keyFiles": [
+        "__init__.py",
+        "session_filter.py",
+        "trend_strength.py",
+        "volume_liquidity.py",
+        "zone_quality.py"
+      ]
+    },
+    "live": {
+      "path": "live",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1774527253284,
+      "keyFiles": [
+        "__init__.py"
+      ]
+    },
+    "live_results": {
+      "path": "live_results",
+      "purpose": null,
+      "fileCount": 325,
+      "lastAccessed": 1774527253285,
+      "keyFiles": [
+        "bot_001.log",
+        "bot_001_equity.csv",
+        "bot_001_state.json",
+        "bot_002.log",
+        "bot_002_equity.csv"
+      ]
+    },
+    "models": {
+      "path": "models",
+      "purpose": "Data models",
+      "fileCount": 1,
+      "lastAccessed": 1774527253289,
+      "keyFiles": [
+        "rl_brain_v2_xgb.pkl"
+      ]
+    },
+    "paper_grid_results": {
+      "path": "paper_grid_results",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1774527253299,
+      "keyFiles": [
+        "paper_grid_state.json",
+        "paper_grid_summary.csv"
+      ]
+    },
+    "ranker": {
+      "path": "ranker",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1774527253300,
+      "keyFiles": [
+        "__init__.py",
+        "capital_allocator.py",
+        "opportunity_ranker.py",
+        "universe_scanner.py"
+      ]
+    },
+    "risk": {
+      "path": "risk",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1774527253302,
+      "keyFiles": [
+        "__init__.py",
+        "circuit_breaker.py"
+      ]
+    },
+    "strategies": {
+      "path": "strategies",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1774527253302,
+      "keyFiles": [
+        "__init__.py",
+        "smc_multi_style.py"
+      ]
+    },
+    "utils": {
+      "path": "utils",
+      "purpose": "Utility functions",
+      "fileCount": 5,
+      "lastAccessed": 1774527253303,
+      "keyFiles": [
+        "__init__.py",
+        "data_downloader.py",
+        "forex_data_downloader.py",
+        "prefetch_history.py",
+        "stock_data_downloader.py"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
