@@ -207,14 +207,32 @@
   "hotPaths": [
     {
       "path": "",
-      "accessCount": 23,
-      "lastAccessed": 1774537867887,
+      "accessCount": 34,
+      "lastAccessed": 1774537888098,
       "type": "directory"
     },
     {
       "path": "CLAUDE.md",
       "accessCount": 7,
       "lastAccessed": 1774537720653,
+      "type": "file"
+    },
+    {
+      "path": "live_multi_bot.py",
+      "accessCount": 3,
+      "lastAccessed": 1774537885004,
+      "type": "file"
+    },
+    {
+      "path": "backtest/generate_rl_data.py",
+      "accessCount": 3,
+      "lastAccessed": 1774537885548,
+      "type": "file"
+    },
+    {
+      "path": "rl_brain.py",
+      "accessCount": 3,
+      "lastAccessed": 1774537890653,
       "type": "file"
     },
     {
@@ -260,9 +278,27 @@
       "type": "file"
     },
     {
-      "path": "live_multi_bot.py",
+      "path": "rl_brain_v2.py",
       "accessCount": 2,
-      "lastAccessed": 1774537866813,
+      "lastAccessed": 1774537876962,
+      "type": "file"
+    },
+    {
+      "path": "paper_grid.py",
+      "accessCount": 2,
+      "lastAccessed": 1774537877988,
+      "type": "file"
+    },
+    {
+      "path": "strategies/smc_multi_style.py",
+      "accessCount": 2,
+      "lastAccessed": 1774537885295,
+      "type": "file"
+    },
+    {
+      "path": "backtest/optuna_backtester.py",
+      "accessCount": 2,
+      "lastAccessed": 1774537885505,
       "type": "file"
     },
     {
@@ -290,40 +326,10 @@
       "type": "file"
     },
     {
-      "path": "rl_brain_v2.py",
-      "accessCount": 1,
-      "lastAccessed": 1774537843427,
-      "type": "file"
-    },
-    {
-      "path": "rl_brain.py",
-      "accessCount": 1,
-      "lastAccessed": 1774537843506,
-      "type": "file"
-    },
-    {
-      "path": "paper_grid.py",
-      "accessCount": 1,
-      "lastAccessed": 1774537845143,
-      "type": "file"
-    },
-    {
-      "path": "backtest/generate_rl_data.py",
-      "accessCount": 1,
-      "lastAccessed": 1774537854997,
-      "type": "file"
-    },
-    {
       "path": "backtest",
       "accessCount": 1,
       "lastAccessed": 1774537856106,
       "type": "directory"
-    },
-    {
-      "path": "strategies/smc_multi_style.py",
-      "accessCount": 1,
-      "lastAccessed": 1774537864266,
-      "type": "file"
     },
     {
       "path": "utils/__init__.py",
@@ -335,6 +341,12 @@
       "path": "config/__init__.py",
       "accessCount": 1,
       "lastAccessed": 1774537864445,
+      "type": "file"
+    },
+    {
+      "path": "ranker/capital_allocator.py",
+      "accessCount": 1,
+      "lastAccessed": 1774537877770,
       "type": "file"
     }
   ],
