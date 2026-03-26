@@ -207,8 +207,8 @@
   "hotPaths": [
     {
       "path": "",
-      "accessCount": 41,
-      "lastAccessed": 1774537905164,
+      "accessCount": 46,
+      "lastAccessed": 1774537913077,
       "type": "directory"
     },
     {
@@ -225,33 +225,39 @@
     },
     {
       "path": "live_multi_bot.py",
-      "accessCount": 4,
-      "lastAccessed": 1774537895921,
-      "type": "file"
-    },
-    {
-      "path": "rl_brain_v2.py",
-      "accessCount": 4,
-      "lastAccessed": 1774537904004,
-      "type": "file"
-    },
-    {
-      "path": "rl_brain.py",
-      "accessCount": 3,
-      "lastAccessed": 1774537890653,
-      "type": "file"
-    },
-    {
-      "path": "paper_grid.py",
-      "accessCount": 3,
-      "lastAccessed": 1774537891895,
+      "accessCount": 5,
+      "lastAccessed": 1774537906799,
       "type": "file"
     },
     {
       "path": "backtest/optuna_backtester.py",
-      "accessCount": 3,
-      "lastAccessed": 1774537896237,
+      "accessCount": 5,
+      "lastAccessed": 1774537915752,
       "type": "file"
+    },
+    {
+      "path": "rl_brain_v2.py",
+      "accessCount": 5,
+      "lastAccessed": 1774537920148,
+      "type": "file"
+    },
+    {
+      "path": "paper_grid.py",
+      "accessCount": 4,
+      "lastAccessed": 1774537907097,
+      "type": "file"
+    },
+    {
+      "path": "rl_brain.py",
+      "accessCount": 4,
+      "lastAccessed": 1774537919421,
+      "type": "file"
+    },
+    {
+      "path": "utils/data_downloader.py",
+      "accessCount": 3,
+      "lastAccessed": 1774537916508,
+      "type": "directory"
     },
     {
       "path": ".claude/agents/smc-strategist.md",
@@ -302,15 +308,15 @@
       "type": "file"
     },
     {
-      "path": "requirements.txt",
-      "accessCount": 1,
-      "lastAccessed": 1774537836133,
+      "path": "config/default_config.yaml",
+      "accessCount": 2,
+      "lastAccessed": 1774537907625,
       "type": "file"
     },
     {
-      "path": "config/default_config.yaml",
+      "path": "requirements.txt",
       "accessCount": 1,
-      "lastAccessed": 1774537836559,
+      "lastAccessed": 1774537836133,
       "type": "file"
     },
     {
@@ -350,10 +356,22 @@
       "type": "file"
     },
     {
-      "path": "utils/data_downloader.py",
+      "path": "utils/prefetch_history.py",
       "accessCount": 1,
-      "lastAccessed": 1774537904949,
-      "type": "directory"
+      "lastAccessed": 1774537908977,
+      "type": "file"
+    },
+    {
+      "path": "data/download_crypto.log",
+      "accessCount": 1,
+      "lastAccessed": 1774537915123,
+      "type": "file"
+    },
+    {
+      "path": "paper_trading.log",
+      "accessCount": 1,
+      "lastAccessed": 1774537920213,
+      "type": "file"
     }
   ],
   "userDirectives": []
