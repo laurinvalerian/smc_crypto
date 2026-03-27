@@ -232,11 +232,14 @@ class AlpacaAdapter(ExchangeAdapter):
             minutes_back = multipliers.get(timeframe, 5) * limit
             start = datetime.now(timezone.utc) - timedelta(minutes=minutes_back)
 
+        from alpaca.data.enums import DataFeed
+
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=alpaca_tf,
             start=start,
             limit=limit,
+            feed=DataFeed.IEX,  # Free tier (SIP requires paid subscription)
         )
 
         bars = await asyncio.to_thread(
@@ -273,7 +276,8 @@ class AlpacaAdapter(ExchangeAdapter):
         except ImportError:
             raise ImportError("alpaca-py required")
 
-        request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        from alpaca.data.enums import DataFeed
+        request = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
         quotes = await asyncio.to_thread(
             self._data_client.get_stock_latest_quote, request,
         )

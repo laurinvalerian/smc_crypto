@@ -1650,15 +1650,17 @@ class PaperBot:
         tier = sig.get("tier", TIER_AAA_PLUS)
         style = sig.get("style", STYLE_DAY)
 
-        # ── RL Brain gate (warm-up: first 100 trades always accepted) ─
-        use_brain = self.trades >= WARMUP_TRADES
+        # ── RL Brain gate ────────────────────────────────────────────
+        # XGBoost models are pre-trained (19M rows) — no warmup needed.
+        # PPO brain (legacy) still uses warmup for online learning.
+        use_ppo_brain = self.trades >= WARMUP_TRADES
         rl_tracked = False
         rl_trade_id: str | None = None
         take_trade = True
         rl_confidence = 1.0
 
-        # XGBoost entry filter (RLBrainSuite)
-        if use_brain and self.rl_suite is not None and self.rl_suite.entry_filter_enabled:
+        # XGBoost entry filter (RLBrainSuite) — always active, no warmup
+        if self.rl_suite is not None and self.rl_suite.entry_filter_enabled:
             xgb_take, rl_confidence = self.rl_suite.predict_entry(sig.get("features", {}))
             if not xgb_take:
                 self._rl_rejected += 1
@@ -1684,8 +1686,8 @@ class PaperBot:
                 self._rl_accepted, self._rl_rejected,
             )
 
-        # PPO brain (legacy, runs after XGBoost filter)
-        if use_brain and self.brain is not None:
+        # PPO brain (legacy, runs after XGBoost filter — warmup gated)
+        if use_ppo_brain and self.brain is not None:
             rl_decision, rl_trade_id = self.brain.should_trade(obs, coin_id=self.symbol)
             rl_tracked = True
             take_trade = rl_decision

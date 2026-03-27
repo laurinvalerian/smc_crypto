@@ -166,6 +166,27 @@ class ExchangeAdapter(abc.ABC):
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """Cancel an order. Returns True on success."""
 
+    async def modify_stop_loss(
+        self,
+        old_order_id: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        new_stop_price: float,
+    ) -> OrderResult | None:
+        """Move stop-loss to a new price (cancel old + place new).
+
+        Used by BE management to move SL to breakeven.
+        Default: cancel + replace. Override for exchanges with native modify.
+        """
+        try:
+            cancelled = await self.cancel_order(old_order_id, symbol)
+            if not cancelled:
+                return None
+            return await self.create_stop_loss(symbol, side, qty, new_stop_price)
+        except Exception:
+            return None
+
     @abc.abstractmethod
     async def fetch_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         """Return list of open orders for a symbol."""

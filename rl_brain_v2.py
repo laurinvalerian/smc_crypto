@@ -51,7 +51,9 @@ ALL_CLASSES = ["crypto", "forex", "stocks", "commodities"]
 
 # Features that should NOT be used as model input
 META_COLS = {"timestamp", "symbol", "asset_class", "window",
-             "label_action", "label_rr", "label_outcome", "label_profitable"}
+             "label_action", "label_rr", "label_outcome", "label_profitable",
+             "label_exit_mechanism", "label_exit_bar", "label_max_favorable_rr",
+             "label_tp_rr", "label_cost_rr"}
 
 # Features to exclude from entry_quality task (data leaks)
 ENTRY_QUALITY_EXCLUDE = {"has_entry_zone", "alignment_score"}
@@ -255,6 +257,45 @@ def train_xgboost(
     )
 
     logger.info("XGBoost trained: %d trees, best iteration %d",
+                model.n_estimators, model.best_iteration)
+
+    return model
+
+
+def train_xgboost_regressor(
+    X_train: np.ndarray, y_train: np.ndarray,
+    X_val: np.ndarray, y_val: np.ndarray,
+    feat_names: list[str],
+    sample_weights: np.ndarray | None = None,
+) -> Any:
+    """Train XGBoost regressor with early stopping and regularization."""
+    import xgboost as xgb
+
+    model = xgb.XGBRegressor(
+        n_estimators=500,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=10,
+        gamma=0.1,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        eval_metric="rmse",
+        early_stopping_rounds=30,
+        n_jobs=4,
+        random_state=42,
+        tree_method="hist",
+    )
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        sample_weight=sample_weights,
+        verbose=False,
+    )
+
+    logger.info("XGBRegressor trained: %d trees, best iteration %d",
                 model.n_estimators, model.best_iteration)
 
     return model
@@ -629,7 +670,7 @@ def run_walk_forward_rolling(
 
     # Save model + metadata
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = MODEL_DIR / "rl_brain_v2_xgb.pkl"
+    model_path = MODEL_DIR / "rl_entry_filter.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({
             "model": final_model,
@@ -663,7 +704,7 @@ def run_walk_forward_rolling(
         return obj
 
     results_clean = json.loads(json.dumps(fold_results, default=_convert))
-    with open(RESULTS_DIR / "fold_results.json", "w") as f:
+    with open(RESULTS_DIR / "fold_results_v2.json", "w") as f:
         json.dump(results_clean, f, indent=2)
 
     # Save feature stability
@@ -681,6 +722,473 @@ def run_walk_forward_rolling(
     gc.collect()
 
     return fold_results
+
+
+# ===================================================================
+#  Regression Walk-Forward: Shared Helpers
+# ===================================================================
+
+def _regression_walk_forward_skeleton(
+    classes: list[str] | None,
+    label_fn,
+    eval_fn,
+    task_name: str,
+    model_filename: str,
+    results_filename: str,
+) -> list[dict[str, Any]]:
+    """
+    Shared walk-forward skeleton for regression tasks (sizing, TP, BE).
+
+    Args:
+        label_fn: (df_entries) -> y array
+        eval_fn: (model, X_test, df_test, feat_names) -> metrics dict
+    """
+    data = load_training_data(classes, subsample_notrade=0.0)
+    all_windows = sorted(data["window"].unique())
+    n_win = len(all_windows)
+    logger.info("[%s] Found %d windows", task_name, n_win)
+
+    if n_win < MIN_TRAIN_WINDOWS + 2:
+        logger.error("Need at least %d windows, found %d", MIN_TRAIN_WINDOWS + 2, n_win)
+        return []
+
+    # Entry bars only
+    pre_filter = len(data)
+    data = data[data["label_action"] > 0].copy()
+    logger.info("[%s] Entry-only filter: %d -> %d rows", task_name, pre_filter, len(data))
+
+    fold_results: list[dict[str, Any]] = []
+    n_folds = n_win - MIN_TRAIN_WINDOWS - 1
+
+    for fold_idx in range(n_folds):
+        train_end = MIN_TRAIN_WINDOWS + fold_idx
+        train_wins = all_windows[:train_end]
+        val_win = all_windows[train_end]
+        test_win = all_windows[train_end + 1]
+
+        logger.info("=" * 70)
+        logger.info("[%s] FOLD %d/%d: Train W%s, Val W%d, Test W%d",
+                    task_name, fold_idx, n_folds - 1,
+                    [int(w) for w in train_wins], int(val_win), int(test_win))
+
+        train_data = data[data["window"].isin(train_wins)].copy()
+        val_data = data[data["window"] == val_win].copy()
+        test_data = data[data["window"] == test_win].copy()
+
+        if len(train_data) == 0 or len(val_data) == 0 or len(test_data) == 0:
+            logger.warning("Skipping fold %d: empty split", fold_idx)
+            continue
+
+        X_train, feat_names = prepare_features(train_data, "entry_quality")
+        X_val, _ = prepare_features(val_data, "entry_quality")
+        X_test, _ = prepare_features(test_data, "entry_quality")
+
+        y_train = label_fn(train_data)
+        y_val = label_fn(val_data)
+
+        logger.info("  Train=%d, Val=%d, Test=%d | y_train: mean=%.3f, std=%.3f",
+                    len(train_data), len(val_data), len(test_data),
+                    float(np.mean(y_train)), float(np.std(y_train)))
+
+        model = train_xgboost_regressor(X_train, y_train, X_val, y_val, feat_names)
+
+        metrics = eval_fn(model, X_test, test_data.reset_index(drop=True), feat_names)
+        metrics["fold"] = fold_idx
+        metrics["train_windows"] = [int(w) for w in train_wins]
+        metrics["test_window"] = int(test_win)
+        metrics["best_iteration"] = int(model.best_iteration)
+
+        # Feature importance
+        if hasattr(model, "feature_importances_"):
+            fi = sorted(zip(feat_names, model.feature_importances_.tolist()),
+                        key=lambda x: x[1], reverse=True)
+            metrics["feature_importance"] = fi
+            logger.info("  Top 5: %s", ", ".join(f"{f}={v:.3f}" for f, v in fi[:5]))
+
+        fold_results.append(metrics)
+
+        del X_train, X_val, X_test, y_train, y_val, model, train_data, val_data, test_data
+        gc.collect()
+
+    if not fold_results:
+        logger.error("[%s] No folds completed!", task_name)
+        return []
+
+    # Train production model
+    logger.info("=" * 70)
+    logger.info("[%s] TRAINING PRODUCTION MODEL (W0-%d, val W%d)",
+                task_name, int(all_windows[-2]), int(all_windows[-1]))
+
+    final_train = data[data["window"].isin(all_windows[:-1])].copy()
+    final_val = data[data["window"] == all_windows[-1]].copy()
+
+    X_ft, fn = prepare_features(final_train, "entry_quality")
+    X_fv, _ = prepare_features(final_val, "entry_quality")
+    y_ft = label_fn(final_train)
+    y_fv = label_fn(final_val)
+
+    final_model = train_xgboost_regressor(X_ft, y_ft, X_fv, y_fv, fn)
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = MODEL_DIR / model_filename
+    with open(model_path, "wb") as f:
+        pickle.dump({
+            "model": final_model,
+            "feat_names": fn,
+            "task": task_name,
+            "clip_ranges": CLIP_RANGES,
+            "asset_class_map": ASSET_CLASS_MAP,
+        }, f)
+    logger.info("[%s] Production model saved: %s", task_name, model_path)
+
+    # Save results
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _c(obj):
+        if isinstance(obj, (np.integer,)): return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        return obj
+
+    with open(RESULTS_DIR / results_filename, "w") as f:
+        json.dump(json.loads(json.dumps(fold_results, default=_c)), f, indent=2)
+    logger.info("[%s] Results saved: %s", task_name, RESULTS_DIR / results_filename)
+
+    del final_train, final_val, X_ft, X_fv, y_ft, y_fv, final_model, data
+    gc.collect()
+
+    return fold_results
+
+
+# ===================================================================
+#  Position Sizing Model (Phase 2)
+# ===================================================================
+
+def _sizing_labels(df: pd.DataFrame) -> np.ndarray:
+    """Label = clipped realized RR (net of fees)."""
+    return np.clip(df["label_rr"].values.astype(np.float32), -1.0, 10.0)
+
+
+def _sizing_eval(model, X_test, df_test, feat_names) -> dict[str, Any]:
+    """Compare model-sized vs uniform-sized portfolio Sharpe on OOS data."""
+    predicted_rr = model.predict(X_test).astype(np.float64)
+    actual_rr = np.clip(df_test["label_rr"].values.astype(np.float64), -1.0, 20.0)
+
+    n_trades = len(actual_rr)
+    if n_trades < 10:
+        return {"n_trades": n_trades, "uniform_sharpe": 0.0, "model_sharpe": 0.0, "improvement": 0.0}
+
+    # Uniform sizing baseline
+    uniform_sharpe = float(np.mean(actual_rr) / max(np.std(actual_rr), 1e-6))
+
+    # Model sizing: map predicted RR → risk multiplier [0.33, 1.5]
+    # Higher predicted RR → more capital allocated
+    target_rr = 3.0
+    risk_mult = np.clip(predicted_rr / target_rr, 0.33, 1.5)
+
+    # Weighted portfolio returns
+    weighted_returns = actual_rr * risk_mult
+    model_sharpe = float(np.mean(weighted_returns) / max(np.std(weighted_returns), 1e-6))
+
+    # PF comparison
+    uniform_wins = actual_rr[actual_rr > 0].sum()
+    uniform_losses = abs(actual_rr[actual_rr < 0].sum())
+    uniform_pf = float(uniform_wins / max(uniform_losses, 0.001))
+
+    model_wins = weighted_returns[weighted_returns > 0].sum()
+    model_losses = abs(weighted_returns[weighted_returns < 0].sum())
+    model_pf = float(model_wins / max(model_losses, 0.001))
+
+    # Prediction quality
+    pred_corr = float(np.corrcoef(predicted_rr, actual_rr)[0, 1]) if n_trades > 2 else 0.0
+    rmse = float(np.sqrt(np.mean((predicted_rr - actual_rr) ** 2)))
+
+    improvement = model_sharpe - uniform_sharpe
+
+    logger.info("  [sizing] Uniform Sharpe=%.3f PF=%.2f | Model Sharpe=%.3f PF=%.2f | "
+                "Improvement=%.3f | Corr=%.3f | RMSE=%.3f | Trades=%d",
+                uniform_sharpe, uniform_pf, model_sharpe, model_pf,
+                improvement, pred_corr, rmse, n_trades)
+
+    return {
+        "n_trades": n_trades,
+        "uniform_sharpe": uniform_sharpe, "uniform_pf": uniform_pf,
+        "model_sharpe": model_sharpe, "model_pf": model_pf,
+        "improvement": improvement,
+        "pred_corr": pred_corr, "rmse": rmse,
+    }
+
+
+def run_walk_forward_sizing(classes: list[str] | None = None) -> list[dict]:
+    """Walk-forward validation for position sizing model."""
+    logger.info("=" * 70)
+    logger.info("POSITION SIZING MODEL — Walk-Forward Validation")
+    logger.info("=" * 70)
+
+    results = _regression_walk_forward_skeleton(
+        classes, _sizing_labels, _sizing_eval,
+        task_name="sizing",
+        model_filename="rl_position_sizer.pkl",
+        results_filename="sizing_results.json",
+    )
+
+    if results:
+        improvements = [r.get("improvement", 0) for r in results]
+        model_sharpes = [r.get("model_sharpe", 0) for r in results]
+        uniform_sharpes = [r.get("uniform_sharpe", 0) for r in results]
+        logger.info("=" * 70)
+        logger.info("[sizing] AGGREGATE: Uniform Sharpe=%.3f | Model Sharpe=%.3f | "
+                    "Improvement=%.3f +/- %.3f",
+                    np.mean(uniform_sharpes), np.mean(model_sharpes),
+                    np.mean(improvements), np.std(improvements))
+        gate = np.mean(model_sharpes) > np.mean(uniform_sharpes)
+        logger.info("[sizing] GATE %s: model_sharpe > uniform_sharpe",
+                    "PASSED" if gate else "FAILED")
+    return results
+
+
+# ===================================================================
+#  TP Optimization Model (Phase 3)
+# ===================================================================
+
+def _tp_labels(df: pd.DataFrame) -> np.ndarray:
+    """Label = MFE (max favorable excursion) — what TP was achievable."""
+    return np.clip(df["label_max_favorable_rr"].values.astype(np.float32), 0.0, 20.0)
+
+
+def _tp_eval(model, X_test, df_test, feat_names) -> dict[str, Any]:
+    """Simulate TP adjustment on OOS data. Compare adjusted vs original outcomes."""
+    predicted_mfe = model.predict(X_test).astype(np.float64)
+    planned_tp = df_test["label_tp_rr"].values.astype(np.float64)
+    actual_mfe = df_test["label_max_favorable_rr"].values.astype(np.float64)
+    actual_rr = np.clip(df_test["label_rr"].values.astype(np.float64), -1.0, 20.0)
+    cost_rr = df_test["label_cost_rr"].values.astype(np.float64)
+
+    n_trades = len(actual_rr)
+    if n_trades < 10:
+        return {"n_trades": n_trades, "original_sharpe": 0.0, "adjusted_sharpe": 0.0}
+
+    # Adjust TP based on predicted MFE
+    adjusted_tp = np.copy(planned_tp)
+    # Reduce: predicted MFE much lower than planned TP → take profit earlier
+    reduce_mask = predicted_mfe < (planned_tp * 0.7)
+    adjusted_tp[reduce_mask] = np.maximum(predicted_mfe[reduce_mask] * 0.85, 0.5)
+    # Extend: predicted MFE much higher than planned TP → let it run
+    extend_mask = predicted_mfe > (planned_tp * 1.3)
+    adjusted_tp[extend_mask] = np.minimum(predicted_mfe[extend_mask] * 0.8, planned_tp[extend_mask] * 1.5)
+
+    # Simulate outcomes under adjusted TP
+    # If actual MFE >= adjusted TP: trade would have hit adjusted TP
+    # Otherwise: original outcome
+    hits_adjusted = actual_mfe >= adjusted_tp
+    adjusted_rr = np.where(
+        hits_adjusted,
+        adjusted_tp - cost_rr,  # hit adjusted TP, net of costs
+        actual_rr,              # original outcome
+    )
+    adjusted_rr = np.clip(adjusted_rr, -1.0, 20.0)
+
+    # Original metrics
+    orig_sharpe = float(np.mean(actual_rr) / max(np.std(actual_rr), 1e-6))
+    orig_wins = actual_rr[actual_rr > 0].sum()
+    orig_losses = abs(actual_rr[actual_rr < 0].sum())
+    orig_pf = float(orig_wins / max(orig_losses, 0.001))
+    orig_wr = float((actual_rr > 0).mean())
+
+    # Adjusted metrics
+    adj_sharpe = float(np.mean(adjusted_rr) / max(np.std(adjusted_rr), 1e-6))
+    adj_wins = adjusted_rr[adjusted_rr > 0].sum()
+    adj_losses = abs(adjusted_rr[adjusted_rr < 0].sum())
+    adj_pf = float(adj_wins / max(adj_losses, 0.001))
+    adj_wr = float((adjusted_rr > 0).mean())
+
+    # TP adjustment stats
+    n_reduced = int(reduce_mask.sum())
+    n_extended = int(extend_mask.sum())
+    n_kept = n_trades - n_reduced - n_extended
+
+    # MFE prediction quality
+    pred_corr = float(np.corrcoef(predicted_mfe, actual_mfe)[0, 1]) if n_trades > 2 else 0.0
+    rmse = float(np.sqrt(np.mean((predicted_mfe - actual_mfe) ** 2)))
+
+    logger.info("  [tp] Original: Sharpe=%.3f PF=%.2f WR=%.1f%% | "
+                "Adjusted: Sharpe=%.3f PF=%.2f WR=%.1f%%",
+                orig_sharpe, orig_pf, 100 * orig_wr,
+                adj_sharpe, adj_pf, 100 * adj_wr)
+    logger.info("  [tp] TP changes: %d reduced, %d extended, %d kept | "
+                "MFE corr=%.3f RMSE=%.3f",
+                n_reduced, n_extended, n_kept, pred_corr, rmse)
+
+    return {
+        "n_trades": n_trades,
+        "original_sharpe": orig_sharpe, "original_pf": orig_pf, "original_wr": orig_wr,
+        "adjusted_sharpe": adj_sharpe, "adjusted_pf": adj_pf, "adjusted_wr": adj_wr,
+        "sharpe_improvement": adj_sharpe - orig_sharpe,
+        "pf_improvement": adj_pf - orig_pf,
+        "n_reduced": n_reduced, "n_extended": n_extended, "n_kept": n_kept,
+        "mfe_pred_corr": pred_corr, "mfe_rmse": rmse,
+    }
+
+
+def run_walk_forward_tp(classes: list[str] | None = None) -> list[dict]:
+    """Walk-forward validation for TP optimization model."""
+    logger.info("=" * 70)
+    logger.info("TP OPTIMIZATION MODEL — Walk-Forward Validation")
+    logger.info("=" * 70)
+
+    results = _regression_walk_forward_skeleton(
+        classes, _tp_labels, _tp_eval,
+        task_name="tp",
+        model_filename="rl_tp_optimizer.pkl",
+        results_filename="tp_results.json",
+    )
+
+    if results:
+        orig_pfs = [r.get("original_pf", 0) for r in results]
+        adj_pfs = [r.get("adjusted_pf", 0) for r in results]
+        orig_sharpes = [r.get("original_sharpe", 0) for r in results]
+        adj_sharpes = [r.get("adjusted_sharpe", 0) for r in results]
+        logger.info("=" * 70)
+        logger.info("[tp] AGGREGATE: Original PF=%.2f Sharpe=%.3f | Adjusted PF=%.2f Sharpe=%.3f",
+                    np.mean(orig_pfs), np.mean(orig_sharpes),
+                    np.mean(adj_pfs), np.mean(adj_sharpes))
+        gate = np.mean(adj_pfs) > np.mean(orig_pfs)
+        logger.info("[tp] GATE %s: adjusted_pf > original_pf",
+                    "PASSED" if gate else "FAILED")
+    return results
+
+
+# ===================================================================
+#  Breakeven Management Model (Phase 4)
+# ===================================================================
+
+def derive_optimal_be_label(df: pd.DataFrame) -> np.ndarray:
+    """
+    Derive optimal BE ratchet level from MFE and outcome data.
+
+    Logic:
+    - Loss with MFE >= 1.5R: should have set BE at 1.0R
+    - Loss with MFE >= 1.0R: should have set BE at 0.7R
+    - Loss with MFE < 1.0R: no BE could help → 0.0
+    - Win: protect at 40% of MFE (capped at 2.5R)
+    - Breakeven: current strategy worked → 1.5R
+    """
+    outcome = df["label_outcome"].values
+    mfe = df["label_max_favorable_rr"].values.astype(np.float32)
+
+    be_label = np.zeros(len(df), dtype=np.float32)
+
+    loss_mask = outcome == 2
+    be_label[loss_mask & (mfe >= 1.5)] = 1.0
+    be_label[loss_mask & (mfe >= 1.0) & (mfe < 1.5)] = 0.7
+    # loss with MFE < 1.0 stays 0.0
+
+    win_mask = outcome == 1
+    be_label[win_mask] = np.clip(mfe[win_mask] * 0.4, 0.0, 2.5)
+
+    be_mask = outcome == 3
+    be_label[be_mask] = 1.5
+
+    return be_label
+
+
+def _be_eval(model, X_test, df_test, feat_names) -> dict[str, Any]:
+    """Simulate BE management on OOS data. Compare model-BE vs no-BE vs fixed-BE."""
+    predicted_be = model.predict(X_test).astype(np.float64)
+    predicted_be = np.clip(predicted_be, 0.0, 3.0)
+
+    actual_rr = np.clip(df_test["label_rr"].values.astype(np.float64), -1.0, 20.0)
+    actual_mfe = df_test["label_max_favorable_rr"].values.astype(np.float64)
+    cost_rr = df_test["label_cost_rr"].values.astype(np.float64)
+    outcome = df_test["label_outcome"].values
+
+    n_trades = len(actual_rr)
+    if n_trades < 10:
+        return {"n_trades": n_trades, "no_be_sharpe": 0.0, "model_be_sharpe": 0.0, "fixed_be_sharpe": 0.0}
+
+    # --- No-BE baseline (original outcomes) ---
+    no_be_rr = actual_rr.copy()
+
+    # --- Fixed BE at 1.5R ---
+    fixed_be_level = 1.5
+    fixed_be_rr = actual_rr.copy()
+    # Trades where MFE >= 1.5R but outcome is loss → saved by BE
+    fixed_saves = (outcome == 2) & (actual_mfe >= fixed_be_level)
+    fixed_be_rr[fixed_saves] = -cost_rr[fixed_saves]  # breakeven = lose only fees
+
+    # --- Model BE ---
+    model_be_rr = actual_rr.copy()
+    # For each trade: if MFE >= predicted_be AND predicted_be > 0 AND outcome is loss → saved
+    model_saves = (outcome == 2) & (predicted_be > 0.1) & (actual_mfe >= predicted_be)
+    model_be_rr[model_saves] = -cost_rr[model_saves]
+
+    def _metrics(rr, label):
+        sharpe = float(np.mean(rr) / max(np.std(rr), 1e-6))
+        wins = rr[rr > 0].sum()
+        losses = abs(rr[rr < 0].sum())
+        pf = float(wins / max(losses, 0.001))
+        # Max drawdown (cumulative)
+        cumsum = np.cumsum(rr)
+        peak = np.maximum.accumulate(cumsum)
+        dd = cumsum - peak
+        max_dd = float(dd.min()) if len(dd) > 0 else 0.0
+        return {"sharpe": sharpe, "pf": pf, "max_dd": max_dd, "saves": 0}
+
+    no_be = _metrics(no_be_rr, "no_be")
+    fixed_be = _metrics(fixed_be_rr, "fixed_be")
+    model_be = _metrics(model_be_rr, "model_be")
+
+    n_fixed_saves = int(fixed_saves.sum())
+    n_model_saves = int(model_saves.sum())
+    n_losses = int((outcome == 2).sum())
+
+    logger.info("  [be] No-BE: Sharpe=%.3f PF=%.2f DD=%.2f",
+                no_be["sharpe"], no_be["pf"], no_be["max_dd"])
+    logger.info("  [be] Fixed-1.5R: Sharpe=%.3f PF=%.2f DD=%.2f | saves=%d/%d losses",
+                fixed_be["sharpe"], fixed_be["pf"], fixed_be["max_dd"],
+                n_fixed_saves, n_losses)
+    logger.info("  [be] Model-BE: Sharpe=%.3f PF=%.2f DD=%.2f | saves=%d/%d losses",
+                model_be["sharpe"], model_be["pf"], model_be["max_dd"],
+                n_model_saves, n_losses)
+
+    return {
+        "n_trades": n_trades, "n_losses": n_losses,
+        "no_be_sharpe": no_be["sharpe"], "no_be_pf": no_be["pf"], "no_be_dd": no_be["max_dd"],
+        "fixed_be_sharpe": fixed_be["sharpe"], "fixed_be_pf": fixed_be["pf"],
+        "fixed_be_dd": fixed_be["max_dd"], "fixed_be_saves": n_fixed_saves,
+        "model_be_sharpe": model_be["sharpe"], "model_be_pf": model_be["pf"],
+        "model_be_dd": model_be["max_dd"], "model_be_saves": n_model_saves,
+        "dd_improvement_vs_no_be": model_be["max_dd"] - no_be["max_dd"],
+    }
+
+
+def run_walk_forward_be(classes: list[str] | None = None) -> list[dict]:
+    """Walk-forward validation for breakeven management model."""
+    logger.info("=" * 70)
+    logger.info("BREAKEVEN MANAGEMENT MODEL — Walk-Forward Validation")
+    logger.info("=" * 70)
+
+    results = _regression_walk_forward_skeleton(
+        classes, derive_optimal_be_label, _be_eval,
+        task_name="be",
+        model_filename="rl_be_manager.pkl",
+        results_filename="be_results.json",
+    )
+
+    if results:
+        no_dds = [r.get("no_be_dd", 0) for r in results]
+        model_dds = [r.get("model_be_dd", 0) for r in results]
+        model_pfs = [r.get("model_be_pf", 0) for r in results]
+        no_pfs = [r.get("no_be_pf", 0) for r in results]
+        logger.info("=" * 70)
+        logger.info("[be] AGGREGATE: No-BE DD=%.2f PF=%.2f | Model-BE DD=%.2f PF=%.2f",
+                    np.mean(no_dds), np.mean(no_pfs),
+                    np.mean(model_dds), np.mean(model_pfs))
+        dd_improved = np.mean(model_dds) > np.mean(no_dds)  # less negative = better
+        pf_ok = np.mean(model_pfs) >= 0.9 * np.mean(no_pfs)
+        logger.info("[be] GATE %s: model_dd better AND model_pf >= 90%% of no_be_pf",
+                    "PASSED" if (dd_improved and pf_ok) else "FAILED")
+    return results
 
 
 # ===================================================================
@@ -890,6 +1398,125 @@ class RLBrainV2:
         return "no_trade", 0.0, 0.0
 
 
+class RLBrainSuite:
+    """Unified inference for all RL models (entry filter + TP optimizer + BE manager)."""
+
+    def __init__(self, config: dict | None = None):
+        cfg = config or {}
+        rl_cfg = cfg.get("rl_brain", {})
+        self.enabled = rl_cfg.get("enabled", True)
+
+        # Entry filter
+        ef_cfg = rl_cfg.get("entry_filter", {})
+        self.entry_filter_enabled = ef_cfg.get("enabled", True)
+        self.confidence_threshold = ef_cfg.get("confidence_threshold", 0.6)
+        self._entry_filter = self._load_model(
+            ef_cfg.get("model_path", "models/rl_entry_filter.pkl")
+        ) if self.entry_filter_enabled else None
+
+        # TP optimizer
+        tp_cfg = rl_cfg.get("tp_optimizer", {})
+        self.tp_enabled = tp_cfg.get("enabled", False)
+        self.max_tp_reduction = tp_cfg.get("max_tp_reduction", 0.3)
+        self.max_tp_extension = tp_cfg.get("max_tp_extension", 0.5)
+        self.min_tp_rr = tp_cfg.get("min_tp_rr", 0.5)
+        self._tp_model = self._load_model(
+            tp_cfg.get("model_path", "models/rl_tp_optimizer.pkl")
+        ) if self.tp_enabled else None
+
+        # BE manager
+        be_cfg = rl_cfg.get("be_manager", {})
+        self.be_enabled = be_cfg.get("enabled", False)
+        self.min_be_rr = be_cfg.get("min_be_rr", 0.5)
+        self.be_fee_buffer = be_cfg.get("fee_buffer", True)
+        self._be_model = self._load_model(
+            be_cfg.get("model_path", "models/rl_be_manager.pkl")
+        ) if self.be_enabled else None
+
+        active = []
+        if self._entry_filter: active.append("entry_filter")
+        if self._tp_model: active.append("tp_optimizer")
+        if self._be_model: active.append("be_manager")
+        logger.info("RLBrainSuite initialized: %s", active if active else "no models loaded")
+
+    @staticmethod
+    def _load_model(path_str: str) -> dict | None:
+        path = Path(path_str)
+        if not path.exists():
+            logger.warning("Model not found: %s", path)
+            return None
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        logger.info("Loaded model: %s (%d features)", path, len(data.get("feat_names", [])))
+        return data
+
+    def _build_features(self, features: dict[str, float], model_data: dict) -> np.ndarray:
+        """Build feature vector from dict, matching model's expected feature order."""
+        feat_names = model_data["feat_names"]
+        x = np.array([features.get(f, 0.0) for f in feat_names],
+                      dtype=np.float32).reshape(1, -1)
+        for col_name, (lo, hi) in model_data.get("clip_ranges", {}).items():
+            if col_name in feat_names:
+                idx = feat_names.index(col_name)
+                x[0, idx] = np.clip(x[0, idx], lo, hi)
+        return np.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    def predict_entry(self, features: dict[str, float]) -> tuple[bool, float]:
+        """Predict whether to take entry. Returns (take, confidence)."""
+        if not self.enabled or self._entry_filter is None:
+            return True, 1.0  # pass-through if disabled
+
+        x = self._build_features(features, self._entry_filter)
+        proba = self._entry_filter["model"].predict_proba(x)[0]
+        confidence = float(proba[1])  # P(win)
+        return confidence >= self.confidence_threshold, confidence
+
+    def predict_tp_adjustment(
+        self, features: dict[str, float], planned_tp_rr: float,
+    ) -> float:
+        """Predict adjusted TP level. Returns adjusted TP in R-multiples."""
+        if not self.enabled or self._tp_model is None or planned_tp_rr <= 0:
+            return planned_tp_rr  # pass-through
+
+        x = self._build_features(features, self._tp_model)
+        predicted_mfe = float(self._tp_model["model"].predict(x)[0])
+        predicted_mfe = max(predicted_mfe, 0.1)
+
+        adjusted = planned_tp_rr
+        if predicted_mfe < planned_tp_rr * 0.7:
+            # MFE much lower than planned → reduce TP
+            adjusted = max(predicted_mfe * 0.85, self.min_tp_rr)
+            # Clamp reduction
+            min_tp = planned_tp_rr * (1.0 - self.max_tp_reduction)
+            adjusted = max(adjusted, min_tp)
+        elif predicted_mfe > planned_tp_rr * 1.3:
+            # MFE much higher → extend TP
+            adjusted = min(predicted_mfe * 0.8, planned_tp_rr * (1.0 + self.max_tp_extension))
+
+        return adjusted
+
+    def predict_be_level(
+        self, features: dict[str, float], cost_rr: float = 0.0,
+    ) -> float:
+        """Predict optimal BE ratchet level. Returns RR at which to move SL to entry.
+        0.0 means no BE (let trade play out). >0 means move to BE when unrealized RR reaches this."""
+        if not self.enabled or self._be_model is None:
+            return 0.0  # no BE
+
+        x = self._build_features(features, self._be_model)
+        predicted_be = float(self._be_model["model"].predict(x)[0])
+        predicted_be = max(predicted_be, 0.0)
+
+        if predicted_be < self.min_be_rr:
+            return 0.0  # below threshold, don't use BE
+
+        # Add fee buffer if configured
+        if self.be_fee_buffer and cost_rr > 0:
+            predicted_be = max(predicted_be, cost_rr * 2.0)
+
+        return min(predicted_be, 3.0)  # cap at 3R
+
+
 # ===================================================================
 #  CLI
 # ===================================================================
@@ -904,7 +1531,8 @@ def main():
     parser.add_argument("--holdout-class", default="commodities",
                         choices=ALL_CLASSES,
                         help="Asset class to hold out (default: commodities)")
-    parser.add_argument("--task", choices=["binary", "direction", "entry_quality"],
+    parser.add_argument("--task", choices=["binary", "direction", "entry_quality",
+                                          "sizing", "tp", "be", "all_regression"],
                         default="entry_quality",
                         help="Prediction task (default: entry_quality)")
     parser.add_argument("--classes", nargs="+",
@@ -918,7 +1546,20 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.train:
-        if args.walk_forward:
+        if args.task == "sizing":
+            run_walk_forward_sizing(classes=args.classes)
+        elif args.task == "tp":
+            run_walk_forward_tp(classes=args.classes)
+        elif args.task == "be":
+            run_walk_forward_be(classes=args.classes)
+        elif args.task == "all_regression":
+            logger.info("Training ALL regression models sequentially...")
+            run_walk_forward_sizing(classes=args.classes)
+            gc.collect()
+            run_walk_forward_tp(classes=args.classes)
+            gc.collect()
+            run_walk_forward_be(classes=args.classes)
+        elif args.walk_forward:
             run_walk_forward_rolling(classes=args.classes, task=args.task)
         elif args.asset_holdout:
             run_asset_holdout(holdout_class=args.holdout_class, task=args.task)
