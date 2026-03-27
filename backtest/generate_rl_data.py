@@ -28,6 +28,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from utils.indicators import compute_rsi_wilders, compute_atr_wilders
+
 # ── Project imports ──────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -93,7 +95,11 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
 }
 
 ASSET_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004, "forex": 0.00005, "stocks": 0.0, "commodities": 0.0001,
+    "crypto": 0.0004, "forex": 0.0003, "stocks": 0.0001, "commodities": 0.0003,
+}
+
+ASSET_SLIPPAGE: dict[str, float] = {
+    "crypto": 0.0002, "forex": 0.0001, "stocks": 0.0001, "commodities": 0.0002,
 }
 
 # Max bars to simulate forward for outcome (48h of 5m bars)
@@ -222,49 +228,10 @@ def _compute_ema(close: np.ndarray, span: int) -> np.ndarray:
     return ema
 
 
-def _compute_rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
-    """RSI with Wilder's smoothing."""
-    n = len(close)
-    rsi = np.full(n, 50.0)
-    if n < period + 1:
-        return rsi
-    delta = np.diff(close)
-    gains = np.where(delta > 0, delta, 0.0)
-    losses = np.where(delta < 0, -delta, 0.0)
-
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-
-    for i in range(period, len(delta)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            rsi[i + 1] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi[i + 1] = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
-
-
-def _compute_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                 period: int = 14) -> np.ndarray:
-    """ATR with Wilder's smoothing."""
-    n = len(high)
-    atr = np.zeros(n)
-    if n < 2:
-        return atr
-    tr = np.maximum(high[1:] - low[1:],
-                    np.maximum(np.abs(high[1:] - close[:-1]),
-                               np.abs(low[1:] - close[:-1])))
-    tr = np.concatenate([[high[0] - low[0]], tr])
-    if n <= period:
-        atr[:] = np.mean(tr)
-        return atr
-    atr[period - 1] = np.mean(tr[:period])
-    for i in range(period, n):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
-    atr[:period - 1] = atr[period - 1]
-    return atr
+# RSI and ATR use shared implementations from utils.indicators
+# to guarantee train/serve parity with live_multi_bot.py
+_compute_rsi = compute_rsi_wilders
+_compute_atr = compute_atr_wilders
 
 
 def _compute_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
@@ -865,6 +832,16 @@ def extract_features_for_instrument(
 #  Label Generation (LOOKAHEAD — teacher knowledge)
 # ═══════════════════════════════════════════════════════════════════
 
+def _funding_cost_rr(asset_class: str, bars_held: int,
+                     entry_price: float, sl_dist: float) -> float:
+    """Crypto perpetual funding rate cost expressed in R-multiples."""
+    if asset_class != "crypto" or bars_held <= 0:
+        return 0.0
+    hours_held = bars_held * 5 / 60  # 5m bars → hours
+    funding_cost = entry_price * 0.0001 * (hours_held / 8)  # ~0.01% per 8h
+    return funding_cost / sl_dist
+
+
 def _simulate_forward(
     df_5m: pd.DataFrame,
     entry_idx: int,
@@ -873,29 +850,48 @@ def _simulate_forward(
     take_profit: float,
     direction: str,
     commission_pct: float = 0.0004,
+    slippage_pct: float = 0.0002,
     be_ratchet_r: float = 1.5,
-) -> tuple[str, float]:
+    asset_class: str = "crypto",
+) -> tuple[str, float, int, float, int]:
     """
     Simulate a trade forward from entry_idx.
-    Returns (outcome, actual_rr).
+
+    Returns (outcome, net_rr, exit_bar_offset, max_favorable_rr, exit_mechanism).
+      exit_mechanism: 0=skip, 1=TP, 2=SL, 3=BE, 4=timeout
+      net_rr: realized RR after commission + slippage + funding
     """
     is_long = direction == "long"
     sl_dist = abs(entry_price - stop_loss)
     if sl_dist == 0:
-        return "skip", 0.0
+        return "skip", 0.0, 0, 0.0, 0
 
     high = df_5m["high"].values.astype(float)
     low = df_5m["low"].values.astype(float)
     close = df_5m["close"].values.astype(float)
     n = len(df_5m)
 
+    # Cost model: commission + slippage on entry AND exit
+    cost_pct = (commission_pct + slippage_pct) * 2
+    cost_rr = (entry_price * cost_pct) / sl_dist
+
     current_sl = stop_loss
     be_triggered = False
-    fee_buffer = entry_price * (commission_pct * 2 + 0.0001 * 2)
+    fee_buffer = entry_price * (commission_pct * 2 + slippage_pct * 2)
+    best_favorable_rr = 0.0
 
-    for i in range(entry_idx + 1, min(entry_idx + MAX_FORWARD_BARS + 1, n)):
+    for i in range(entry_idx + 2, min(entry_idx + MAX_FORWARD_BARS + 1, n)):
         bar_high = high[i]
         bar_low = low[i]
+        bars_held = i - entry_idx
+
+        # Track max favorable excursion (in R-multiples)
+        if is_long:
+            fav = (bar_high - entry_price) / sl_dist
+        else:
+            fav = (entry_price - bar_low) / sl_dist
+        if fav > best_favorable_rr:
+            best_favorable_rr = fav
 
         # Check BE ratchet
         if not be_triggered:
@@ -912,40 +908,44 @@ def _simulate_forward(
 
         # Check SL hit
         if is_long and bar_low <= current_sl:
-            pnl_dir = current_sl - entry_price
-            rr = pnl_dir / sl_dist
-            if be_triggered and abs(rr) < 0.5:
-                return "breakeven", rr
-            return ("win" if rr > 0 else "loss"), rr
+            raw_rr = (current_sl - entry_price) / sl_dist
+            net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            if be_triggered and abs(raw_rr) < 0.5:
+                return "breakeven", net_rr, bars_held, best_favorable_rr, 3
+            return ("win" if net_rr > 0 else "loss"), net_rr, bars_held, best_favorable_rr, 2
 
         if not is_long and bar_high >= current_sl:
-            pnl_dir = entry_price - current_sl
-            rr = pnl_dir / sl_dist
-            if be_triggered and abs(rr) < 0.5:
-                return "breakeven", rr
-            return ("win" if rr > 0 else "loss"), rr
+            raw_rr = (entry_price - current_sl) / sl_dist
+            net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            if be_triggered and abs(raw_rr) < 0.5:
+                return "breakeven", net_rr, bars_held, best_favorable_rr, 3
+            return ("win" if net_rr > 0 else "loss"), net_rr, bars_held, best_favorable_rr, 2
 
         # Check TP hit
         if is_long and bar_high >= take_profit:
-            rr = (take_profit - entry_price) / sl_dist
-            return "win", rr
+            raw_rr = (take_profit - entry_price) / sl_dist
+            net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            return "win", net_rr, bars_held, best_favorable_rr, 1
 
         if not is_long and bar_low <= take_profit:
-            rr = (entry_price - take_profit) / sl_dist
-            return "win", rr
+            raw_rr = (entry_price - take_profit) / sl_dist
+            net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            return "win", net_rr, bars_held, best_favorable_rr, 1
 
     # Timeout — classify by current position
+    bars_held = min(MAX_FORWARD_BARS, n - 1 - entry_idx)
     exit_price = close[min(entry_idx + MAX_FORWARD_BARS, n - 1)]
     if is_long:
-        rr = (exit_price - entry_price) / sl_dist
+        raw_rr = (exit_price - entry_price) / sl_dist
     else:
-        rr = (entry_price - exit_price) / sl_dist
+        raw_rr = (entry_price - exit_price) / sl_dist
+    net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
 
-    if rr >= 0.5:
-        return "win", rr
-    elif rr <= -0.5:
-        return "loss", rr
-    return "breakeven", rr
+    if net_rr >= 0.5:
+        return "win", net_rr, bars_held, best_favorable_rr, 4
+    elif net_rr <= -0.5:
+        return "loss", net_rr, bars_held, best_favorable_rr, 4
+    return "breakeven", net_rr, bars_held, best_favorable_rr, 4
 
 
 def generate_teacher_labels(
@@ -982,6 +982,7 @@ def generate_teacher_labels(
     n = len(df_5m)
     ts_5m = df_5m["timestamp"].values
     close = df_5m["close"].values.astype(float)
+    open_prices = df_5m["open"].values.astype(float)
 
     # Temporal maps
     def _vlen(htf_df):
@@ -1017,9 +1018,16 @@ def generate_teacher_labels(
     label_rr = np.zeros(n, dtype=np.float32)
     label_outcome = np.zeros(n, dtype=np.int8)     # 0=no, 1=win, 2=loss, 3=be
     label_profitable = np.zeros(n, dtype=np.int8)
+    # Extended labels for Phase 2 models
+    label_exit_mechanism = np.zeros(n, dtype=np.int8)   # 0=none, 1=TP, 2=SL, 3=BE, 4=timeout
+    label_exit_bar = np.zeros(n, dtype=np.int16)         # bars held
+    label_max_favorable_rr = np.zeros(n, dtype=np.float32)  # best unrealized RR
+    label_tp_rr = np.zeros(n, dtype=np.float32)          # planned TP in R-multiples
+    label_cost_rr = np.zeros(n, dtype=np.float32)        # total fees+slippage in R
 
     min_start = swing_len * 2
     commission = ASSET_COMMISSION.get(asset_class, 0.0004)
+    slippage = ASSET_SLIPPAGE.get(asset_class, 0.0002)
     liq_range = smc_params.get("liquidity_range_percent", 0.005)
     _zone_bars = 12 if asset_class == "forex" else 6
     fvg_thresh = smc_params.get("fvg_threshold", 0.0004)
@@ -1082,7 +1090,10 @@ def generate_teacher_labels(
             continue
 
         # ── Entry/SL/TP ──────────────────────────────────────────
-        entry_price = close[i]
+        # Realistic fill: signal at close[i], execution at next bar open
+        if i + 1 >= n - 10:
+            continue
+        entry_price = float(open_prices[i + 1])
         if entry_zone is not None:
             if bias == "bullish":
                 stop_loss = entry_zone["bottom"] * (1 - liq_range)
@@ -1119,12 +1130,19 @@ def generate_teacher_labels(
             continue
 
         # ── Simulate forward ─────────────────────────────────────
-        outcome, realized_rr = _simulate_forward(
+        planned_tp_rr = abs(tp_price - entry_price) / sl_dist
+        outcome, realized_rr, exit_bars, max_fav_rr, exit_mech = _simulate_forward(
             df_5m, i, entry_price, stop_loss, tp_price,
-            direction, commission_pct=commission,
+            direction, commission_pct=commission, slippage_pct=slippage,
+            asset_class=asset_class,
         )
         if outcome == "skip":
             continue
+
+        # Cost in R-multiples (for reference)
+        _cost_pct = (commission + slippage) * 2
+        _cost_rr = (entry_price * _cost_pct) / sl_dist
+        _fund_rr = _funding_cost_rr(asset_class, exit_bars, entry_price, sl_dist)
 
         # ── Label ────────────────────────────────────────────────
         label_action[i] = 1 if direction == "long" else 2
@@ -1136,6 +1154,12 @@ def generate_teacher_labels(
             label_outcome[i] = 2
         elif outcome == "breakeven":
             label_outcome[i] = 3
+        # Extended labels
+        label_exit_mechanism[i] = exit_mech
+        label_exit_bar[i] = exit_bars
+        label_max_favorable_rr[i] = max_fav_rr
+        label_tp_rr[i] = planned_tp_rr
+        label_cost_rr[i] = _cost_rr + _fund_rr
         n_entries += 1
 
     logger.info("  Teacher labels: %d entries out of %d bars (%.1f%%)",
@@ -1147,6 +1171,11 @@ def generate_teacher_labels(
         "label_rr": label_rr,
         "label_outcome": label_outcome,
         "label_profitable": label_profitable,
+        "label_exit_mechanism": label_exit_mechanism,
+        "label_exit_bar": label_exit_bar,
+        "label_max_favorable_rr": label_max_favorable_rr,
+        "label_tp_rr": label_tp_rr,
+        "label_cost_rr": label_cost_rr,
     })
 
     if signal_window_start is not None:

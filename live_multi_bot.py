@@ -56,6 +56,8 @@ from rich.table import Table
 from rich.text import Text
 
 from rl_brain import CentralRLBrain, extract_features, compute_shaped_reward
+from rl_brain_v2 import RLBrainSuite
+from utils.indicators import compute_rsi_wilders, compute_atr_wilders
 from strategies.smc_multi_style import (
     compute_smc_indicators,
     _precompute_running_bias,
@@ -162,6 +164,16 @@ ASSET_COMMISSION: dict[str, float] = {
     "forex": 0.00005,       # ~0.5 pip spread equivalent
     "stocks": 0.0,          # commission-free (Alpaca)
     "commodities": 0.0001,  # ~1 pip spread equivalent
+}
+
+# ── Training-matched cost constants for RL feature computation ───
+# These MUST match generate_rl_data.py ASSET_COMMISSION/ASSET_SLIPPAGE
+# (different from live ASSET_COMMISSION which represents actual broker fees)
+_TRAIN_COMMISSION: dict[str, float] = {
+    "crypto": 0.0004, "forex": 0.0003, "stocks": 0.0001, "commodities": 0.0003,
+}
+_TRAIN_SLIPPAGE: dict[str, float] = {
+    "crypto": 0.0002, "forex": 0.0001, "stocks": 0.0001, "commodities": 0.0002,
 }
 
 # ── Asset-Class-Specific SMC Parameters (from config smc_profiles) ─
@@ -387,6 +399,7 @@ class PaperBot:
         asset_class: str = "crypto",
         adapter: ExchangeAdapter | None = None,
         central_brain: CentralRLBrain | None = None,
+        rl_suite: RLBrainSuite | None = None,
     ) -> None:
         self.bot_id = bot_id
         self.tag = f"bot_{bot_id:03d}"
@@ -456,6 +469,7 @@ class PaperBot:
         if central_brain is None:
             raise ValueError("central_brain must be provided")
         self.brain = central_brain
+        self.rl_suite = rl_suite
         # Store last obs so we can record reward when trade closes
         self._pending_obs: np.ndarray | None = None
 
@@ -654,6 +668,7 @@ class PaperBot:
                 ind_1d = compute_smc_indicators(
                     self.buffer_1d, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                comp["_ind_1d"] = ind_1d
                 running_bias = _precompute_running_bias(ind_1d, self.buffer_1d)
                 daily_bias = _bias_from_running(running_bias, len(self.buffer_1d))
 
@@ -684,6 +699,7 @@ class PaperBot:
                 ind_4h = compute_smc_indicators(
                     self.buffer_4h, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                comp["_ind_4h"] = ind_4h
                 running_4h = _precompute_running_structure(ind_4h)
                 if _structure_confirms_from_running(running_4h, daily_bias, len(self.buffer_4h)):
                     score += _w_h4
@@ -718,6 +734,7 @@ class PaperBot:
                     if _sh is not None and _sl is not None and _sh > _sl:
                         _mid = (_sh + _sl) / 2.0
                         _cur = float(self.buffer_5m["close"].iloc[-1])
+                        comp["_premium_discount"] = 1.0 if _cur > _mid else -1.0
                         if daily_bias == "bullish" and _cur > _mid:
                             return 0.0, direction, comp  # Long in premium
                         if daily_bias == "bearish" and _cur < _mid:
@@ -731,6 +748,7 @@ class PaperBot:
                 ind_1h = compute_smc_indicators(
                     self.buffer_1h, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                comp["_ind_1h"] = ind_1h
                 running_1h = _precompute_running_structure(ind_1h)
                 if _structure_confirms_from_running(running_1h, daily_bias, len(self.buffer_1h)):
                     score += _w_h1
@@ -757,6 +775,7 @@ class PaperBot:
                 ind_15m = compute_smc_indicators(
                     self.buffer_15m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                comp["_ind_15m"] = ind_15m
                 _zone_bars = 12 if _fx else 6
                 entry_zone = _find_entry_zone_at(
                     ind_15m, self.buffer_15m, daily_bias,
@@ -805,6 +824,7 @@ class PaperBot:
                 ind_5m = compute_smc_indicators(
                     self.buffer_5m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
+                comp["_ind_5m"] = ind_5m
                 _trig_lb = 3 if _fx else 1
                 bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m, lookback_bars=_trig_lb)
                 if len(bull_mask) > 0:
@@ -1138,6 +1158,205 @@ class PaperBot:
             return None
         return (sl, tp)
 
+    # ── XGBoost feature extraction ────────────────────────────────────
+
+    # XGBoost asset class mapping (must match rl_brain_v2.ASSET_CLASS_MAP)
+    _XGB_AC_MAP = {"crypto": 0, "forex": 1, "stocks": 2, "commodities": 3}
+
+    def _build_xgb_features(self, components: dict, score: float) -> dict[str, float]:
+        """Build 37-feature dict matching XGBoost model expectations.
+
+        Mirrors the feature computation in backtest/generate_rl_data.py
+        but only for the current (last) bar.
+        """
+        feat: dict[str, float] = {}
+
+        # ── Structure direction per TF ──────────────────────────────
+        ind_1d = components.get("_ind_1d")
+        if ind_1d is not None and not self.buffer_1d.empty:
+            try:
+                bias = _precompute_running_bias(ind_1d, self.buffer_1d)
+                feat["struct_1d"] = float(bias[-1]) if len(bias) > 0 else 0.0
+            except Exception:
+                feat["struct_1d"] = 0.0
+        else:
+            feat["struct_1d"] = 0.0
+
+        for tf_key, ind_key in [("4h", "_ind_4h"), ("1h", "_ind_1h"),
+                                 ("15m", "_ind_15m"), ("5m", "_ind_5m")]:
+            ind = components.get(ind_key)
+            if ind is not None:
+                try:
+                    rs = _precompute_running_structure(ind)
+                    feat[f"struct_{tf_key}"] = float(rs[-1]) if len(rs) > 0 else 0.0
+                except Exception:
+                    feat[f"struct_{tf_key}"] = 0.0
+            else:
+                feat[f"struct_{tf_key}"] = 0.0
+
+        # ── Break decay per TF (exp(-0.05 * bars_since_last_break)) ─
+        for tf_key, ind_key in [("1d", "_ind_1d"), ("4h", "_ind_4h"),
+                                 ("1h", "_ind_1h"), ("15m", "_ind_15m"),
+                                 ("5m", "_ind_5m")]:
+            ind = components.get(ind_key)
+            decay = 0.0
+            if ind is not None:
+                bos_choch = ind.get("bos_choch")
+                if bos_choch is not None and not bos_choch.empty:
+                    last_break = -100
+                    for i in range(len(bos_choch)):
+                        choch_v = bos_choch["CHOCH"].iat[i]
+                        bos_v = bos_choch["BOS"].iat[i]
+                        if (pd.notna(choch_v) and choch_v != 0) or (pd.notna(bos_v) and bos_v != 0):
+                            last_break = i
+                    bars = (len(bos_choch) - 1) - last_break
+                    decay = float(np.exp(-0.05 * bars))
+            feat[f"decay_{tf_key}"] = decay
+
+        # ── Premium / Discount ──────────────────────────────────────
+        feat["premium_discount"] = float(components.get("_premium_discount", 0.0))
+
+        # ── Boolean component flags → float ─────────────────────────
+        for flag in ("h4_confirms", "h4_poi", "h1_confirms", "h1_choch",
+                     "precision_trigger", "volume_ok"):
+            feat[flag] = 1.0 if components.get(flag) else 0.0
+
+        # has_entry_zone: always 1.0 for live entry signals — by the time we
+        # reach _build_xgb_features, entry zone existence is already confirmed.
+        # Entry filter model excludes this (ENTRY_QUALITY_EXCLUDE), but
+        # TP/BE/sizing models use it.
+        feat["has_entry_zone"] = 1.0
+
+        # ── EMA distances (relative to price) ───────────────────────
+        if not self.buffer_5m.empty and len(self.buffer_5m) >= 50:
+            c5 = self.buffer_5m["close"].values.astype(np.float64)
+            p = float(c5[-1])
+            e20 = float(pd.Series(c5).ewm(span=20, adjust=False).mean().iloc[-1])
+            e50 = float(pd.Series(c5).ewm(span=50, adjust=False).mean().iloc[-1])
+            feat["ema20_dist_5m"] = (p - e20) / p if p > 0 else 0.0
+            feat["ema50_dist_5m"] = (p - e50) / p if p > 0 else 0.0
+        else:
+            feat["ema20_dist_5m"] = 0.0
+            feat["ema50_dist_5m"] = 0.0
+
+        if not self.buffer_1h.empty and len(self.buffer_1h) >= 50:
+            c1h = self.buffer_1h["close"].values.astype(np.float64)
+            p1h = float(c1h[-1])
+            e20h = float(pd.Series(c1h).ewm(span=20, adjust=False).mean().iloc[-1])
+            e50h = float(pd.Series(c1h).ewm(span=50, adjust=False).mean().iloc[-1])
+            feat["ema20_dist_1h"] = (p1h - e20h) / p1h if p1h > 0 else 0.0
+            feat["ema50_dist_1h"] = (p1h - e50h) / p1h if p1h > 0 else 0.0
+        else:
+            feat["ema20_dist_1h"] = 0.0
+            feat["ema50_dist_1h"] = 0.0
+
+        # ── ATR normalized (ATR / price) — Wilder's smoothing ───────
+        def _atr_norm(buf: pd.DataFrame) -> float:
+            if buf.empty or len(buf) < 15:
+                return 0.0
+            h = buf["high"].values.astype(np.float64)
+            lo = buf["low"].values.astype(np.float64)
+            c = buf["close"].values.astype(np.float64)
+            atr_arr = compute_atr_wilders(h, lo, c, 14)
+            return float(atr_arr[-1]) / float(c[-1]) if c[-1] > 0 else 0.0
+
+        feat["atr_5m_norm"] = _atr_norm(self.buffer_5m)
+        feat["atr_1h_norm"] = _atr_norm(self.buffer_1h)
+        feat["atr_daily_norm"] = _atr_norm(self.buffer_1d)
+
+        # ── RSI (normalized to [0, 1]) — Wilder's smoothing ─────────
+        def _rsi_last(closes: np.ndarray, period: int = 14) -> float:
+            if len(closes) < period + 1:
+                return 0.5
+            rsi_arr = compute_rsi_wilders(closes, period)
+            return float(rsi_arr[-1]) / 100.0  # normalize to [0, 1]
+
+        feat["rsi_5m"] = _rsi_last(self.buffer_5m["close"].values.astype(np.float64)) if not self.buffer_5m.empty and len(self.buffer_5m) >= 15 else 0.5
+        feat["rsi_1h"] = _rsi_last(self.buffer_1h["close"].values.astype(np.float64)) if not self.buffer_1h.empty and len(self.buffer_1h) >= 15 else 0.5
+
+        # ── Volume ratio (current / 20-bar MA, capped at 5) ────────
+        if not self.buffer_5m.empty and len(self.buffer_5m) >= 20:
+            vols = self.buffer_5m["volume"].values.astype(np.float64)
+            avg_v = float(np.mean(vols[-20:]))
+            feat["volume_ratio"] = min(float(vols[-1]) / avg_v, 5.0) if avg_v > 0 else 1.0
+        else:
+            feat["volume_ratio"] = 1.0
+
+        # ── ADX on 1H (normalized by /50, capped at 2.0) ───────────
+        feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
+
+        # ── Alignment score ─────────────────────────────────────────
+        feat["alignment_score"] = float(score)
+
+        # ── Hour encoding (UTC, integer hour from candle timestamp) ──
+        if not self.buffer_5m.empty:
+            _last_ts = self.buffer_5m["timestamp"].iloc[-1]
+            _hour_int = float(pd.Timestamp(_last_ts).hour)
+        else:
+            _hour_int = float(datetime.now(timezone.utc).hour)
+        feat["hour_sin"] = float(np.sin(2 * np.pi * _hour_int / 24))
+        feat["hour_cos"] = float(np.cos(2 * np.pi * _hour_int / 24))
+
+        # ── FVG / OB active counts on 15m (running per-bar algorithm
+        #    matching generate_rl_data.py:740-778 exactly) ──────────────
+        feat["fvg_bull_active"] = 0.0
+        feat["fvg_bear_active"] = 0.0
+        feat["ob_bull_active"] = 0.0
+        feat["ob_bear_active"] = 0.0
+
+        ind_15m = components.get("_ind_15m")
+        if ind_15m is not None:
+            for key, col, b_key, br_key in [
+                ("fvg", "FVG", "fvg_bull_active", "fvg_bear_active"),
+                ("order_blocks", "OB", "ob_bull_active", "ob_bear_active"),
+            ]:
+                df_z = ind_15m.get(key)
+                if df_z is not None and not df_z.empty and col in df_z.columns:
+                    vals = df_z[col].values
+                    mit = df_z["MitigatedIndex"].values if "MitigatedIndex" in df_z.columns else np.full(len(vals), np.nan)
+                    n15 = len(vals)
+                    active: list[tuple[int, float]] = []
+                    bull_c = 0.0
+                    bear_c = 0.0
+                    for j in range(n15):
+                        if pd.notna(vals[j]) and vals[j] != 0:
+                            active.append((j, float(vals[j])))
+                        active = [(a, t) for a, t in active
+                                  if np.isnan(mit[a]) or mit[a] > j]
+                        bull_c = sum(1 for _, t in active if t > 0) / 5.0
+                        bear_c = sum(1 for _, t in active if t < 0) / 5.0
+                    feat[b_key] = min(bull_c, 1.0)
+                    feat[br_key] = min(bear_c, 1.0)
+
+        # ── Liquidity counts on 1H (running per-bar, matching training) ─
+        feat["liq_above_count"] = 0.0
+        feat["liq_below_count"] = 0.0
+
+        ind_1h = components.get("_ind_1h")
+        if ind_1h is not None:
+            liq_df = ind_1h.get("liquidity")
+            if liq_df is not None and not liq_df.empty:
+                liq_vals = liq_df["Liquidity"].values
+                swept = liq_df["Swept"].values if "Swept" in liq_df.columns else np.full(len(liq_vals), np.nan)
+                n1h = len(liq_vals)
+                active_liq: list[tuple[int, float]] = []
+                above_c = 0.0
+                below_c = 0.0
+                for j in range(n1h):
+                    if pd.notna(liq_vals[j]) and liq_vals[j] != 0:
+                        active_liq.append((j, float(liq_vals[j])))
+                    active_liq = [(a, t) for a, t in active_liq
+                                  if np.isnan(swept[a]) or swept[a] > j]
+                    above_c = sum(1 for _, t in active_liq if t > 0) / 5.0
+                    below_c = sum(1 for _, t in active_liq if t < 0) / 5.0
+                feat["liq_above_count"] = min(above_c, 1.0)
+                feat["liq_below_count"] = min(below_c, 1.0)
+
+        # ── Asset class ID ──────────────────────────────────────────
+        feat["asset_class_id"] = float(self._XGB_AC_MAP.get(self.asset_class, 0))
+
+        return feat
+
     # ── Signal preparation (called from on_candle) ──────────────────
 
     def _prepare_signal(
@@ -1345,6 +1564,26 @@ class PaperBot:
             zone_low = price
             zone_high = sl
 
+        # ── Build feature vectors BEFORE stripping heavy indicator dicts ─
+        _xgb_features = self._build_xgb_features(components, score)
+        _ppo_obs = extract_features(
+            buf, score, direction,
+            setup_tier=tier, trade_style=style,
+            rr_ratio=rr, daily_atr_pct=daily_atr,
+            adx_normalized=min(components.get("adx_value", 0.0) / 50.0, 1.0),
+            session_score=components.get("session_score", 0.5),
+            zone_quality=components.get("zone_quality", 0.0),
+            volume_score=components.get("volume_score", 0.0),
+            momentum_score=components.get("momentum_score", 0.0),
+            tf_agreement_score=components.get("tf_agreement_score", 0.0),
+            spread_normalized=0.0,
+            asset_class_id=ASSET_CLASS_ID.get(self.asset_class, 0.0),
+        )
+
+        # Strip heavy indicator DataFrames — only needed for feature extraction
+        for _k in ("_ind_1d", "_ind_4h", "_ind_1h", "_ind_15m", "_ind_5m", "_premium_discount"):
+            components.pop(_k, None)
+
         # ── Store pending signal with all classification data ─────
         self._pending_signal = {
             "symbol": symbol,
@@ -1357,22 +1596,11 @@ class PaperBot:
             "tier": tier,
             "components": components,
             "daily_atr_pct": daily_atr,
-            "obs": extract_features(
-                buf, score, direction,
-                setup_tier=tier, trade_style=style,
-                rr_ratio=rr, daily_atr_pct=daily_atr,
-                adx_normalized=min(components.get("adx_value", 0.0) / 50.0, 1.0),
-                session_score=components.get("session_score", 0.5),
-                zone_quality=components.get("zone_quality", 0.0),
-                volume_score=components.get("volume_score", 0.0),
-                momentum_score=components.get("momentum_score", 0.0),
-                tf_agreement_score=components.get("tf_agreement_score", 0.0),
-                spread_normalized=0.0,
-                asset_class_id=ASSET_CLASS_ID.get(self.asset_class, 0.0),
-            ),
+            "obs": _ppo_obs,
             "zone_low": zone_low,
             "zone_high": zone_high,
             "ref_price": price,
+            "features": _xgb_features,
         }
         self.logger.info(
             "PENDING %s %s %s [%s] | zone=[%.6f, %.6f] SL=%.6f TP=%.6f "
@@ -1424,7 +1652,21 @@ class PaperBot:
         rl_tracked = False
         rl_trade_id: str | None = None
         take_trade = True
-        if use_brain:
+        rl_confidence = 1.0
+
+        # XGBoost entry filter (RLBrainSuite)
+        if use_brain and self.rl_suite is not None and self.rl_suite.entry_filter_enabled:
+            xgb_take, rl_confidence = self.rl_suite.predict_entry(sig.get("features", {}))
+            if not xgb_take:
+                self.logger.info(
+                    "XGB entry filter skipped %s (confidence=%.3f < threshold, score=%.2f)",
+                    symbol, rl_confidence, score,
+                )
+                self._pending_signal = None
+                return
+
+        # PPO brain (legacy, runs after XGBoost filter)
+        if use_brain and self.brain is not None:
             rl_decision, rl_trade_id = self.brain.should_trade(obs, coin_id=self.symbol)
             rl_tracked = True
             take_trade = rl_decision
@@ -1474,6 +1716,32 @@ class PaperBot:
             self._pending_signal = None
             return
 
+        # ── RL TP adjustment ───────────────────────────────────────────
+        rl_be_level = 0.0
+        if self.rl_suite is not None:
+            if self.rl_suite.tp_enabled and sl_dist > 0:
+                planned_tp_rr = tp_dist / sl_dist
+                adjusted_tp_rr = self.rl_suite.predict_tp_adjustment(
+                    sig.get("features", {}), planned_tp_rr,
+                )
+                if abs(adjusted_tp_rr - planned_tp_rr) > 0.01:
+                    old_tp = tp
+                    tp = price + adjusted_tp_rr * sl_dist if direction == "long" else price - adjusted_tp_rr * sl_dist
+                    tp_dist = abs(tp - price)
+                    self.logger.info(
+                        "RL TP adjusted %s: %.6f -> %.6f (RR %.1f -> %.1f)",
+                        symbol, old_tp, tp, planned_tp_rr, adjusted_tp_rr,
+                    )
+
+            if self.rl_suite.be_enabled and sl_dist > 0:
+                # Match training formula: cost_rr in R-multiples
+                _tc = _TRAIN_COMMISSION.get(self.asset_class, 0.0004)
+                _ts = _TRAIN_SLIPPAGE.get(self.asset_class, 0.0002)
+                cost_rr = (price * (_tc + _ts) * 2) / sl_dist
+                rl_be_level = self.rl_suite.predict_be_level(
+                    sig.get("features", {}), cost_rr,
+                )
+
         order_id, sl_order_id, tp_order_id, qty, risk_pct, used_leverage = (
             await self._execute_bracket_order_with_risk_reduction(
                 symbol=symbol,
@@ -1509,6 +1777,7 @@ class PaperBot:
             "direction": direction,
             "entry": price,
             "sl": sl,
+            "original_sl": sl,
             "tp": tp,
             "qty": qty,
             "leverage": used_leverage,
@@ -1522,6 +1791,9 @@ class PaperBot:
             "tp_order_id": tp_order_id,
             "rl_tracked": rl_tracked,
             "rl_trade_id": rl_trade_id,
+            "rl_confidence": rl_confidence,
+            "rl_be_level": rl_be_level,
+            "be_triggered": False,
         }
         self._active_trades.append(trade_info)
         self._last_entry_time = datetime.now(timezone.utc)
@@ -3274,6 +3546,54 @@ class LiveMultiBotRunner:
                     remaining: list[dict[str, Any]] = []
                     # Process each tracked trade independently
                     for trade in list(bot._active_trades):
+                        # ── BE management: move SL to breakeven ──
+                        if (not trade.get("be_triggered", False)
+                                and trade.get("rl_be_level", 0) > 0
+                                and bot.rl_suite is not None
+                                and bot.rl_suite.be_enabled
+                                and bot.adapter is not None):
+                            entry_p = trade["entry"]
+                            direction = trade["direction"]
+                            sl_dist_orig = abs(entry_p - trade.get("original_sl", trade["sl"]))
+                            if sl_dist_orig > 0:
+                                be_target_rr = trade["rl_be_level"]
+                                current_rr = 0.0
+                                last_price = entry_p
+                                if recent:
+                                    try:
+                                        _lp = float(recent[-1].get("price", 0) or 0)
+                                        if _lp > 0:
+                                            last_price = _lp
+                                    except Exception:
+                                        pass
+                                if direction == "long" and last_price > entry_p:
+                                    current_rr = (last_price - entry_p) / sl_dist_orig
+                                elif direction == "short" and last_price < entry_p:
+                                    current_rr = (entry_p - last_price) / sl_dist_orig
+                                if current_rr >= be_target_rr:
+                                    # Move SL to entry + fee buffer
+                                    fee_buffer = entry_p * bot.commission_rate * 4
+                                    if direction == "long":
+                                        new_sl = entry_p + fee_buffer
+                                    else:
+                                        new_sl = entry_p - fee_buffer
+                                    old_sl_id = trade.get("sl_order_id")
+                                    if old_sl_id:
+                                        exit_side = "sell" if direction == "long" else "buy"
+                                        new_sl_order = await bot.adapter.modify_stop_loss(
+                                            old_sl_id, trade["symbol"], exit_side,
+                                            trade["qty"], new_sl,
+                                        )
+                                        if new_sl_order and new_sl_order.order_id:
+                                            trade["sl_order_id"] = new_sl_order.order_id
+                                            trade["sl"] = new_sl
+                                            trade["be_triggered"] = True
+                                            bot.logger.info(
+                                                "BE TRIGGERED %s: SL moved to %.6f (was %.6f) at RR=%.1f",
+                                                trade["symbol"], new_sl, trade.get("sl", 0),
+                                                current_rr,
+                                            )
+
                         exit_side = "sell" if trade["direction"] == "long" else "buy"
                         entry_ms = int(trade["entry_time"].timestamp() * 1000)
 
@@ -3755,6 +4075,9 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
         coin_ids=all_symbols,
     )
 
+    # ── Create RL Brain Suite (XGBoost models) ────────────────────
+    rl_suite = RLBrainSuite(config)
+
     # ── Create bots ───────────────────────────────────────────────
     bots: list[PaperBot] = []
     for idx, (sym, ac) in enumerate(active):
@@ -3766,6 +4089,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             asset_class=ac,
             adapter=adapters[ac],
             central_brain=central_brain,
+            rl_suite=rl_suite,
         )
         bots.append(bot)
 
