@@ -189,3 +189,28 @@ live:
   testnet: true            # Start on Binance Futures Testnet
   poll_interval_sec: 5     # Order-book polling interval
   max_open_trades: 5
+
+# ── RL Brain (XGBoost Models) ──────────────────────────────────
+rl_brain:
+  enabled: true              # Master switch for all RL models
+  entry_filter:
+    enabled: true            # Filter entries by predicted win probability
+    confidence_threshold: 0.6
+    model_path: "models/rl_entry_filter.pkl"
+  position_sizer:
+    enabled: false           # Off by default until paper-validated
+    model_path: "models/rl_position_sizer.pkl"
+    target_rr: 3.0           # RR target for full allocation
+    min_multiplier: 0.33     # Minimum risk multiplier
+    max_multiplier: 1.5      # Maximum risk multiplier
+  tp_optimizer:
+    enabled: true             # Enabled for paper trading (marginal Sharpe improvement)
+    model_path: "models/rl_tp_optimizer.pkl"
+    max_tp_reduction: 0.3    # Max 30% TP reduction from planned
+    max_tp_extension: 0.5    # Max 50% TP extension from planned
+    min_tp_rr: 0.5           # Never set TP below 0.5R
+  be_manager:
+    enabled: true             # Enabled for paper trading (DD -29%, PF +30% in backtest)
+    model_path: "models/rl_be_manager.pkl"
+    min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
+    fee_buffer: true         # Add fee buffer when moving to BE

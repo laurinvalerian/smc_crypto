@@ -470,6 +470,9 @@ class PaperBot:
             raise ValueError("central_brain must be provided")
         self.brain = central_brain
         self.rl_suite = rl_suite
+        # RL monitoring stats
+        self._rl_accepted: int = 0
+        self._rl_rejected: int = 0
         # Store last obs so we can record reward when trade closes
         self._pending_obs: np.ndarray | None = None
 
@@ -1658,12 +1661,28 @@ class PaperBot:
         if use_brain and self.rl_suite is not None and self.rl_suite.entry_filter_enabled:
             xgb_take, rl_confidence = self.rl_suite.predict_entry(sig.get("features", {}))
             if not xgb_take:
+                self._rl_rejected += 1
+                _total_rl = self._rl_accepted + self._rl_rejected
+                _rate = self._rl_accepted / _total_rl * 100 if _total_rl > 0 else 0
                 self.logger.info(
-                    "XGB entry filter skipped %s (confidence=%.3f < threshold, score=%.2f)",
+                    "XGB REJECT %s conf=%.3f score=%.2f | accepted=%d rejected=%d rate=%.0f%%",
                     symbol, rl_confidence, score,
+                    self._rl_accepted, self._rl_rejected, _rate,
                 )
+                # Alert: abnormal acceptance rate after 20+ decisions
+                if _total_rl >= 20 and (_rate < 10 or _rate > 95):
+                    self.logger.warning(
+                        "RL ALERT: acceptance rate %.0f%% (%d/%d) — check feature extraction",
+                        _rate, self._rl_accepted, _total_rl,
+                    )
                 self._pending_signal = None
                 return
+            self._rl_accepted += 1
+            self.logger.info(
+                "XGB ACCEPT %s conf=%.3f score=%.2f | accepted=%d rejected=%d",
+                symbol, rl_confidence, score,
+                self._rl_accepted, self._rl_rejected,
+            )
 
         # PPO brain (legacy, runs after XGBoost filter)
         if use_brain and self.brain is not None:
@@ -3353,6 +3372,25 @@ class LiveMultiBotRunner:
                 bot.peak_equity = bot.equity
 
             bot._append_equity()
+
+            # ── RL performance kill switches ─────────────────────────
+            if bot.trades >= 50 and bot.rl_suite is not None and bot.rl_suite.enabled:
+                _wr = bot.wins / bot.trades
+                _gross_win = bot.total_pnl if bot.total_pnl > 0 else 0.0
+                _gross_loss = abs(bot.total_pnl - _gross_win) if bot.total_pnl < 0 else 0.0
+                _pf = _gross_win / _gross_loss if _gross_loss > 0 else 99.0
+                if _wr < 0.35:
+                    bot.logger.critical(
+                        "RL KILL: WR %.1f%% < 35%% over %d trades — disabling RL",
+                        _wr * 100, bot.trades,
+                    )
+                    bot.rl_suite.enabled = False
+                elif _pf < 1.0 and bot.total_pnl < 0:
+                    bot.logger.critical(
+                        "RL KILL: PF %.2f < 1.0, net PnL %.2f over %d trades — disabling RL",
+                        _pf, bot.total_pnl, bot.trades,
+                    )
+                    bot.rl_suite.enabled = False
 
             # Record PnL in circuit breaker
             if bot.circuit_breaker is not None:
