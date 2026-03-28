@@ -9,67 +9,58 @@ build/
 .eggs/
 
 # Virtual environments
-venv/
 .venv/
+venv/
 env/
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Environment variables
-.env
-
-# Data files (large, downloaded locally)
-data/*.parquet
-data/*.csv
-data/*.h5
-
-# Backtest results (generated locally)
-backtest/results/*.csv
-backtest/results/*.json
-backtest/results/*.png
-backtest/results/*.html
-
-# Optuna storage
-*.db
-*.sqlite3
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Docker
+# Environment variables
+.env
 docker/.env
 
-# Live bot results (generated locally)
+# Data files (large, regenerable)
+data/
+*.parquet
+*.h5
+
+# Models (regenerable from training)
+models/
+
+# Binary / data artifacts
+*.pkl
+*.pt
+*.db
+*.sqlite3
+
+# Backtest results (regenerable)
+backtest/results/
+!backtest/results/.gitkeep
+
+# Live results (runtime generated)
 live_results/
 
-# RL model checkpoints (generated per bot)
-rl_models/
-*.pt
+# Paper grid results (runtime generated)
+paper_grid_results/
+!paper_grid_results/.gitkeep
 
 # Logs
 *.log
 
-# Backtest cache & results
-backtest/results/
-backtest/results/signal_cache/
-backtests/results
+# RL model checkpoints
+rl_models/
 
-# Data logs
-data/*.log
-data/**/*.log
-
-# Binary/data artifacts
-*.pkl
-*.h5
-*.parquet
-
-.omc
-.claude
-venv
-
+# OMC / Claude state
+.omc/
+.claude/
 project-memory.json
+
+# CSV results
+*.csv
+!requirements.txt

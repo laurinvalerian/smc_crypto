@@ -219,6 +219,9 @@ ASSET_CLASS_ID: dict[str, float] = {
 
 # ── REST Polling interval for OANDA/Alpaca (no WebSocket) ────────
 REST_POLL_INTERVAL_SEC = 10
+# Stocks: longer intervals to stay within Alpaca free-tier rate limits (200 req/min)
+REST_POLL_INTERVAL_STOCKS_CANDLE = 60   # 5m candles — no need to poll faster
+REST_POLL_INTERVAL_STOCKS_TICKER = 30
 
 
 def symbol_to_asset_class(symbol: str) -> str:
@@ -491,6 +494,9 @@ class PaperBot:
             self.tag, symbol, self.asset_class, self.equity,
         )
 
+        # Near-miss diagnostic state (rate-limiting)
+        self._last_neutral_bias_log_hour = -1
+
         # Multi-TF OHLCV buffers (loaded async via load_history())
         self.buffer_1d: pd.DataFrame = pd.DataFrame()
         self.buffer_4h: pd.DataFrame = pd.DataFrame()
@@ -689,6 +695,13 @@ class PaperBot:
                 self.logger.debug("1D bias computation failed: %s", exc)
 
         if daily_bias == "neutral":
+            _cur_hour = datetime.now(timezone.utc).hour
+            if self.asset_class == "forex" and _cur_hour != self._last_neutral_bias_log_hour:
+                self._last_neutral_bias_log_hour = _cur_hour
+                self.logger.info(
+                    "NEAR-MISS NEUTRAL-BIAS %s | class=%s | no_daily_direction",
+                    self.symbol, self.asset_class,
+                )
             direction = "long"
             return 0.0, direction, comp
 
@@ -739,8 +752,16 @@ class PaperBot:
                         _cur = float(self.buffer_5m["close"].iloc[-1])
                         comp["_premium_discount"] = 1.0 if _cur > _mid else -1.0
                         if daily_bias == "bullish" and _cur > _mid:
+                            self.logger.info(
+                                "NEAR-MISS D/P EXIT %s | class=%s dir=%s bias=%s zone=premium price=%.5f mid=%.5f",
+                                self.symbol, self.asset_class, direction, daily_bias, _cur, _mid,
+                            )
                             return 0.0, direction, comp  # Long in premium
                         if daily_bias == "bearish" and _cur < _mid:
+                            self.logger.info(
+                                "NEAR-MISS D/P EXIT %s | class=%s dir=%s bias=%s zone=discount price=%.5f mid=%.5f",
+                                self.symbol, self.asset_class, direction, daily_bias, _cur, _mid,
+                            )
                             return 0.0, direction, comp  # Short in discount
             except Exception as exc:
                 self.logger.debug("D/P filter failed: %s", exc)
@@ -1286,7 +1307,11 @@ class PaperBot:
             feat["volume_ratio"] = 1.0
 
         # ── ADX on 1H (normalized by /50, capped at 2.0) ───────────
-        feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
+        # Training data has adx_1h ≈ 0 for forex/stocks/commodities (only crypto has real values)
+        if self.asset_class == "crypto":
+            feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
+        else:
+            feat["adx_1h"] = 0.0
 
         # ── Alignment score ─────────────────────────────────────────
         feat["alignment_score"] = float(score)
@@ -1419,6 +1444,12 @@ class PaperBot:
         # ── Multi-TF alignment score (granular) ───────────────────
         score, direction, components = self._multi_tf_alignment_score(candle)
         if score < self.alignment_threshold:
+            if score >= 0.50:
+                self.logger.info(
+                    "NEAR-MISS ALIGNMENT %s | class=%s score=%.3f thresh=%.2f dir=%s | flags=%s",
+                    symbol, self.asset_class, score, self.alignment_threshold, direction,
+                    {k: v for k, v in components.items() if not k.startswith("_")},
+                )
             self._pending_signal = None
             return
 
@@ -1544,9 +1575,24 @@ class PaperBot:
         tier = self._classify_setup_tier(score, rr, components)
         if not tier:
             self._pending_signal = None
-            self.logger.debug(
-                "NO TIER %s | score=%.2f RR=%.1f – setup quality too low",
-                symbol, score, rr,
+            _flags = {
+                "bias_strong": bool(components.get("bias_strong")),
+                "h4_confirms": bool(components.get("h4_confirms")),
+                "h4_poi": bool(components.get("h4_poi")),
+                "h1_confirms": bool(components.get("h1_confirms")),
+                "h1_choch": bool(components.get("h1_choch")),
+                "entry_zone": components.get("entry_zone") is not None,
+                "precision_trigger": bool(components.get("precision_trigger")),
+                "volume_ok": bool(components.get("volume_ok")),
+                "adx_strong": bool(components.get("adx_strong")),
+                "session_optimal": bool(components.get("session_optimal")),
+                "zone_quality_ok": bool(components.get("zone_quality_ok")),
+            }
+            _passing = sum(1 for v in _flags.values() if v)
+            _failing = [k for k, v in _flags.items() if not v]
+            self.logger.info(
+                "NEAR-MISS TIER %s | class=%s score=%.3f RR=%.1f dir=%s | flags=%d/11 | missing=%s",
+                symbol, self.asset_class, score, rr, direction, _passing, _failing,
             )
             return
 
@@ -3283,8 +3329,10 @@ class LiveMultiBotRunner:
 
     # ── REST polling for non-WebSocket adapters (OANDA, Alpaca) ────
 
-    async def _poll_candles(self, bot: PaperBot) -> None:
+    async def _poll_candles(self, bot: PaperBot, stagger_sec: float = 0.0) -> None:
         """REST-based 5m candle polling for OANDA/Alpaca bots."""
+        if stagger_sec > 0:
+            await asyncio.sleep(stagger_sec)
         last_ts: int | None = None
         while not self._shutdown.is_set():
             try:
@@ -3312,13 +3360,16 @@ class LiveMultiBotRunner:
             except Exception as exc:
                 bot.logger.error("REST candle poll %s: %s", bot.symbol, exc)
             try:
-                await asyncio.wait_for(self._shutdown.wait(), timeout=REST_POLL_INTERVAL_SEC)
+                interval = REST_POLL_INTERVAL_STOCKS_CANDLE if bot.asset_class == "stocks" else REST_POLL_INTERVAL_SEC
+                await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
                 return  # shutdown
             except asyncio.TimeoutError:
                 pass
 
-    async def _poll_ticker(self, bot: PaperBot) -> None:
+    async def _poll_ticker(self, bot: PaperBot, stagger_sec: float = 0.0) -> None:
         """REST-based ticker polling for OANDA/Alpaca bots."""
+        if stagger_sec > 0:
+            await asyncio.sleep(stagger_sec)
         while not self._shutdown.is_set():
             try:
                 ticker = await bot.adapter.watch_ticker(bot.symbol)
@@ -3334,7 +3385,8 @@ class LiveMultiBotRunner:
             except Exception as exc:
                 bot.logger.error("REST ticker poll %s: %s", bot.symbol, exc)
             try:
-                await asyncio.wait_for(self._shutdown.wait(), timeout=5)
+                interval = REST_POLL_INTERVAL_STOCKS_TICKER if bot.asset_class == "stocks" else 5
+                await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
                 return
             except asyncio.TimeoutError:
                 pass
@@ -3956,6 +4008,9 @@ class LiveMultiBotRunner:
                 logger.warning("Startup zombie sweep [%s] failed: %s", ac, exc)
 
         # Start watchers: WebSocket for crypto, REST polling for others
+        # Stagger REST bots to avoid rate limits (stocks: 2s apart, others: 0.5s)
+        _stock_idx = 0
+        _rest_idx = 0
         for bot in self.bots:
             if bot.asset_class == "crypto":
                 # WebSocket-based (existing methods)
@@ -3966,12 +4021,18 @@ class LiveMultiBotRunner:
                     self._watch_ticker(bot.symbol)
                 )
             else:
-                # REST polling for OANDA/Alpaca
+                # REST polling for OANDA/Alpaca — staggered start
+                if bot.asset_class == "stocks":
+                    stagger = _stock_idx * 2.0
+                    _stock_idx += 1
+                else:
+                    stagger = _rest_idx * 0.5
+                    _rest_idx += 1
                 self._watcher_tasks[bot.symbol] = asyncio.create_task(
-                    self._poll_candles(bot)
+                    self._poll_candles(bot, stagger_sec=stagger)
                 )
                 self._ticker_tasks[bot.symbol] = asyncio.create_task(
-                    self._poll_ticker(bot)
+                    self._poll_ticker(bot, stagger_sec=stagger)
                 )
 
         # Position poller (detects TP/SL fills on exchange)
