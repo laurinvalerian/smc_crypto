@@ -853,17 +853,29 @@ def _simulate_forward(
     slippage_pct: float = 0.0002,
     be_ratchet_r: float = 1.5,
     asset_class: str = "crypto",
-) -> tuple[str, float, int, float, int]:
+    emit_bar_rows: bool = False,
+) -> tuple[str, float, int, float, int] | tuple[str, float, int, float, int, list[dict]]:
     """
     Simulate a trade forward from entry_idx.
 
-    Returns (outcome, net_rr, exit_bar_offset, max_favorable_rr, exit_mechanism).
+    Returns (outcome, net_rr, exit_bar_offset, max_favorable_rr, exit_mechanism)
+    when emit_bar_rows=False (default, backward compatible).
+
+    When emit_bar_rows=True, returns a 6-tuple with an additional list of
+    per-bar dicts.  Each dict represents one 5m bar during the trade with
+    causal features only (no future data).  After the simulation loop, the
+    label ``label_hold_better`` is backfilled on every bar using the known
+    final net_rr (two-pass: forward to exit, backward to fill labels).
+
       exit_mechanism: 0=skip, 1=TP, 2=SL, 3=BE, 4=timeout
       net_rr: realized RR after commission + slippage + funding
+      label_hold_better: 1 if continuing to hold from this bar improved outcome
     """
     is_long = direction == "long"
     sl_dist = abs(entry_price - stop_loss)
     if sl_dist == 0:
+        if emit_bar_rows:
+            return "skip", 0.0, 0, 0.0, 0, []
         return "skip", 0.0, 0, 0.0, 0
 
     high = df_5m["high"].values.astype(float)
@@ -880,18 +892,39 @@ def _simulate_forward(
     fee_buffer = entry_price * (commission_pct * 2 + slippage_pct * 2)
     best_favorable_rr = 0.0
 
+    # Per-bar state for exit episode emission (populated when emit_bar_rows=True)
+    bar_rows: list[dict] = []
+
     for i in range(entry_idx + 2, min(entry_idx + MAX_FORWARD_BARS + 1, n)):
         bar_high = high[i]
         bar_low = low[i]
+        bar_close = close[i]
         bars_held = i - entry_idx
 
         # Track max favorable excursion (in R-multiples)
         if is_long:
             fav = (bar_high - entry_price) / sl_dist
+            unrealized_rr = (bar_close - entry_price) / sl_dist
+            sl_dist_pct = (bar_close - current_sl) / bar_close if bar_close > 0 else 0.0
         else:
             fav = (entry_price - bar_low) / sl_dist
+            unrealized_rr = (entry_price - bar_close) / sl_dist
+            sl_dist_pct = (current_sl - bar_close) / bar_close if bar_close > 0 else 0.0
         if fav > best_favorable_rr:
             best_favorable_rr = fav
+
+        # Collect bar state for exit episodes (causal: only data known at this bar)
+        if emit_bar_rows:
+            bar_rows.append({
+                "bar_index": bars_held,
+                "bar_unrealized_rr": unrealized_rr,
+                "sl_distance_pct": max(sl_dist_pct, 0.0),
+                "max_favorable_seen": best_favorable_rr,
+                "bars_held": bars_held,
+                "be_triggered": int(be_triggered),
+                # label_hold_better backfilled after exit (two-pass)
+                "label_hold_better": None,
+            })
 
         # Check BE ratchet
         if not be_triggered:
@@ -911,25 +944,41 @@ def _simulate_forward(
             raw_rr = (current_sl - entry_price) / sl_dist
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
             if be_triggered and abs(raw_rr) < 0.5:
-                return "breakeven", net_rr, bars_held, best_favorable_rr, 3
-            return ("win" if net_rr > 0 else "loss"), net_rr, bars_held, best_favorable_rr, 2
+                outcome, mech = "breakeven", 3
+            else:
+                outcome, mech = ("win" if net_rr > 0 else "loss"), 2
+            if emit_bar_rows:
+                _backfill_hold_labels(bar_rows, net_rr)
+                return outcome, net_rr, bars_held, best_favorable_rr, mech, bar_rows
+            return outcome, net_rr, bars_held, best_favorable_rr, mech
 
         if not is_long and bar_high >= current_sl:
             raw_rr = (entry_price - current_sl) / sl_dist
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
             if be_triggered and abs(raw_rr) < 0.5:
-                return "breakeven", net_rr, bars_held, best_favorable_rr, 3
-            return ("win" if net_rr > 0 else "loss"), net_rr, bars_held, best_favorable_rr, 2
+                outcome, mech = "breakeven", 3
+            else:
+                outcome, mech = ("win" if net_rr > 0 else "loss"), 2
+            if emit_bar_rows:
+                _backfill_hold_labels(bar_rows, net_rr)
+                return outcome, net_rr, bars_held, best_favorable_rr, mech, bar_rows
+            return outcome, net_rr, bars_held, best_favorable_rr, mech
 
         # Check TP hit
         if is_long and bar_high >= take_profit:
             raw_rr = (take_profit - entry_price) / sl_dist
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            if emit_bar_rows:
+                _backfill_hold_labels(bar_rows, net_rr)
+                return "win", net_rr, bars_held, best_favorable_rr, 1, bar_rows
             return "win", net_rr, bars_held, best_favorable_rr, 1
 
         if not is_long and bar_low <= take_profit:
             raw_rr = (entry_price - take_profit) / sl_dist
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            if emit_bar_rows:
+                _backfill_hold_labels(bar_rows, net_rr)
+                return "win", net_rr, bars_held, best_favorable_rr, 1, bar_rows
             return "win", net_rr, bars_held, best_favorable_rr, 1
 
     # Timeout — classify by current position
@@ -942,10 +991,32 @@ def _simulate_forward(
     net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
 
     if net_rr >= 0.5:
-        return "win", net_rr, bars_held, best_favorable_rr, 4
+        outcome, mech = "win", 4
     elif net_rr <= -0.5:
-        return "loss", net_rr, bars_held, best_favorable_rr, 4
-    return "breakeven", net_rr, bars_held, best_favorable_rr, 4
+        outcome, mech = "loss", 4
+    else:
+        outcome, mech = "breakeven", 4
+
+    if emit_bar_rows:
+        _backfill_hold_labels(bar_rows, net_rr)
+        return outcome, net_rr, bars_held, best_favorable_rr, mech, bar_rows
+    return outcome, net_rr, bars_held, best_favorable_rr, mech
+
+
+def _backfill_hold_labels(bar_rows: list[dict], final_net_rr: float) -> None:
+    """
+    Two-pass label backfill: after final exit is known, label each bar.
+
+    label_hold_better = 1 if (final_net_rr - bar_unrealized_rr) > 0
+      → holding from this bar improved the final outcome
+    label_hold_better = 0 if exit at this bar was already optimal
+
+    This is causal: we use the known final RR of a closed trade (offline batch),
+    not any future bar price beyond the actual exit.
+    """
+    for row in bar_rows:
+        remaining_rr = final_net_rr - row["bar_unrealized_rr"]
+        row["label_hold_better"] = int(remaining_rr > 0)
 
 
 def generate_teacher_labels(
@@ -1403,6 +1474,212 @@ def run_data_generation(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Exit Episode Generation
+# ═══════════════════════════════════════════════════════════════════
+
+def _process_exit_episodes_worker(args: tuple) -> "pd.DataFrame | None":
+    """Worker: generate bar-by-bar exit episodes for one (symbol, window) pair."""
+    sym, ac, config, w_start, w_end, wi = args
+    try:
+        smc_params = ASSET_SMC_PARAMS.get(ac, ASSET_SMC_PARAMS["crypto"])
+        commission = ASSET_COMMISSION.get(ac, 0.0004)
+        slippage = ASSET_SLIPPAGE.get(ac, 0.0002)
+
+        # Lookahead buffer same as process_instrument
+        history_start = (
+            pd.Timestamp(w_start, tz="UTC") - pd.Timedelta(days=180)
+        ).strftime("%Y-%m-%d")
+        frames = load_multi_tf_data(sym, ac, start=history_start, end=w_end)
+        if frames is None or "5m" not in frames or len(frames["5m"]) < 100:
+            return None
+        df_5m = frames["5m"]
+
+        # Guard: must use causal indicators for bar-level features
+        assert compute_smc_indicators_causal.__name__ == "compute_smc_indicators_causal", (
+            "lookahead leakage prevention: must use causal indicators"
+        )
+
+        # Compute LOOKAHEAD indicators (for teacher entry detection only)
+        lookahead_inds: dict[str, dict[str, Any]] = {}
+        for tf, df in frames.items():
+            if df.empty or len(df) < smc_params["swing_length"] * 2:
+                continue
+            try:
+                lookahead_inds[tf] = compute_smc_indicators(
+                    df,
+                    swing_length=smc_params["swing_length"],
+                    fvg_threshold=smc_params["fvg_threshold"],
+                    ob_lookback=smc_params.get("order_block_lookback", 20),
+                    liq_range_pct=smc_params["liquidity_range_percent"],
+                )
+            except Exception:
+                pass
+
+        if "5m" not in lookahead_inds:
+            return None
+
+        window_start_ts = pd.Timestamp(w_start, tz="UTC")
+
+        # Get teacher-labeled entries (lookahead for detection, not for bar features)
+        label_df = generate_teacher_labels(
+            frames, lookahead_inds, ac, smc_params,
+            signal_window_start=window_start_ts,
+        )
+
+        entry_mask = label_df["label_action"] > 0
+        if not entry_mask.any():
+            return None
+
+        # Map label timestamps → df_5m integer indices for fast lookup
+        ts_5m = df_5m["timestamp"].values
+        ts_map: dict = {ts: idx for idx, ts in enumerate(ts_5m)}
+
+        all_episode_rows: list[dict] = []
+
+        for _, label_row in label_df[entry_mask].iterrows():
+            label_ts = label_row["timestamp"]
+            entry_idx = ts_map.get(label_ts)
+            if entry_idx is None or entry_idx + 10 >= len(df_5m):
+                continue
+
+            direction = "long" if int(label_row["label_action"]) == 1 else "short"
+            entry_price = float(df_5m["open"].iloc[entry_idx + 1])  # next bar open
+            if entry_price <= 0:
+                continue
+
+            tp_rr = float(label_row.get("label_tp_rr", 3.0))
+            if tp_rr <= 0.5:
+                continue
+
+            # Reconstruct SL/TP from a local ATR estimate (causal: slice up to entry)
+            atr_slice = df_5m["close"].iloc[max(0, entry_idx - 14):entry_idx + 1]
+            atr_est = float(atr_slice.std()) if len(atr_slice) > 1 else entry_price * 0.005
+            atr_est = max(atr_est, entry_price * 0.002)
+
+            if direction == "long":
+                stop_loss = entry_price - atr_est
+                take_profit = entry_price + atr_est * tp_rr
+            else:
+                stop_loss = entry_price + atr_est
+                take_profit = entry_price - atr_est * tp_rr
+
+            result = _simulate_forward(
+                df_5m, entry_idx, entry_price, stop_loss, take_profit,
+                direction, commission_pct=commission, slippage_pct=slippage,
+                asset_class=ac, emit_bar_rows=True,
+            )
+            if len(result) != 6:
+                continue
+            outcome, net_rr, exit_bars, max_fav_rr, exit_mech, bar_rows = result
+
+            if outcome == "skip" or not bar_rows:
+                continue
+
+            # Attach trade-level metadata to every bar row
+            for row in bar_rows:
+                row.update({
+                    "symbol": sym,
+                    "asset_class": ac,
+                    "direction": direction,
+                    "window": wi,
+                    "entry_price": entry_price,
+                    "final_net_rr": net_rr,
+                    "outcome": outcome,
+                    "exit_mechanism": exit_mech,
+                    "max_favorable_rr": max_fav_rr,
+                    "tp_rr": tp_rr,
+                })
+                all_episode_rows.append(row)
+
+        if not all_episode_rows:
+            return None
+
+        return pd.DataFrame(all_episode_rows)
+
+    except Exception as exc:
+        logger.warning("Exit episode worker failed for %s/%s: %s", sym, ac, exc)
+        return None
+
+
+def generate_exit_training_data(
+    classes: list[str],
+    symbols_override: list[str] | None = None,
+    max_crypto: int = 30,
+    n_workers: int = 4,
+) -> None:
+    """
+    Generate bar-by-bar exit episode data from historical simulations.
+
+    Extends _simulate_forward() with emit_bar_rows=True to replay every
+    historical trade bar-by-bar, computing the label_hold_better signal
+    using a two-pass backfill (final net_rr known at episode end).
+
+    Output: data/rl_training/{ac}_exit_episodes.parquet
+      One row per 5m bar during each simulated trade.
+      label_hold_better = 1 if holding improved final outcome, 0 if exit was optimal.
+
+    Causal guarantee: only compute_smc_indicators_causal is used for bar features.
+    """
+    import yaml
+    from multiprocessing import Pool
+
+    config_path = Path("config/default_config.yaml")
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for ac in classes:
+        logger.info("═══ GENERATING EXIT EPISODES: %s ═══", ac.upper())
+
+        symbols = symbols_override or get_symbols_for_class(ac, max_crypto=max_crypto)
+        if not symbols:
+            logger.warning("  No symbols for %s — skipping", ac)
+            continue
+
+        work_items = [
+            (sym, ac, config, w_start, w_end, wi)
+            for wi, (w_start, w_end) in enumerate(WINDOWS)
+            for sym in symbols
+        ]
+        logger.info("  %d work items (%d symbols × %d windows), %d workers",
+                    len(work_items), len(symbols), len(WINDOWS), n_workers)
+
+        all_frames: list[pd.DataFrame] = []
+        completed = 0
+        with Pool(processes=n_workers) as pool:
+            for result in pool.imap_unordered(
+                _process_exit_episodes_worker, work_items, chunksize=1
+            ):
+                completed += 1
+                if completed % 20 == 0 or completed == len(work_items):
+                    logger.info("  Progress: %d/%d", completed, len(work_items))
+                if result is not None and len(result) > 0:
+                    all_frames.append(result)
+
+        gc.collect()
+
+        if not all_frames:
+            logger.warning("  %s: No exit episodes generated", ac)
+            continue
+
+        combined = pd.concat(all_frames, ignore_index=True)
+        out_path = OUTPUT_DIR / f"{ac}_exit_episodes.parquet"
+        combined.to_parquet(out_path, index=False)
+
+        n_hold = int((combined["label_hold_better"] == 1).sum())
+        n_exit = int((combined["label_hold_better"] == 0).sum())
+        n_trades_approx = combined.groupby(["symbol", "direction", "entry_price"]).ngroups
+        logger.info(
+            "  %s: %d bar rows from ~%d trades | HOLD=%d (%.1f%%) EXIT=%d (%.1f%%)",
+            ac, len(combined), n_trades_approx,
+            n_hold, 100 * n_hold / max(len(combined), 1),
+            n_exit, 100 * n_exit / max(len(combined), 1),
+        )
+        logger.info("  Saved: %s", out_path)
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1418,6 +1695,8 @@ def main():
                         help="Max crypto symbols (default 30)")
     parser.add_argument("--workers", type=int, default=4,
                         help="Parallel workers (default 4)")
+    parser.add_argument("--exit-episodes", action="store_true",
+                        help="Generate bar-by-bar exit episodes (for exit classifier training)")
     args = parser.parse_args()
 
     if args.all_classes:
@@ -1427,8 +1706,12 @@ def main():
     else:
         classes = ["crypto", "stocks"]  # default: most reliable
 
-    run_data_generation(classes, symbols_override=args.symbols,
-                        max_crypto=args.max_crypto, n_workers=args.workers)
+    if args.exit_episodes:
+        generate_exit_training_data(classes, symbols_override=args.symbols,
+                                    max_crypto=args.max_crypto, n_workers=args.workers)
+    else:
+        run_data_generation(classes, symbols_override=args.symbols,
+                            max_crypto=args.max_crypto, n_workers=args.workers)
 
 
 if __name__ == "__main__":

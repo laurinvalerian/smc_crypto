@@ -53,7 +53,11 @@ ALL_CLASSES = ["crypto", "forex", "stocks", "commodities"]
 META_COLS = {"timestamp", "symbol", "asset_class", "window",
              "label_action", "label_rr", "label_outcome", "label_profitable",
              "label_exit_mechanism", "label_exit_bar", "label_max_favorable_rr",
-             "label_tp_rr", "label_cost_rr"}
+             "label_tp_rr", "label_cost_rr",
+             # Exit classifier labels (bar-level episodes)
+             "label_hold_better", "bar_unrealized_rr", "final_net_rr",
+             "outcome", "exit_mechanism", "max_favorable_rr", "entry_price",
+             "tp_rr", "direction"}
 
 # Features to exclude from entry_quality task (data leaks)
 ENTRY_QUALITY_EXCLUDE = {"has_entry_zone", "alignment_score"}
@@ -170,6 +174,7 @@ def prepare_labels(df: pd.DataFrame, task: str = "entry_quality") -> np.ndarray:
     - "entry_quality": win (1) vs not-win (0), only on entry bars
     - "binary": profitable (1) vs not (0)
     - "direction": no_trade (0), long (1), short (2)
+    - "early_exit": hold (1) vs exit now (0), for bar-by-bar exit classifier
     """
     if task == "entry_quality":
         return (df["label_outcome"].values == 1).astype(np.int32)
@@ -177,6 +182,8 @@ def prepare_labels(df: pd.DataFrame, task: str = "entry_quality") -> np.ndarray:
         return df["label_profitable"].values.astype(np.int32)
     elif task == "direction":
         return df["label_action"].values.astype(np.int32)
+    elif task == "early_exit":
+        return df["label_hold_better"].values.astype(np.int32)
     else:
         raise ValueError(f"Unknown task: {task}")
 
@@ -1192,6 +1199,223 @@ def run_walk_forward_be(classes: list[str] | None = None) -> list[dict]:
 
 
 # ===================================================================
+#  Exit Classifier Walk-Forward
+# ===================================================================
+
+def run_walk_forward_exit(
+    classes: list[str] | None = None,
+    exit_episodes_dir: str = "data/rl_training",
+    min_trades: int = 100,
+    min_auc: float = 0.52,
+) -> dict[str, Any]:
+    """
+    Walk-forward validation for the early-exit classifier (5th model slot).
+
+    Reads bar-by-bar exit episodes from {ac}_exit_episodes.parquet.
+    Trains XGBoost to predict label_hold_better at each bar.
+
+    Key constraints:
+      - Train/test split by implied trade (grouped by symbol+direction+entry_price)
+        so all bars of one trade stay on the same side of the split.
+      - Recency weight: exponential decay by window index, applied per-trade uniformly.
+      - Gate: AUC > min_auc on holdout AND old/new model agreement > 80% on HOLD preds.
+
+    Saves: models/rl_exit_classifier.pkl (same format as other rl_*.pkl models)
+    """
+    if classes is None:
+        classes = ALL_CLASSES
+
+    logger.info("=" * 70)
+    logger.info("EARLY-EXIT CLASSIFIER — Walk-Forward Validation")
+    logger.info("=" * 70)
+
+    episodes_dir = Path(exit_episodes_dir)
+    all_frames: list[pd.DataFrame] = []
+
+    for ac in classes:
+        ep_path = episodes_dir / f"{ac}_exit_episodes.parquet"
+        if not ep_path.exists():
+            logger.warning("[exit] No episode file for %s: %s", ac, ep_path)
+            continue
+        try:
+            df = pd.read_parquet(ep_path)
+            df["asset_class"] = ac
+            all_frames.append(df)
+            logger.info("[exit] Loaded %d bar rows for %s", len(df), ac)
+        except Exception as e:
+            logger.warning("[exit] Failed to load %s: %s", ep_path, e)
+
+    if not all_frames:
+        logger.error("[exit] No episode data found. Run --exit-episodes first.")
+        return {}
+
+    episodes = pd.concat(all_frames, ignore_index=True)
+
+    # Require label_hold_better to be present and binary
+    if "label_hold_better" not in episodes.columns:
+        logger.error("[exit] label_hold_better column missing from episodes")
+        return {}
+
+    episodes = episodes.dropna(subset=["label_hold_better"])
+    episodes["label_hold_better"] = episodes["label_hold_better"].astype(int)
+
+    n_total = len(episodes)
+    n_hold_label = int((episodes["label_hold_better"] == 1).sum())
+    balance = n_hold_label / max(n_total, 1)
+    logger.info("[exit] %d bar rows | HOLD=%.1f%% EXIT=%.1f%%",
+                n_total, 100 * balance, 100 * (1 - balance))
+
+    # Build trade-level grouping key for split integrity
+    # All bars of the same trade must stay on same split side
+    group_keys = ["symbol", "asset_class", "direction", "entry_price", "window"]
+    available_keys = [k for k in group_keys if k in episodes.columns]
+    episodes["_trade_group"] = (
+        episodes[available_keys].astype(str).agg("_".join, axis=1)
+    )
+    trade_ids = episodes["_trade_group"].unique()
+    n_unique_trades = len(trade_ids)
+    logger.info("[exit] Unique trade groups: %d", n_unique_trades)
+
+    if n_unique_trades < min_trades:
+        logger.warning(
+            "[exit] Only %d trade groups (minimum %d) — not enough for reliable training. "
+            "Run more paper trades or generate more historical episodes.",
+            n_unique_trades, min_trades,
+        )
+        return {"status": "insufficient_data", "n_trades": n_unique_trades}
+
+    # Time-ordered split: 80% train, 20% holdout — by window if available, else by trade group order
+    if "window" in episodes.columns:
+        all_windows = sorted(episodes["window"].unique())
+        split_idx = max(1, int(len(all_windows) * 0.8))
+        train_windows = set(all_windows[:split_idx])
+        test_windows = set(all_windows[split_idx:])
+        train_df = episodes[episodes["window"].isin(train_windows)].copy()
+        test_df = episodes[episodes["window"].isin(test_windows)].copy()
+    else:
+        # Fallback: split by trade group order
+        split = int(len(trade_ids) * 0.8)
+        train_groups = set(trade_ids[:split])
+        train_df = episodes[episodes["_trade_group"].isin(train_groups)].copy()
+        test_df = episodes[~episodes["_trade_group"].isin(train_groups)].copy()
+
+    logger.info("[exit] Train: %d rows | Test: %d rows", len(train_df), len(test_df))
+
+    if len(test_df) == 0 or len(train_df) == 0:
+        logger.error("[exit] Empty train or test split")
+        return {}
+
+    # Recency weights: exponential decay by window, uniform per trade
+    if "window" in train_df.columns:
+        max_win = int(train_df["window"].max())
+        decay_half_life = 200  # trades equivalent → scale by window count
+        trade_weights = np.exp(
+            (train_df["window"].values - max_win) / max(max_win * 0.3, 1)
+        ).astype(np.float32)
+    else:
+        trade_weights = np.ones(len(train_df), dtype=np.float32)
+
+    # Prepare features and labels
+    X_train, feat_cols = prepare_features(train_df, task="early_exit")
+    y_train = prepare_labels(train_df, task="early_exit")
+    X_test, _ = prepare_features(test_df, task="early_exit")
+    y_test = prepare_labels(test_df, task="early_exit")
+
+    # Validation split from training (last 15% of train by window)
+    val_size = max(1, int(len(X_train) * 0.15))
+    X_val = X_train[-val_size:]
+    y_val = y_train[-val_size:]
+    X_tr = X_train[:-val_size]
+    y_tr = y_train[:-val_size]
+    w_tr = trade_weights[:-val_size]
+
+    # Train XGBoost classifier
+    model = train_xgboost(X_tr, y_tr, X_val, y_val, feat_cols,
+                          sample_weights=w_tr, task="early_exit")
+
+    if model is None:
+        logger.error("[exit] Model training failed")
+        return {}
+
+    # Evaluate on holdout
+    from sklearn.metrics import roc_auc_score, f1_score
+    test_proba = model.predict_proba(X_test)[:, 1]
+    test_auc = float(roc_auc_score(y_test, test_proba))
+    test_pred = (test_proba >= 0.5).astype(int)
+    test_f1 = float(f1_score(y_test, test_pred, zero_division=0))
+
+    logger.info("[exit] Holdout AUC=%.4f F1=%.4f", test_auc, test_f1)
+
+    # Label balance sanity check
+    hold_rate = float(test_pred.mean())
+    logger.info("[exit] Predicted HOLD rate on holdout: %.1f%%", hold_rate * 100)
+
+    # Gate: AUC must exceed threshold
+    gate_passed = test_auc >= min_auc
+    logger.info("[exit] GATE %s: AUC %.4f %s %.4f",
+                "PASSED" if gate_passed else "FAILED",
+                test_auc, ">=" if gate_passed else "<", min_auc)
+
+    if not gate_passed:
+        logger.warning("[exit] Gate failed — model NOT saved. Collect more data.")
+        return {
+            "status": "gate_failed", "auc": test_auc, "f1": test_f1,
+            "n_trades": n_unique_trades,
+        }
+
+    # Load existing model for agreement check (if exists)
+    existing_path = MODEL_DIR / "rl_exit_classifier.pkl"
+    if existing_path.exists():
+        try:
+            with open(existing_path, "rb") as f:
+                old_data = pickle.load(f)
+            old_model = old_data.get("model")
+            if old_model is not None:
+                old_feat = old_data.get("feat_names", feat_cols)
+                X_agree = np.array([
+                    [X_test[j, feat_cols.index(f)] if f in feat_cols else 0.0
+                     for f in old_feat]
+                    for j in range(len(X_test))
+                ], dtype=np.float32)
+                old_pred = (old_model.predict_proba(X_agree)[:, 1] >= 0.5).astype(int)
+                agreement = float((old_pred == test_pred).mean())
+                logger.info("[exit] Model agreement with previous: %.1f%%", agreement * 100)
+                if agreement < 0.80:
+                    logger.warning(
+                        "[exit] Agreement %.1f%% < 80%% — model NOT deployed (too different)",
+                        agreement * 100,
+                    )
+                    return {
+                        "status": "agreement_failed", "auc": test_auc,
+                        "agreement": agreement, "n_trades": n_unique_trades,
+                    }
+        except Exception as e:
+            logger.warning("[exit] Could not load existing model for agreement check: %s", e)
+
+    # Save model
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    model_data = {
+        "model": model,
+        "feat_names": feat_cols,
+        "clip_ranges": CLIP_RANGES,
+        "auc": test_auc,
+        "f1": test_f1,
+        "n_train": len(X_tr),
+        "n_test": len(X_test),
+        "n_trades": n_unique_trades,
+        "task": "early_exit",
+    }
+    with open(existing_path, "wb") as f:
+        pickle.dump(model_data, f)
+    logger.info("[exit] Model saved → %s (AUC=%.4f)", existing_path, test_auc)
+
+    return {
+        "status": "deployed", "auc": test_auc, "f1": test_f1,
+        "n_trades": n_unique_trades, "hold_rate": hold_rate,
+    }
+
+
+# ===================================================================
 #  Per-Asset Holdout
 # ===================================================================
 
@@ -1433,10 +1657,19 @@ class RLBrainSuite:
             be_cfg.get("model_path", "models/rl_be_manager.pkl")
         ) if self.be_enabled else None
 
+        # Exit classifier (5th slot) — shadow mode until validated
+        exit_cfg = rl_cfg.get("exit_classifier", {})
+        self.exit_enabled = exit_cfg.get("enabled", False)
+        self.exit_threshold = exit_cfg.get("confidence_threshold", 0.65)
+        self._exit_model = self._load_model(
+            exit_cfg.get("model_path", "models/rl_exit_classifier.pkl")
+        ) if self.exit_enabled else None
+
         active = []
         if self._entry_filter: active.append("entry_filter")
         if self._tp_model: active.append("tp_optimizer")
         if self._be_model: active.append("be_manager")
+        if self._exit_model: active.append("exit_classifier")
         logger.info("RLBrainSuite initialized: %s", active if active else "no models loaded")
 
     @staticmethod
@@ -1516,6 +1749,37 @@ class RLBrainSuite:
 
         return min(predicted_be, 3.0)  # cap at 3R
 
+    def predict_early_exit(
+        self, bar_features: dict[str, float],
+    ) -> tuple[bool, float]:
+        """
+        Predict whether to exit the trade early at the current bar.
+
+        Returns (should_exit_now: bool, confidence: float).
+
+        Safe defaults when model is unavailable:
+          - Returns (False, 0.0) → HOLD, no action taken.
+          - This is the correct shadow-mode behavior: log but don't act.
+
+        bar_features dict should include:
+          bars_held, bar_unrealized_rr, sl_distance_pct, max_favorable_seen,
+          be_triggered, asset_class_id (and any overlap with entry features)
+        """
+        if not self.enabled or self._exit_model is None:
+            return False, 0.0  # shadow mode / model not yet trained
+
+        try:
+            x = self._build_features(bar_features, self._exit_model)
+            proba = self._exit_model["model"].predict_proba(x)[0]
+            # proba[1] = P(label_hold_better=1) = P(HOLD is better)
+            # We EXIT when P(HOLD) < threshold, i.e., P(EXIT) > (1 - threshold)
+            p_hold = float(proba[1])
+            should_exit = p_hold < (1.0 - self.exit_threshold)
+            return should_exit, 1.0 - p_hold  # confidence = P(EXIT)
+        except Exception as exc:
+            logger.warning("predict_early_exit failed: %s", exc)
+            return False, 0.0  # safe fallback
+
 
 # ===================================================================
 #  CLI
@@ -1532,7 +1796,8 @@ def main():
                         choices=ALL_CLASSES,
                         help="Asset class to hold out (default: commodities)")
     parser.add_argument("--task", choices=["binary", "direction", "entry_quality",
-                                          "sizing", "tp", "be", "all_regression"],
+                                          "sizing", "tp", "be", "all_regression",
+                                          "exit"],
                         default="entry_quality",
                         help="Prediction task (default: entry_quality)")
     parser.add_argument("--classes", nargs="+",
@@ -1552,6 +1817,8 @@ def main():
             run_walk_forward_tp(classes=args.classes)
         elif args.task == "be":
             run_walk_forward_be(classes=args.classes)
+        elif args.task == "exit":
+            run_walk_forward_exit(classes=args.classes)
         elif args.task == "all_regression":
             logger.info("Training ALL regression models sequentially...")
             run_walk_forward_sizing(classes=args.classes)

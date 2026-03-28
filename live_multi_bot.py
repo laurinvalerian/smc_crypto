@@ -57,6 +57,7 @@ from rich.text import Text
 
 from rl_brain import CentralRLBrain, extract_features, compute_shaped_reward
 from rl_brain_v2 import RLBrainSuite
+from trade_journal import TradeJournal
 from utils.indicators import compute_rsi_wilders, compute_atr_wilders
 from strategies.smc_multi_style import (
     compute_smc_indicators,
@@ -502,6 +503,9 @@ class PaperBot:
         self._rl_rejected: int = 0
         # Store last obs so we can record reward when trade closes
         self._pending_obs: np.ndarray | None = None
+
+        # Trade lifecycle journal (set by Runner; logs every bar for ML training)
+        self.journal: TradeJournal | None = None
 
         # Output
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1032,6 +1036,99 @@ class PaperBot:
 
         if len(buf) >= self.swing_length + 5:
             self._prepare_signal(symbol, buf, candle)
+
+        # ── Trade Journal: record bar for each active trade ──────────
+        # Fires only on confirmed closed 5m candles (not poll ticks).
+        if self._active_trades and self.journal is not None:
+            candle_ts = candle.get("timestamp")
+            if isinstance(candle_ts, (int, float)):
+                # Millisecond timestamp → datetime
+                from datetime import timezone
+                candle_dt = datetime.fromtimestamp(candle_ts / 1000, tz=timezone.utc)
+            elif isinstance(candle_ts, datetime):
+                candle_dt = candle_ts
+            else:
+                candle_dt = datetime.now(timezone.utc)
+
+            bar_close = float(candle.get("close", 0.0))
+            bar_high = float(candle.get("high", 0.0))
+            bar_low = float(candle.get("low", 0.0))
+            bar_vol = float(candle.get("volume", 0.0))
+
+            # Compute RSI from recent 5m buffer (causal: only closed bars)
+            rsi_val = 0.0
+            if not self.buffer_5m.empty and len(self.buffer_5m) >= 15:
+                try:
+                    rsi_arr = compute_rsi_wilders(
+                        self.buffer_5m["close"].values.astype(np.float64), period=14
+                    )
+                    rsi_val = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 0.0
+                except Exception:
+                    pass
+
+            for trade in self._active_trades:
+                trade_id = trade.get("rl_trade_id") or trade.get("order_id", "")
+                if not trade_id:
+                    continue
+                entry_price = float(trade.get("entry", bar_close))
+                entry_time = trade.get("entry_time")
+                if entry_time is None:
+                    continue
+
+                bars_held = max(0, int(
+                    (candle_dt - entry_time).total_seconds() // 300
+                ))
+                direction = trade.get("direction", "long")
+                current_sl = float(trade.get("sl", 0.0))
+                sl_dist_pct = 0.0
+                unrealized_pnl_pct = 0.0
+                if entry_price > 0 and bar_close > 0:
+                    if direction == "long":
+                        unrealized_pnl_pct = (bar_close - entry_price) / entry_price
+                        sl_dist_pct = max((bar_close - current_sl) / bar_close, 0.0)
+                    else:
+                        unrealized_pnl_pct = (entry_price - bar_close) / entry_price
+                        sl_dist_pct = max((current_sl - bar_close) / bar_close, 0.0)
+
+                try:
+                    self.journal.record_bar(
+                        trade_id=trade_id,
+                        bar_index=bars_held,
+                        timestamp=candle_dt,
+                        close=bar_close,
+                        high=bar_high,
+                        low=bar_low,
+                        volume=bar_vol,
+                        unrealized_pnl_pct=unrealized_pnl_pct,
+                        sl_distance_pct=sl_dist_pct,
+                        rsi_5m=rsi_val / 100.0,  # normalise to [0,1]
+                    )
+                except Exception as exc:
+                    self.logger.debug("journal.record_bar error: %s", exc)
+
+                # ── Shadow exit prediction (logs only, never acts) ────
+                if (self.rl_suite is not None and
+                        hasattr(self.rl_suite, "predict_early_exit")):
+                    try:
+                        bar_features = {
+                            "bars_held": float(bars_held),
+                            "bar_unrealized_rr": unrealized_pnl_pct / max(float(trade.get("risk_pct", 0.01)), 1e-6),
+                            "sl_distance_pct": sl_dist_pct,
+                            "max_favorable_seen": self.journal._max_favorable.get(trade_id, 0.0),
+                            "be_triggered": float(trade.get("be_triggered", False)),
+                            "asset_class_id": float({"crypto": 0, "forex": 1, "stocks": 2, "commodities": 3}.get(self.asset_class, 0)),
+                            "rsi_5m": rsi_val / 100.0,
+                        }
+                        should_exit, exit_conf = self.rl_suite.predict_early_exit(bar_features)
+                        if should_exit:
+                            self.logger.info(
+                                "EXIT_SHADOW %s %s bar=%d conf=%.3f unrealized=%.2f%% "
+                                "[SHADOW MODE — no action taken]",
+                                symbol, direction.upper(), bars_held, exit_conf,
+                                unrealized_pnl_pct * 100,
+                            )
+                    except Exception as exc:
+                        self.logger.debug("shadow exit prediction error: %s", exc)
 
     # ── Simple alignment score ────────────────────────────────────
 
@@ -1909,6 +2006,34 @@ class PaperBot:
         self._active_trades.append(trade_info)
         self._last_entry_time = datetime.now(timezone.utc)
         self._last_trade_style = style
+
+        # ── Trade Journal: record trade open ─────────────────────────
+        trade_id_for_journal = rl_trade_id or order_id or f"t_{len(self._active_trades)}"
+        # Backfill trade_id so candle handler and close hook use same key
+        self._active_trades[-1]["rl_trade_id"] = trade_id_for_journal
+        if self.journal is not None:
+            try:
+                rr_target = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 3.0
+                self.journal.open_trade(
+                    trade_id=trade_id_for_journal,
+                    symbol=symbol,
+                    asset_class=self.asset_class,
+                    direction=direction,
+                    style=style,
+                    tier=tier,
+                    entry_time=datetime.now(timezone.utc),
+                    entry_price=price,
+                    sl_original=sl,
+                    tp=tp,
+                    score=score,
+                    rr_target=rr_target,
+                    leverage=used_leverage,
+                    risk_pct=risk_pct,
+                    entry_features=sig.get("features", {}),
+                )
+            except Exception as exc:
+                self.logger.debug("journal.open_trade error: %s", exc)
+
         self.logger.info(
             "OPEN [%s|%s] %s %s @ %.6f | SL=%.6f TP=%.6f RR=%.1f | qty=%.4f "
             "risk=%.2f%% lev=%dx score=%.2f bal=%.2f order=%s",
@@ -3231,6 +3356,11 @@ class LiveMultiBotRunner:
         for bot in self.bots:
             bot.paper_grid = self.paper_grid
 
+        # ── Trade Journal (lifecycle logger for ML training data) ─
+        self.journal = TradeJournal("trade_journal/journal.db")
+        for bot in self.bots:
+            bot.journal = self.journal
+
         # Feed status per symbol: connected | reconnecting_N | disconnected | polling
         self.ws_status: dict[str, str] = {}
         for bot in bots:
@@ -3523,6 +3653,52 @@ class LiveMultiBotRunner:
                     hit_sl=(pnl_pct < 0),
                 )
                 bot.brain.record_outcome(trade_id=trade["rl_trade_id"], reward=shaped_rew, done=True)
+
+            # ── Trade Journal: record trade close ─────────────────────
+            if bot.journal is not None:
+                trade_id_j = trade.get("rl_trade_id", "")
+                if trade_id_j:
+                    try:
+                        entry_price_j = float(trade.get("entry", exit_price))
+                        sl_dist_j = abs(entry_price_j - float(trade.get("sl", entry_price_j)))
+                        rr_actual = (
+                            (abs(exit_price - entry_price_j) / sl_dist_j)
+                            if sl_dist_j > 0 else 0.0
+                        )
+                        rr_target = abs(
+                            float(trade.get("tp", entry_price_j)) - entry_price_j
+                        ) / sl_dist_j if sl_dist_j > 0 else 3.0
+
+                        outcome_str = "win" if net_pnl > 0 else "loss"
+                        # Determine exit reason from price proximity to SL/TP
+                        tp_price = float(trade.get("tp", 0.0))
+                        sl_price = float(trade.get("sl", 0.0))
+                        if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.003:
+                            exit_reason = "tp_hit"
+                        elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.003:
+                            exit_reason = "sl_hit"
+                        else:
+                            exit_reason = "manual"
+
+                        # MFE/MAE from journal's running tracker
+                        max_fav = bot.journal._max_favorable.get(trade_id_j, abs(pnl_pct / 100))
+                        bars_held_j = trade.get("bars_held", 0)
+
+                        bot.journal.close_trade(
+                            trade_id=trade_id_j,
+                            exit_time=datetime.now(timezone.utc),
+                            exit_price=exit_price,
+                            outcome=outcome_str,
+                            exit_reason=exit_reason,
+                            bars_held=bars_held_j,
+                            pnl_pct=pnl_pct / 100.0,
+                            rr_actual=rr_actual if net_pnl > 0 else -rr_actual,
+                            max_favorable_pct=max_fav,
+                            max_adverse_pct=min(pnl_pct / 100.0, 0.0),
+                            be_triggered=bool(trade.get("be_triggered", False)),
+                        )
+                    except Exception as exc:
+                        bot.logger.debug("journal.close_trade error: %s", exc)
 
             # === CLEANUP ===
             sl_order_id = trade.get("sl_order_id")
