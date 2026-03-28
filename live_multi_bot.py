@@ -212,6 +212,23 @@ ASSET_MAX_LEVERAGE: dict[str, int] = {
     "crypto": 10, "forex": 15, "stocks": 4, "commodities": 10,
 }
 
+# ── Per-Class Tier Flag Configuration ────────────────────────────
+# Flags to SKIP for tier gate checks (still contribute to alignment score).
+# Tick-volume classes skip volume_ok since it's unreliable without real volume.
+TIER_SKIP_FLAGS: dict[str, list[str]] = {
+    "crypto": [],
+    "forex": ["volume_ok"],
+    "stocks": [],
+    "commodities": ["volume_ok"],
+}
+
+# Max new signals per SYMBOL per 4-hour window, by asset class (safety throttle).
+# Per-symbol, not per-class: 28 forex pairs × 3 = 84 theoretical max per class.
+# Portfolio-level protection comes from circuit breakers (daily -3%, weekly -5%).
+MAX_SIGNALS_PER_SYMBOL_4H: dict[str, int] = {
+    "crypto": 5, "forex": 3, "stocks": 5, "commodities": 2,
+}
+
 # ── Asset-Class IDs for RL Brain ─────────────────────────────────
 ASSET_CLASS_ID: dict[str, float] = {
     "crypto": 0.0, "forex": 0.25, "stocks": 0.5, "commodities": 0.75,
@@ -450,6 +467,13 @@ class PaperBot:
         # Pending signal for real-time entry (set by on_candle, consumed by on_tick)
         self._pending_signal: dict[str, Any] | None = None
 
+        # Per-class tier flag skip list and signal rate limiting
+        self._tier_skip_flags: set[str] = set(
+            TIER_SKIP_FLAGS.get(asset_class, [])
+        )
+        self._max_signals_per_4h: int = MAX_SIGNALS_PER_SYMBOL_4H.get(asset_class, 5)
+        self._recent_signal_times: list[datetime] = []
+
         # Cooldown: dynamic per trade style
         self._last_entry_time: datetime | None = None
         self._entry_cooldown = timedelta(hours=1)
@@ -631,9 +655,9 @@ class PaperBot:
         Returns (score 0–1, direction, components_dict).
         """
         swing_len = self.swing_length
-        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
-        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
-        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+        fvg_thresh = self.fvg_threshold
+        ob_lookback = self.ob_lookback
+        liq_range = self.liq_range
 
         # Components tracked for tier classification (expanded for AAA++)
         comp: dict[str, Any] = {
@@ -1067,9 +1091,9 @@ class PaperBot:
         Returns ``(sl, tp)`` or ``None`` when valid levels cannot be found.
         """
         swing_len = self.swing_length
-        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
-        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
-        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+        fvg_thresh = self.fvg_threshold
+        ob_lookback = self.ob_lookback
+        liq_range = self.liq_range
 
         if len(self.buffer_5m) < swing_len * 2:
             return None
@@ -1307,11 +1331,9 @@ class PaperBot:
             feat["volume_ratio"] = 1.0
 
         # ── ADX on 1H (normalized by /50, capped at 2.0) ───────────
-        # Training data has adx_1h ≈ 0 for forex/stocks/commodities (only crypto has real values)
-        if self.asset_class == "crypto":
-            feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
-        else:
-            feat["adx_1h"] = 0.0
+        # Training data computes real ADX for ALL classes (default 0.5, real ~0.3-0.8)
+        # Models trained Mar 27 before commit 45ebeb5 — expect real ADX for all classes
+        feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
 
         # ── Alignment score ─────────────────────────────────────────
         feat["alignment_score"] = float(score)
@@ -1434,12 +1456,14 @@ class PaperBot:
 
         # ── Volume filter (basic pre-check – detailed scoring in alignment) ─
         # Quick reject if volume is clearly dead (< 0.5x avg)
+        # Skip for tick-volume classes (forex/commodities) — meaningless with tick data
         # The full 3-layer volume scoring happens in _multi_tf_alignment_score
-        volumes = [c["volume"] for c in buf[-20:]]
-        avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
-        if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
-            self._pending_signal = None
-            return
+        if self.asset_class not in ("forex", "commodities"):
+            volumes = [c["volume"] for c in buf[-20:]]
+            avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
+            if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
+                self._pending_signal = None
+                return
 
         # ── Multi-TF alignment score (granular) ───────────────────
         score, direction, components = self._multi_tf_alignment_score(candle)
@@ -1590,11 +1614,31 @@ class PaperBot:
             }
             _passing = sum(1 for v in _flags.values() if v)
             _failing = [k for k, v in _flags.items() if not v]
+            _skipped = [k for k in _failing if k in self._tier_skip_flags]
+            _real_failing = [k for k in _failing if k not in self._tier_skip_flags]
             self.logger.info(
-                "NEAR-MISS TIER %s | class=%s score=%.3f RR=%.1f dir=%s | flags=%d/11 | missing=%s",
-                symbol, self.asset_class, score, rr, direction, _passing, _failing,
+                "NEAR-MISS TIER %s | class=%s score=%.3f RR=%.1f dir=%s | "
+                "flags=%d/11 | missing=%s | skipped=%s",
+                symbol, self.asset_class, score, rr, direction,
+                _passing, _real_failing, _skipped,
             )
             return
+
+        # ── Signal rate limiting (per-class safety throttle) ──────
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=4)
+        self._recent_signal_times = [
+            t for t in self._recent_signal_times if t > cutoff
+        ]
+        if len(self._recent_signal_times) >= self._max_signals_per_4h:
+            self.logger.info(
+                "RATE-LIMITED %s | class=%s | %d signals in 4h (max=%d)",
+                symbol, self.asset_class,
+                len(self._recent_signal_times), self._max_signals_per_4h,
+            )
+            self._pending_signal = None
+            return
+        self._recent_signal_times.append(now)
 
         # ── Final style constraint validation ─────────────────────
         if not self._validate_style_constraints(style, price, sl, tp):
@@ -2460,7 +2504,7 @@ class PaperBot:
                 if pd.isna(top_val) or pd.isna(bottom_val) or pd.isna(fvg_dir) or fvg_dir == 0:
                     continue
                 gap_size = abs(top_val - bottom_val) / price if price > 0 else 0
-                if gap_size < FIXED_SMC_PARAMS["fvg_threshold"]:
+                if gap_size < self.fvg_threshold:
                     continue
                 if bias == "bullish" and fvg_dir > 0:
                     return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val)}
@@ -2524,38 +2568,47 @@ class PaperBot:
 
         AAA++ requires ALL components aligned – the absolute best setups only.
         AAA+ requires core SMC alignment + strong bias.
+        Per-class skip_flags allow tick-volume classes to bypass unreliable gates.
 
         No A or SPEC tiers – only high-probability trades.
         """
+        skip = self._tier_skip_flags
+
+        def _flag(name: str) -> bool:
+            """Check flag, returning True (pass) if flag is in skip list."""
+            if name in skip:
+                return True
+            return bool(components.get(name, False))
+
         # AAA++: Sniper setup – every single component must be True
         t = TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]
         if (score >= t["min_score"]
                 and rr >= t["min_rr"]
-                and components.get("bias_strong", False)
-                and components.get("h4_confirms", False)
-                and components.get("h4_poi", False)
-                and components.get("h1_confirms", False)
-                and components.get("h1_choch", False)
-                and components.get("entry_zone") is not None
-                and components.get("precision_trigger", False)
-                and components.get("volume_ok", False)
-                and components.get("adx_strong", False)
-                and components.get("session_optimal", False)
-                and components.get("zone_quality_ok", False)
-                and components.get("momentum_confluent", False)
-                and components.get("tf_agreement", 0) >= 4):
+                and _flag("bias_strong")
+                and _flag("h4_confirms")
+                and _flag("h4_poi")
+                and _flag("h1_confirms")
+                and _flag("h1_choch")
+                and (components.get("entry_zone") is not None or "entry_zone" in skip)
+                and _flag("precision_trigger")
+                and _flag("volume_ok")
+                and _flag("adx_strong")
+                and _flag("session_optimal")
+                and _flag("zone_quality_ok")
+                and _flag("momentum_confluent")
+                and (components.get("tf_agreement", 0) >= 4 or "tf_agreement" in skip)):
             return TIER_AAA_PLUS_PLUS
 
         # AAA+: Premium setup – core SMC alignment + strong bias
         t = TIER_THRESHOLDS[TIER_AAA_PLUS]
         if (score >= t["min_score"]
                 and rr >= t["min_rr"]
-                and components.get("bias_strong", False)
-                and components.get("h4_confirms", False)
-                and components.get("h1_confirms", False)
-                and components.get("precision_trigger", False)
-                and components.get("volume_ok", False)
-                and components.get("adx_strong", False)):
+                and _flag("bias_strong")
+                and _flag("h4_confirms")
+                and _flag("h1_confirms")
+                and _flag("precision_trigger")
+                and _flag("volume_ok")
+                and _flag("adx_strong")):
             return TIER_AAA_PLUS
 
         return ""  # Don't trade – quality too low
@@ -2567,9 +2620,9 @@ class PaperBot:
     ) -> float | None:
         """Extract SL from a given timeframe's SMC indicators."""
         swing_len = self.swing_length
-        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
-        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
-        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+        fvg_thresh = self.fvg_threshold
+        ob_lookback = self.ob_lookback
+        liq_range = self.liq_range
 
         if len(buffer) < swing_len * 2:
             return None
@@ -2627,9 +2680,9 @@ class PaperBot:
     ) -> float | None:
         """Extract TP from a given timeframe's SMC indicators."""
         swing_len = self.swing_length
-        fvg_thresh = FIXED_SMC_PARAMS["fvg_threshold"]
-        ob_lookback = FIXED_SMC_PARAMS["order_block_lookback"]
-        liq_range = FIXED_SMC_PARAMS["liquidity_range_percent"]
+        fvg_thresh = self.fvg_threshold
+        ob_lookback = self.ob_lookback
+        liq_range = self.liq_range
 
         if len(buffer) < swing_len * 2:
             return None

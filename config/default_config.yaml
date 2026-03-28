@@ -114,6 +114,25 @@ smc_profiles:
     min_daily_atr_pct: 0.006
     min_5m_atr_pct: 0.0008
 
+# ── Per-Class Tier Flag Configuration ──────────────────────────────
+# Flags to SKIP per asset class for AAA++ / AAA+ tier gates.
+# Skipped flags still contribute to the alignment SCORE (weighted),
+# but are not required as boolean gates for tier classification.
+tier_flags:
+  skip_flags:
+    crypto: []                    # Real volume — all flags required
+    forex: [volume_ok]            # Tick volume — skip volume gate
+    stocks: []                    # Real volume — all flags required
+    commodities: [volume_ok]      # Tick volume — skip volume gate
+  # Safety throttle: max new signals per SYMBOL per 4-hour window (by asset class).
+  # Note: Python module constants (TIER_SKIP_FLAGS, MAX_SIGNALS_PER_SYMBOL_4H) are
+  # the runtime source of truth. Edit those in live_multi_bot.py if tuning.
+  max_signals_per_symbol_4h:
+    crypto: 5
+    forex: 3                      # Conservative until forex signals are validated
+    stocks: 5
+    commodities: 2
+
 # ── Tuning Ranges (Optuna overrides) ─────────────────────────────
 tuning:
   alignment_threshold_min: 0.60
