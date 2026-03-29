@@ -300,6 +300,6 @@ journal:
 dashboard:
   pin: "1234"
   username: "admin"
-  password: "Tr4d3B0t!2026"       # CHANGE THIS on server after deployment
+  password: "changeme"             # Override on server — never commit real password
   host: "0.0.0.0"
   port: 8080

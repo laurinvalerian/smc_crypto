@@ -33,11 +33,15 @@ try:
         _cfg = yaml.safe_load(_f)
     DASHBOARD_PIN = str(_cfg.get("dashboard", {}).get("pin", "1234"))
     DASHBOARD_USER = str(_cfg.get("dashboard", {}).get("username", "admin"))
-    DASHBOARD_PASS = str(_cfg.get("dashboard", {}).get("password", "changeme123"))
+    DASHBOARD_PASS = str(_cfg.get("dashboard", {}).get("password", "changeme"))
 except Exception:
     DASHBOARD_PIN = "1234"
     DASHBOARD_USER = "admin"
-    DASHBOARD_PASS = "changeme123"
+    DASHBOARD_PASS = "changeme"
+
+# Environment variables override config (so server credentials survive git pull)
+DASHBOARD_USER = os.environ.get("DASH_USER", DASHBOARD_USER)
+DASHBOARD_PASS = os.environ.get("DASH_PASS", DASHBOARD_PASS)
 
 app.secret_key = secrets.token_hex(32)
 app.permanent_session_lifetime = timedelta(hours=24)
