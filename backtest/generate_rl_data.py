@@ -108,6 +108,114 @@ MAX_FORWARD_BARS = 576
 # Feature names
 FEATURE_NAMES: list[str] = []  # Populated at module level below
 
+# Module-level cache for symbol ranks (computed once per training run)
+_symbol_ranks_cache: dict[str, dict[str, dict[str, float]]] = {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Symbol Ranks (per-class percentile features)
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_symbol_ranks(asset_class: str) -> dict[str, dict[str, float]]:
+    """Compute per-symbol percentile ranks within an asset class.
+
+    Computes ATR, volume, and spread statistics for all instruments in the
+    given asset class, then returns percentile ranks [0, 1] for each.
+
+    Results are cached so they are computed once per training run.
+
+    Returns:
+        Dict of symbol -> {"volatility_rank": float, "liquidity_rank": float,
+                           "spread_rank": float}
+    """
+    if asset_class in _symbol_ranks_cache:
+        return _symbol_ranks_cache[asset_class]
+
+    data_dir = Path(f"data/{asset_class}")
+    if not data_dir.exists():
+        _symbol_ranks_cache[asset_class] = {}
+        return {}
+
+    parquets = sorted(data_dir.glob("*_5m.parquet"))
+    if not parquets:
+        _symbol_ranks_cache[asset_class] = {}
+        return {}
+
+    # Compute raw stats per instrument
+    stats: list[tuple[str, float, float, float]] = []  # (sym, atr_pct, vol_usd, spread_pct)
+
+    for p in parquets:
+        sym = p.stem.replace("_5m", "")
+        try:
+            df = pd.read_parquet(p)
+        except Exception:
+            continue
+        if len(df) < 100:
+            continue
+
+        close = pd.to_numeric(df["close"], errors="coerce").values.astype(float)
+        high = pd.to_numeric(df["high"], errors="coerce").values.astype(float)
+        low = pd.to_numeric(df["low"], errors="coerce").values.astype(float)
+
+        # ATR % (14-period average true range as fraction of price)
+        if len(close) > 14:
+            tr = np.maximum(
+                high[1:] - low[1:],
+                np.maximum(np.abs(high[1:] - close[:-1]),
+                           np.abs(low[1:] - close[:-1])),
+            )
+            atr_mean = float(np.mean(tr[:min(len(tr), 5000)]))
+            price_mean = float(np.mean(close[1:min(len(close), 5001)]))
+            atr_pct = atr_mean / price_mean if price_mean > 0 else 0.0
+        else:
+            atr_pct = 0.0
+
+        # Volume USD (0 for forex/commodities tick volume)
+        vol_usd = 0.0
+        if "volume" in df.columns and asset_class not in ("forex", "commodities"):
+            vol = pd.to_numeric(df["volume"], errors="coerce").values.astype(float)
+            vol_usd = float(np.mean(vol[:min(len(vol), 5000)] * close[:min(len(close), 5000)]))
+
+        # Spread % (average bar range as fraction of close)
+        ranges = high - low
+        mask = close > 0
+        spread_pct = float(np.mean(ranges[mask] / close[mask])) if mask.any() else 0.0
+
+        stats.append((sym, atr_pct, vol_usd, spread_pct))
+
+    if not stats:
+        _symbol_ranks_cache[asset_class] = {}
+        return {}
+
+    # Compute percentile ranks
+    symbols = [s[0] for s in stats]
+    atr_vals = np.array([s[1] for s in stats])
+    vol_vals = np.array([s[2] for s in stats])
+    spread_vals = np.array([s[3] for s in stats])
+
+    def _percentile_rank(values: np.ndarray) -> np.ndarray:
+        """Compute percentile rank [0, 1] for each value."""
+        n = len(values)
+        if n <= 1:
+            return np.full(n, 0.5)
+        order = values.argsort().argsort()  # rank positions
+        return order.astype(float) / (n - 1)
+
+    atr_ranks = _percentile_rank(atr_vals)
+    vol_ranks = _percentile_rank(vol_vals)
+    spread_ranks = _percentile_rank(spread_vals)
+
+    result: dict[str, dict[str, float]] = {}
+    for i, sym in enumerate(symbols):
+        result[sym] = {
+            "volatility_rank": float(atr_ranks[i]),
+            "liquidity_rank": float(vol_ranks[i]),
+            "spread_rank": float(spread_ranks[i]),
+        }
+
+    _symbol_ranks_cache[asset_class] = result
+    return result
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Symbol Discovery
@@ -353,12 +461,17 @@ def extract_features_for_instrument(
     asset_class: str,
     smc_params: dict[str, Any],
     signal_window_start: pd.Timestamp | None = None,
+    symbol: str | None = None,
 ) -> pd.DataFrame:
     """
     Extract RL feature matrix for all 5m bars of one instrument.
 
-    Returns DataFrame with 40 feature columns + timestamp column.
+    Returns DataFrame with 43 feature columns + timestamp column.
     Features use ONLY causal (past) data — safe for inference.
+
+    The 3 symbol-level features (volatility_rank, liquidity_rank,
+    spread_rank) are percentile ranks [0, 1] within the asset class,
+    computed once per training run and cached.
     """
     df_5m = frames.get("5m")
     if df_5m is None or df_5m.empty or len(df_5m) < 50:
@@ -811,6 +924,23 @@ def extract_features_for_instrument(
         "liq_above_count": liq_above_count,
         "liq_below_count": liq_below_count,
     }
+
+    # ── Symbol-Level Features (3) ───────────────────────────────
+    # Percentile ranks within asset class — constant per instrument
+    if symbol is not None:
+        ranks = compute_symbol_ranks(asset_class)
+        sym_ranks = ranks.get(symbol, {})
+    else:
+        sym_ranks = {}
+    features["symbol_volatility_rank"] = np.full(
+        n, sym_ranks.get("volatility_rank", 0.5), dtype=np.float32,
+    )
+    features["symbol_liquidity_rank"] = np.full(
+        n, sym_ranks.get("liquidity_rank", 0.5), dtype=np.float32,
+    )
+    features["symbol_spread_rank"] = np.full(
+        n, sym_ranks.get("spread_rank", 0.5), dtype=np.float32,
+    )
 
     df = pd.DataFrame(features)
     df.insert(0, "timestamp", df_5m["timestamp"].values)
@@ -1347,6 +1477,7 @@ def process_instrument(
     features_df = extract_features_for_instrument(
         frames, causal_indicators, asset_class, smc_params,
         signal_window_start=window_start_ts,
+        symbol=symbol,
     )
     if features_df.empty:
         logger.warning("  %s: No features extracted — skipping", symbol)

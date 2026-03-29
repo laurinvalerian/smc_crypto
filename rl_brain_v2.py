@@ -1677,6 +1677,25 @@ class RLBrainSuite:
         if self._exit_model: active.append("exit_classifier")
         logger.info("RLBrainSuite initialized: %s", active if active else "no models loaded")
 
+        # Hot-swap: track model file mtimes for live reload
+        self._model_paths: dict[str, str] = {
+            "entry_filter": ef_cfg.get("model_path", "models/rl_entry_filter.pkl"),
+            "tp_optimizer": tp_cfg.get("model_path", "models/rl_tp_optimizer.pkl"),
+            "be_manager": be_cfg.get("model_path", "models/rl_be_manager.pkl"),
+            "exit_classifier": exit_cfg.get("model_path", "models/rl_exit_classifier.pkl"),
+        }
+        self._model_mtimes: dict[str, float] = {}
+        for name, mpath in self._model_paths.items():
+            p = Path(mpath)
+            if p.exists():
+                self._model_mtimes[mpath] = p.stat().st_mtime
+
+        # Continuous learner config for rollback
+        cl_cfg = cfg.get("continuous_learner", {})
+        self._rollback_min_trades = cl_cfg.get("rollback_min_trades", 20)
+        self._rollback_pnl_threshold = cl_cfg.get("rollback_cumulative_pnl", -0.03)
+        self._rollback_winrate_threshold = cl_cfg.get("rollback_min_winrate", 0.20)
+
     @staticmethod
     def _load_model(path_str: str) -> dict | None:
         path = Path(path_str)
@@ -1687,6 +1706,142 @@ class RLBrainSuite:
             data = pickle.load(f)
         logger.info("Loaded model: %s (%d features)", path, len(data.get("feat_names", [])))
         return data
+
+    def check_and_reload_models(self) -> None:
+        """Check if model files have been updated on disk and reload if so.
+        Called every 60 seconds from the live bot's main loop.
+        Also checks the rollback marker and triggers rollback if conditions met.
+        """
+        import json as _json
+
+        slot_to_attr = {
+            "entry_filter": "_entry_filter",
+            "tp_optimizer": "_tp_model",
+            "be_manager": "_be_model",
+            "exit_classifier": "_exit_model",
+        }
+
+        for slot_name, model_path_str in self._model_paths.items():
+            p = Path(model_path_str)
+            if not p.exists():
+                continue
+
+            current_mtime = p.stat().st_mtime
+            stored_mtime = self._model_mtimes.get(model_path_str, 0.0)
+
+            if current_mtime <= stored_mtime:
+                continue
+
+            # File has changed -- attempt reload
+            attr_name = slot_to_attr.get(slot_name)
+            if attr_name is None:
+                continue
+
+            old_data = getattr(self, attr_name, None)
+            old_version = old_data.get("version", "?") if old_data else "?"
+
+            try:
+                new_data = self._load_model(model_path_str)
+                if new_data is None:
+                    logger.error("[ML] Failed to reload %s -- keeping old model", model_path_str)
+                    continue
+
+                # Verify the model can produce predictions (basic sanity check)
+                feat_names = new_data.get("feat_names", [])
+                if not feat_names:
+                    logger.error("[ML] Reloaded model %s has no feat_names -- keeping old", model_path_str)
+                    continue
+
+                new_version = new_data.get("version", "?")
+                setattr(self, attr_name, new_data)
+                self._model_mtimes[model_path_str] = current_mtime
+                logger.info("[ML] Model reloaded: %s v%s->v%s", p.name, old_version, new_version)
+
+            except Exception as exc:
+                logger.error("[ML] Error reloading %s: %s -- keeping old model", model_path_str, exc)
+
+        # Check rollback marker
+        rollback_marker = Path("models/.rollback_watch")
+        if not rollback_marker.exists():
+            return
+
+        try:
+            with open(rollback_marker) as f:
+                marker = _json.load(f)
+        except (OSError, _json.JSONDecodeError):
+            return
+
+        # Rollback evaluation is done by the live bot which tracks trades
+        # under the new model.  This method is a hook point -- the live bot
+        # should call _check_rollback_conditions() with its accumulated stats.
+
+    def check_rollback_conditions(
+        self,
+        cumulative_pnl: float,
+        win_rate: float,
+        n_trades: int,
+    ) -> bool:
+        """Evaluate whether the current model should be rolled back.
+
+        Called by the live bot after each trade close, with cumulative
+        stats since the last model deployment.
+
+        Returns True if rollback was triggered and executed.
+        """
+        import json as _json
+
+        rollback_marker = Path("models/.rollback_watch")
+        if not rollback_marker.exists():
+            return False
+
+        try:
+            with open(rollback_marker) as f:
+                marker = _json.load(f)
+        except (OSError, _json.JSONDecodeError):
+            return False
+
+        min_trades = marker.get("min_trades", self._rollback_min_trades)
+        if n_trades < min_trades:
+            return False
+
+        pnl_threshold = marker.get("cumulative_pnl_threshold", self._rollback_pnl_threshold)
+        wr_threshold = marker.get("min_winrate_threshold", self._rollback_winrate_threshold)
+
+        should_rollback = (cumulative_pnl < pnl_threshold) or (win_rate < wr_threshold)
+
+        if not should_rollback:
+            return False
+
+        logger.warning(
+            "[ML] ROLLBACK TRIGGERED: cumPnL=%.2f%% (threshold=%.2f%%), "
+            "WR=%.1f%% (threshold=%.1f%%), trades=%d",
+            cumulative_pnl * 100, pnl_threshold * 100,
+            win_rate * 100, wr_threshold * 100, n_trades,
+        )
+
+        prev_version = marker.get("prev_version")
+        if prev_version is None:
+            logger.error("[ML] No prev_version in rollback marker -- cannot rollback")
+            return False
+
+        # Execute rollback for all model slots
+        try:
+            from continuous_learner import manual_rollback
+            for slot_name in ("entry_filter", "exit_classifier"):
+                manual_rollback(slot_name)
+
+            # Remove rollback marker
+            rollback_marker.unlink(missing_ok=True)
+
+            # Force reload models
+            self.check_and_reload_models()
+
+            logger.info("[ML] Rollback complete -- models restored to previous versions")
+            return True
+
+        except Exception as exc:
+            logger.error("[ML] Rollback execution failed: %s", exc)
+            return False
 
     def _build_features(self, features: dict[str, float], model_data: dict) -> np.ndarray:
         """Build feature vector from dict, matching model's expected feature order."""

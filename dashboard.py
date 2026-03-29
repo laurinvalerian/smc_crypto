@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import re
+import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -371,9 +372,199 @@ def _aggregate_stats() -> dict:
     }
 
 
+def _get_ml_metrics() -> dict:
+    """Build ML model health payload."""
+    models_dir = Path("models")
+    retrain_log = Path("backtest/results/rl/retrain_log.jsonl")
+    rollback_watch = models_dir / ".rollback_watch"
+
+    # Try to import SCHEMA_VERSION from features module
+    feature_schema = None
+    try:
+        from features.feature_extractor import SCHEMA_VERSION as _SV
+        feature_schema = _SV
+    except Exception:
+        pass
+
+    model_files = {
+        "entry_filter": "models/rl_entry_filter.pkl",
+        "exit_classifier": "models/rl_exit_classifier.pkl",
+        "dqn_exit_manager": "models/dqn_exit_manager.zip",
+    }
+
+    models_out = {}
+    for name, rel_path in model_files.items():
+        p = Path(rel_path)
+        if p.exists():
+            stat = p.stat()
+            info: dict = {
+                "path": rel_path,
+                "exists": True,
+                "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            if feature_schema is not None:
+                info["schema_version"] = feature_schema
+        else:
+            info = {"path": rel_path, "exists": False}
+        models_out[name] = info
+
+    # Last retrain entry
+    last_retrain = None
+    if retrain_log.exists():
+        try:
+            with open(retrain_log) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            if lines:
+                last_retrain = json.loads(lines[-1])
+        except Exception:
+            pass
+
+    # Rollback watch file
+    rollback_data = None
+    if rollback_watch.exists():
+        try:
+            with open(rollback_watch) as f:
+                rollback_data = f.read().strip() or None
+        except Exception:
+            pass
+
+    return {
+        "models": models_out,
+        "last_retrain": last_retrain,
+        "rollback_watch": rollback_data,
+        "feature_schema": feature_schema,
+    }
+
+
+def _get_journal_recent() -> dict:
+    """Return last 50 closed trades from journal SQLite DB plus aggregate stats."""
+    db_path = Path("trade_journal/journal.db")
+    empty = {"trades": [], "total_trades": 0, "stats": {"win_rate": 0.0, "avg_rr": 0.0, "total_pnl_pct": 0.0}}
+    if not db_path.exists():
+        return empty
+
+    cols = [
+        "trade_id", "symbol", "asset_class", "direction",
+        "entry_time", "exit_time", "entry_price", "exit_price",
+        "pnl_pct", "rr_actual", "rr_target", "outcome",
+        "exit_reason", "bars_held", "tier", "score",
+    ]
+
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # Total closed trades
+            cur.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL")
+            total_trades = cur.fetchone()[0]
+
+            # Last 50
+            col_sql = ", ".join(c for c in cols if c in _journal_columns(cur))
+            if not col_sql:
+                return empty
+            cur.execute(
+                f"SELECT {col_sql} FROM trades WHERE exit_time IS NOT NULL "
+                "ORDER BY exit_time DESC LIMIT 50"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+
+            # Aggregate stats
+            cur.execute(
+                "SELECT COUNT(*) as n, SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) as wins, "
+                "AVG(rr_actual) as avg_rr, SUM(pnl_pct) as total_pnl "
+                "FROM trades WHERE exit_time IS NOT NULL"
+            )
+            agg = cur.fetchone()
+            n = agg[0] or 0
+            wins = agg[1] or 0
+            avg_rr = round(float(agg[2]), 3) if agg[2] is not None else 0.0
+            total_pnl = round(float(agg[3]), 4) if agg[3] is not None else 0.0
+            win_rate = round(wins / n, 4) if n > 0 else 0.0
+
+    except Exception:
+        return empty
+
+    return {
+        "trades": rows,
+        "total_trades": total_trades,
+        "stats": {
+            "win_rate": win_rate,
+            "avg_rr": avg_rr,
+            "total_pnl_pct": total_pnl,
+        },
+    }
+
+
+def _journal_columns(cur: sqlite3.Cursor) -> set:
+    """Return the set of column names present in the trades table."""
+    try:
+        cur.execute("PRAGMA table_info(trades)")
+        return {row[1] for row in cur.fetchall()}
+    except Exception:
+        return set()
+
+
+def _get_trade_detail(trade_id: str) -> dict:
+    """Return bar-by-bar data for one trade from the journal DB."""
+    db_path = Path("trade_journal/journal.db")
+    not_found = {"trade_id": trade_id, "bars": [], "metadata": {}}
+    if not db_path.exists():
+        return not_found
+
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # Metadata from trades table
+            cur.execute(
+                "SELECT * FROM trades WHERE trade_id = ? LIMIT 1", (trade_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return not_found
+            metadata = dict(row)
+
+            # Bar-by-bar data from trade_bars table (if it exists)
+            bars = []
+            try:
+                cur.execute(
+                    "SELECT * FROM trade_bars WHERE trade_id = ? ORDER BY bar_index ASC",
+                    (trade_id,),
+                )
+                bars = [dict(r) for r in cur.fetchall()]
+            except sqlite3.OperationalError:
+                # Table doesn't exist yet
+                pass
+
+    except Exception:
+        return not_found
+
+    return {"trade_id": trade_id, "bars": bars, "metadata": metadata}
+
+
 @app.route("/api/stats")
 def api_stats():
     return jsonify(_aggregate_stats())
+
+
+@app.route("/api/ml-metrics")
+def api_ml_metrics():
+    return jsonify(_get_ml_metrics())
+
+
+@app.route("/api/journal/recent")
+def api_journal_recent():
+    return jsonify(_get_journal_recent())
+
+
+@app.route("/api/journal/trade/<trade_id>")
+def api_journal_trade(trade_id: str):
+    return jsonify(_get_trade_detail(trade_id))
 
 
 @app.route("/")
