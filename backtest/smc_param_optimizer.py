@@ -477,13 +477,15 @@ def _evaluate_params(
             asset_class=representative_symbols[0][1] if representative_symbols else "crypto",
         )
 
-        if results_df.empty or "pnl_pct" not in results_df.columns:
+        # Column is "pnl" (absolute $), not "pnl_pct"
+        pnl_col = "pnl" if "pnl" in results_df.columns else "pnl_pct"
+        if results_df.empty or pnl_col not in results_df.columns:
             oos_profit_factors.append(0.0)
             continue
 
         # Compute profit factor
-        gross_profit = results_df.loc[results_df["pnl_pct"] > 0, "pnl_pct"].sum()
-        gross_loss = abs(results_df.loc[results_df["pnl_pct"] < 0, "pnl_pct"].sum())
+        gross_profit = results_df.loc[results_df[pnl_col] > 0, pnl_col].sum()
+        gross_loss = abs(results_df.loc[results_df[pnl_col] < 0, pnl_col].sum())
         pf = gross_profit / gross_loss if gross_loss > 0 else (10.0 if gross_profit > 0 else 0.0)
 
         # Cap PF at 10 to avoid outlier influence
@@ -498,10 +500,14 @@ def _select_representative_symbols(
 ) -> list[tuple[str, str]]:
     """Select representative symbols from a cluster for optimization.
 
-    Picks up to max_symbols instruments, preferring those with the most data.
+    Picks up to max_symbols instruments that have sufficient historical data
+    covering the optimization windows (2024-01 to 2024-11).
     Returns list of (symbol, asset_class) tuples.
     """
-    sized: list[tuple[str, str, int]] = []
+    MIN_OPT_DATE = pd.Timestamp("2024-01-01", tz="UTC")
+    MIN_ROWS = 50_000  # ~2 months of 5m data
+
+    candidates: list[tuple[str, str, int]] = []
     for sym in instruments:
         ac = _get_asset_class_for_symbol(sym)
         safe = sym.replace("/", "_").replace(":", "_")
@@ -509,12 +515,28 @@ def _select_representative_symbols(
         if data_dir is None:
             continue
         path = data_dir / f"{safe}_5m.parquet"
-        if path.exists():
-            sized.append((sym, ac, path.stat().st_size))
+        if not path.exists():
+            continue
 
-    # Sort by file size (more data = more representative)
-    sized.sort(key=lambda x: x[2], reverse=True)
-    return [(sym, ac) for sym, ac, _ in sized[:max_symbols]]
+        # Check data actually covers the optimization window
+        try:
+            df = pd.read_parquet(path, columns=["timestamp"])
+            if len(df) < MIN_ROWS:
+                continue
+            earliest = pd.Timestamp(df["timestamp"].min())
+            if earliest > MIN_OPT_DATE:
+                logger.debug("Skipping %s: data starts %s (need < %s)", sym, earliest, MIN_OPT_DATE)
+                continue
+            candidates.append((sym, ac, len(df)))
+        except Exception:
+            continue
+
+    # Sort by row count (more data = more representative)
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    selected = [(sym, ac) for sym, ac, _ in candidates[:max_symbols]]
+    if not selected:
+        logger.warning("No instruments with sufficient data for optimization windows")
+    return selected
 
 
 def run_optimization(
