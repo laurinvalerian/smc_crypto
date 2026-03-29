@@ -234,9 +234,18 @@ def _load_optimized_smc_params() -> dict[str, dict]:
             if not optimized:
                 continue
             # Map optimized params to all instruments in this cluster
+            # Store under MULTIPLE key formats for matching:
+            #   "BTCUSDT" (raw), "BTC/USDT:USDT" (ccxt), "EUR_USD" (oanda)
             for sym in info.get("instruments", []):
                 symbol_params[sym] = optimized
+                # Crypto: BTCUSDT -> BTC/USDT:USDT (ccxt futures format)
+                if sym.endswith("USDT") and "_" not in sym:
+                    base = sym[:-4]
+                    symbol_params[f"{base}/USDT:USDT"] = optimized
+                # Forex/commodities already use OANDA format (EUR_USD)
 
+        if symbol_params:
+            logger.info("Loaded optimized SMC params for %d symbol keys", len(symbol_params))
         return symbol_params
     except Exception as e:
         logger.warning("Failed loading optimized SMC params: %s", e)
