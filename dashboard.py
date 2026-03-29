@@ -1,6 +1,7 @@
 """
 Paper Trading Dashboard — lightweight Flask app with auto-refresh.
 Reads from live_results/ (bot state JSONs, equity CSVs, log files).
+Includes kill switch, pause/resume, and component toggle control panel.
 
 Usage: python3 dashboard.py [--port 8080]
 """
@@ -10,18 +11,73 @@ import csv
 import json
 import os
 import re
+import signal as _signal
 import sqlite3
+import subprocess
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string
+import yaml
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 RESULTS_DIR = Path("live_results")
 
-# ── Bot symbol → asset class mapping (parsed once from logs) ─────
+# ── PIN from config ────────────────────────────────────────────────
+try:
+    with open("config/default_config.yaml") as _f:
+        _cfg = yaml.safe_load(_f)
+    DASHBOARD_PIN = str(_cfg.get("dashboard", {}).get("pin", "1234"))
+except Exception:
+    DASHBOARD_PIN = "1234"
+
+# ── Bot symbol -> asset class mapping (parsed once from logs) ─────
 _BOT_MAP: dict[str, dict] = {}
+
+
+def _verify_pin() -> str | None:
+    """Check PIN from POST data. Returns error message or None if OK."""
+    pin = request.form.get("pin", "")
+    if pin != DASHBOARD_PIN:
+        return "Invalid PIN"
+    return None
+
+
+def _find_bot_pid() -> int | None:
+    """Find PID of live_multi_bot.py process."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "live_multi_bot.py"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().split("\n")
+        pids = [p.strip() for p in pids if p.strip()]
+        if pids:
+            return int(pids[0])
+    except Exception:
+        pass
+    return None
+
+
+def _get_bot_uptime() -> str:
+    """Get bot uptime from paper_trading.log."""
+    main_log = Path("paper_trading.log")
+    if not main_log.exists():
+        return "unknown"
+    try:
+        with open(main_log) as f:
+            first_line = f.readline()
+        m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", first_line)
+        if m:
+            start = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - start
+            hours = int(delta.total_seconds() // 3600)
+            mins = int((delta.total_seconds() % 3600) // 60)
+            return f"{hours}h {mins}m"
+    except Exception:
+        pass
+    return "unknown"
 
 
 def _discover_bots() -> dict[str, dict]:
@@ -313,31 +369,10 @@ def _aggregate_stats() -> dict:
     rl_rate = rl_accepted / rl_total * 100 if rl_total > 0 else 0
 
     # Check bot process
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "live_multi_bot"], capture_output=True, text=True
-        )
-        bot_running = bool(result.stdout.strip())
-    except Exception:
-        bot_running = False
+    bot_running = _find_bot_pid() is not None
 
     # Compute uptime from main log
-    uptime_str = "unknown"
-    main_log = Path("paper_trading.log")
-    if main_log.exists():
-        try:
-            with open(main_log) as f:
-                first_line = f.readline()
-            m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", first_line)
-            if m:
-                start = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
-                delta = datetime.now(timezone.utc) - start
-                hours = int(delta.total_seconds() // 3600)
-                mins = int((delta.total_seconds() % 3600) // 60)
-                uptime_str = f"{hours}h {mins}m"
-        except Exception:
-            pass
+    uptime_str = _get_bot_uptime()
 
     # Kill switch status
     # Daily and weekly PnL would need time-windowed calculation
@@ -547,6 +582,10 @@ def _get_trade_detail(trade_id: str) -> dict:
     return {"trade_id": trade_id, "bars": bars, "metadata": metadata}
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  Existing API Routes
+# ═══════════════════════════════════════════════════════════════════
+
 @app.route("/api/stats")
 def api_stats():
     return jsonify(_aggregate_stats())
@@ -567,325 +606,624 @@ def api_journal_trade(trade_id: str):
     return jsonify(_get_trade_detail(trade_id))
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  Control Panel API Routes
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/control/stop", methods=["POST"])
+def api_stop():
+    """Kill the trading bot process."""
+    err = _verify_pin()
+    if err:
+        return jsonify({"error": err}), 403
+
+    pid = _find_bot_pid()
+    if pid is None:
+        return jsonify({"error": "Bot process not found"}), 404
+
+    try:
+        os.kill(pid, _signal.SIGTERM)
+        # Wait up to 5 seconds for graceful shutdown
+        for _ in range(10):
+            time.sleep(0.5)
+            try:
+                os.kill(pid, 0)  # Check if still alive
+            except OSError:
+                return jsonify({"status": "stopped", "pid": pid})
+        # Force kill if still running
+        try:
+            os.kill(pid, _signal.SIGKILL)
+        except OSError:
+            pass
+        return jsonify({"status": "stopped", "pid": pid, "method": "SIGKILL"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/control/pause", methods=["POST"])
+def api_pause():
+    """Pause new trades (existing trades continue)."""
+    err = _verify_pin()
+    if err:
+        return jsonify({"error": err}), 403
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    pause_path = RESULTS_DIR / ".pause_flag"
+    pause_path.write_text(datetime.now(timezone.utc).isoformat())
+    return jsonify({"status": "paused"})
+
+
+@app.route("/api/control/resume", methods=["POST"])
+def api_resume():
+    """Resume trading."""
+    err = _verify_pin()
+    if err:
+        return jsonify({"error": err}), 403
+
+    pause_path = RESULTS_DIR / ".pause_flag"
+    if pause_path.exists():
+        pause_path.unlink()
+    return jsonify({"status": "running"})
+
+
+@app.route("/api/control/toggle", methods=["POST"])
+def api_toggle_component():
+    """Toggle a component on/off."""
+    err = _verify_pin()
+    if err:
+        return jsonify({"error": err}), 403
+
+    component = request.form.get("component", "")
+    enabled = request.form.get("enabled", "true").lower() == "true"
+
+    valid_components = {"entry_filter", "exit_classifier", "tp_optimizer", "be_manager"}
+    if component not in valid_components:
+        return jsonify({"error": f"Unknown component: {component}"}), 400
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    toggles_path = RESULTS_DIR / "component_toggles.json"
+    toggles = {}
+    if toggles_path.exists():
+        try:
+            with open(toggles_path) as f:
+                toggles = json.load(f)
+        except Exception:
+            pass
+
+    toggles[component] = enabled
+    with open(toggles_path, "w") as f:
+        json.dump(toggles, f, indent=2)
+
+    return jsonify({"component": component, "enabled": enabled})
+
+
+@app.route("/api/control/status")
+def api_control_status():
+    """Get bot status without PIN."""
+    pid = _find_bot_pid()
+    paused = (RESULTS_DIR / ".pause_flag").exists()
+
+    # Component toggles
+    toggles_path = RESULTS_DIR / "component_toggles.json"
+    toggles = {
+        "entry_filter": True,
+        "exit_classifier": True,
+        "tp_optimizer": True,
+        "be_manager": True,
+    }
+    if toggles_path.exists():
+        try:
+            with open(toggles_path) as f:
+                saved = json.load(f)
+            toggles.update(saved)
+        except Exception:
+            pass
+
+    # Model info
+    model_files = {
+        "entry_filter": "models/rl_entry_filter.pkl",
+        "exit_classifier": "models/rl_exit_classifier.pkl",
+        "tp_optimizer": "models/rl_tp_optimizer.pkl",
+        "be_manager": "models/rl_be_manager.pkl",
+    }
+    model_info = {}
+    for name, rel_path in model_files.items():
+        p = Path(rel_path)
+        if p.exists():
+            stat = p.stat()
+            model_info[name] = {
+                "exists": True,
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "size_mb": round(stat.st_size / (1024 * 1024), 2),
+            }
+        else:
+            model_info[name] = {"exists": False}
+
+    # Last retrain
+    retrain_log = Path("backtest/results/rl/retrain_log.jsonl")
+    last_retrain = None
+    if retrain_log.exists():
+        try:
+            with open(retrain_log) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            if lines:
+                last_retrain = json.loads(lines[-1])
+        except Exception:
+            pass
+
+    # Last trade from trade log
+    last_trade = None
+    bots = _discover_bots()
+    for tag, bot in bots.items():
+        if tag.startswith("_"):
+            continue
+        log_lines = _parse_log_entries(tag, max_lines=100)
+        for line in reversed(log_lines):
+            if "CLOSE " in line and ("WIN" in line or "LOSS" in line):
+                m = re.search(
+                    r"CLOSE (\w+) (\w+) (\S+) @ .* pnl=([-\d.]+)",
+                    line,
+                )
+                if m:
+                    last_trade = {
+                        "outcome": m.group(1),
+                        "direction": m.group(2),
+                        "symbol": bot.get("symbol", tag),
+                        "pnl": float(m.group(4)),
+                    }
+                    break
+        if last_trade:
+            break
+
+    if pid is not None:
+        state = "paused" if paused else "running"
+    else:
+        state = "stopped"
+
+    return jsonify({
+        "pid": pid,
+        "state": state,
+        "uptime": _get_bot_uptime(),
+        "paused": paused,
+        "toggles": toggles,
+        "models": model_info,
+        "last_retrain": last_retrain,
+        "last_trade": last_trade,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Control Panel HTML
+# ═══════════════════════════════════════════════════════════════════
+
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(CONTROL_PANEL_HTML)
 
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+CONTROL_PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SMC Paper Trading Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMC Bot Control</title>
 <style>
-:root {
-  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
-  --border: #30363d; --text: #c9d1d9; --text2: #8b949e;
-  --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
-}
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family: -apple-system, 'Segoe UI', monospace; background:var(--bg); color:var(--text); padding:12px; }
-.grid { display:grid; gap:12px; grid-template-columns:1fr; }
-@media(min-width:768px) { .grid { grid-template-columns:repeat(2,1fr); } .wide { grid-column:span 2; } }
-@media(min-width:1200px) { .grid { grid-template-columns:repeat(3,1fr); } .wide { grid-column:span 3; } }
-.card { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:16px; }
-.card h3 { color:var(--blue); font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
-.stat { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--bg3); font-size:14px; }
-.stat:last-child { border:none; }
-.stat .label { color:var(--text2); }
-.stat .val { font-weight:600; }
-.green { color:var(--green); } .red { color:var(--red); } .yellow { color:var(--yellow); }
-.header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px; }
-.header h1 { font-size:18px; color:var(--blue); }
-.status { padding:4px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-.status.running { background:#1a3a1a; color:var(--green); }
-.status.stopped { background:#3a1a1a; color:var(--red); }
-table { width:100%; border-collapse:collapse; font-size:12px; }
-th { text-align:left; padding:6px 4px; color:var(--text2); border-bottom:1px solid var(--border); }
-td { padding:5px 4px; border-bottom:1px solid var(--bg3); }
-tr:hover { background:var(--bg3); }
-.bar-track { background:var(--bg3); border-radius:4px; height:20px; overflow:hidden; margin:2px 0; position:relative; }
-.bar-fill { height:100%; border-radius:4px; transition:width 0.5s; }
-.bar-label { position:absolute; right:6px; top:2px; font-size:11px; color:var(--text); }
-#equity-chart { width:100%; height:200px; }
-.refresh { color:var(--text2); font-size:11px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       background: #1a1a2e; color: #e0e0e0; padding: 16px; min-height: 100vh; }
+a { color: #58a6ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Layout */
+.container { max-width: 800px; margin: 0 auto; }
+
+/* Header */
+.header { display: flex; justify-content: space-between; align-items: center;
+          flex-wrap: wrap; gap: 12px; margin-bottom: 20px; padding-bottom: 16px;
+          border-bottom: 1px solid #30363d; }
+.header h1 { font-size: 22px; color: #e0e0e0; font-weight: 700; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.status-indicator { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
+.status-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; }
+.dot-green { background: #27ae60; box-shadow: 0 0 6px #27ae60; }
+.dot-yellow { background: #f39c12; box-shadow: 0 0 6px #f39c12; }
+.dot-red { background: #e74c3c; box-shadow: 0 0 6px #e74c3c; }
+.meta-text { font-size: 12px; color: #8b949e; }
+
+/* Cards */
+.card { background: #16213e; border-radius: 12px; padding: 20px; margin: 12px 0;
+        border: 1px solid #0f3460; }
+.card h2 { font-size: 16px; margin-bottom: 16px; color: #a0a0c0;
+           text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+
+/* PIN input */
+.pin-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.pin-label { font-size: 14px; color: #a0a0c0; }
+.pin-input { padding: 12px; font-size: 24px; text-align: center; width: 130px;
+             background: #0f3460; border: 1px solid #30363d; color: white;
+             border-radius: 8px; letter-spacing: 8px; outline: none; }
+.pin-input:focus { border-color: #58a6ff; }
+
+/* Buttons */
+.btn { display: inline-block; padding: 16px 32px; border: none; border-radius: 8px;
+       font-size: 18px; font-weight: bold; cursor: pointer; width: 100%; margin: 6px 0;
+       transition: opacity 0.2s, transform 0.1s; text-align: center; }
+.btn:hover { opacity: 0.9; }
+.btn:active { transform: scale(0.98); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.btn-stop { background: #e74c3c; color: white; }
+.btn-pause { background: #f39c12; color: white; }
+.btn-resume { background: #27ae60; color: white; }
+.btn-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+@media(min-width: 500px) { .btn-row { grid-template-columns: 1fr 1fr 1fr; } }
+
+/* Toggles */
+.toggle-row { display: flex; justify-content: space-between; align-items: center;
+              padding: 14px 0; border-bottom: 1px solid #0f3460; }
+.toggle-row:last-child { border-bottom: none; }
+.toggle-info { display: flex; flex-direction: column; gap: 2px; }
+.toggle-name { font-size: 15px; font-weight: 600; }
+.toggle-desc { font-size: 12px; color: #8b949e; }
+.switch { position: relative; width: 52px; height: 28px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+          background: #e74c3c; border-radius: 28px; transition: 0.3s; }
+.slider:before { position: absolute; content: ""; height: 22px; width: 22px; left: 3px;
+                 bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }
+input:checked + .slider { background: #27ae60; }
+input:checked + .slider:before { transform: translateX(24px); }
+
+/* Status section */
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media(min-width: 500px) { .stat-grid { grid-template-columns: 1fr 1fr 1fr; } }
+.stat-item { background: #0f3460; border-radius: 8px; padding: 14px; text-align: center; }
+.stat-value { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+.stat-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+.green { color: #27ae60; }
+.red { color: #e74c3c; }
+.yellow { color: #f39c12; }
+.blue { color: #58a6ff; }
+
+/* Model info table */
+.model-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.model-table th { text-align: left; padding: 8px 6px; color: #8b949e;
+                  border-bottom: 1px solid #30363d; font-weight: 600; }
+.model-table td { padding: 8px 6px; border-bottom: 1px solid #0f3460; }
+
+/* Toast */
+.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+         padding: 12px 24px; border-radius: 8px; font-size: 14px; font-weight: 600;
+         z-index: 1000; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+.toast.show { opacity: 1; }
+.toast.success { background: #27ae60; color: white; }
+.toast.error { background: #e74c3c; color: white; }
+
+/* Nav link */
+.nav-link { display: inline-block; margin-top: 12px; font-size: 13px; color: #58a6ff; }
+
+/* Confirmation dialog */
+.confirm-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+                   background: rgba(0,0,0,0.7); z-index: 999; align-items: center;
+                   justify-content: center; }
+.confirm-overlay.active { display: flex; }
+.confirm-box { background: #16213e; border: 1px solid #e74c3c; border-radius: 12px;
+               padding: 24px; max-width: 400px; width: 90%; text-align: center; }
+.confirm-box h3 { color: #e74c3c; margin-bottom: 12px; font-size: 18px; }
+.confirm-box p { color: #a0a0c0; margin-bottom: 20px; font-size: 14px; }
+.confirm-btns { display: flex; gap: 12px; }
+.confirm-btns .btn { font-size: 14px; padding: 10px 20px; }
+.btn-cancel { background: #30363d; color: #e0e0e0; }
 </style>
 </head>
 <body>
-<div class="header">
-  <h1>SMC Paper Trading</h1>
-  <div>
-    <span id="status" class="status stopped">--</span>
-    <span class="refresh" id="updated">loading...</span>
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <h1>SMC Trading Bot &mdash; Control Panel</h1>
+    <div class="header-right">
+      <div class="status-indicator">
+        <span class="status-dot dot-red" id="status-dot"></span>
+        <span id="status-text">CHECKING...</span>
+      </div>
+      <div class="meta-text">
+        PID: <span id="bot-pid">--</span> | Up: <span id="bot-uptime">--</span>
+      </div>
+    </div>
   </div>
+
+  <!-- Emergency Controls -->
+  <div class="card">
+    <h2>Emergency Controls</h2>
+    <div class="pin-row">
+      <span class="pin-label">PIN:</span>
+      <input type="password" class="pin-input" id="pin" maxlength="4" inputmode="numeric"
+             pattern="[0-9]*" placeholder="----">
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-stop" id="btn-stop" onclick="confirmStop()">EMERGENCY STOP</button>
+      <button class="btn btn-pause" id="btn-pause" onclick="doPause()">PAUSE ALL</button>
+      <button class="btn btn-resume" id="btn-resume" onclick="doResume()">RESUME</button>
+    </div>
+  </div>
+
+  <!-- Confirmation dialog for emergency stop -->
+  <div class="confirm-overlay" id="confirm-overlay">
+    <div class="confirm-box">
+      <h3>CONFIRM EMERGENCY STOP</h3>
+      <p>This will kill the live_multi_bot.py process. Existing positions will remain open but unmanaged.</p>
+      <div class="confirm-btns">
+        <button class="btn btn-cancel" onclick="cancelStop()">Cancel</button>
+        <button class="btn btn-stop" onclick="doStop()">STOP BOT</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Component Toggles -->
+  <div class="card">
+    <h2>Component Toggles</h2>
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <span class="toggle-name">Entry Filter</span>
+        <span class="toggle-desc">XGBoost entry prediction gate</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="tog-entry_filter" checked onchange="doToggle('entry_filter', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <span class="toggle-name">Exit Classifier</span>
+        <span class="toggle-desc">ML early exit prediction</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="tog-exit_classifier" checked onchange="doToggle('exit_classifier', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <span class="toggle-name">TP Optimizer</span>
+        <span class="toggle-desc">RL take-profit adjustment</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="tog-tp_optimizer" checked onchange="doToggle('tp_optimizer', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <span class="toggle-name">BE Manager</span>
+        <span class="toggle-desc">Break-even level prediction</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="tog-be_manager" checked onchange="doToggle('be_manager', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <!-- Status -->
+  <div class="card">
+    <h2>Live Status</h2>
+    <div class="stat-grid">
+      <div class="stat-item">
+        <div class="stat-value" id="st-equity">--</div>
+        <div class="stat-label">Equity</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value" id="st-trades">--</div>
+        <div class="stat-label">Trades Today</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value" id="st-positions">--</div>
+        <div class="stat-label">Active Positions</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Last Trade -->
+  <div class="card">
+    <h2>Last Trade</h2>
+    <div id="last-trade-info" style="font-size:14px;color:#8b949e;">No trades recorded</div>
+  </div>
+
+  <!-- Model Versions -->
+  <div class="card">
+    <h2>ML Models</h2>
+    <table class="model-table">
+      <thead><tr><th>Model</th><th>Status</th><th>Size</th><th>Last Modified</th></tr></thead>
+      <tbody id="model-tbody"></tbody>
+    </table>
+    <div id="retrain-info" style="margin-top:12px;font-size:12px;color:#8b949e;"></div>
+  </div>
+
+  <!-- Navigation to full dashboard -->
+  <a class="nav-link" href="/api/stats" target="_blank">View raw stats JSON</a>
+  &nbsp;|&nbsp;
+  <a class="nav-link" href="/api/ml-metrics" target="_blank">View ML metrics JSON</a>
+  &nbsp;|&nbsp;
+  <a class="nav-link" href="/api/journal/recent" target="_blank">View journal JSON</a>
 </div>
-<div class="grid" id="root">
-  <!-- Header Stats -->
-  <div class="card" id="c-header">
-    <h3>Account Overview</h3>
-    <div class="stat"><span class="label">Uptime</span><span class="val" id="uptime">--</span></div>
-    <div class="stat"><span class="label">Total Equity</span><span class="val" id="equity">--</span></div>
-    <div class="stat"><span class="label">Total PnL</span><span class="val" id="pnl">--</span></div>
-    <div class="stat"><span class="label">Active Positions</span><span class="val" id="positions">--</span></div>
-    <div class="stat"><span class="label">Total Trades</span><span class="val" id="trades">--</span></div>
-    <div class="stat"><span class="label">Win Rate</span><span class="val" id="wr">--</span></div>
-  </div>
 
-  <!-- RL Brain Stats -->
-  <div class="card" id="c-rl">
-    <h3>RL Brain Stats</h3>
-    <div class="stat"><span class="label">Entry Filter: Accepted</span><span class="val green" id="rl-acc">--</span></div>
-    <div class="stat"><span class="label">Entry Filter: Rejected</span><span class="val red" id="rl-rej">--</span></div>
-    <div class="stat"><span class="label">Acceptance Rate</span><span class="val" id="rl-rate">--</span></div>
-    <div class="stat"><span class="label">TP Adjustments</span><span class="val" id="tp-adj">--</span></div>
-    <div class="stat"><span class="label">BE Triggers</span><span class="val" id="be-trig">--</span></div>
-  </div>
-
-  <!-- Model Status -->
-  <div class="card" id="c-models">
-    <h3>Model Status</h3>
-    <table>
-      <thead><tr><th>Model</th><th>Status</th><th>Features</th></tr></thead>
-      <tbody id="model-body"></tbody>
-    </table>
-  </div>
-
-  <!-- Asset Class Status -->
-  <div class="card" id="c-classes">
-    <h3>Asset Class Status</h3>
-    <table>
-      <thead><tr><th>Class</th><th>Adapter</th><th>Status</th><th>Errors</th></tr></thead>
-      <tbody id="class-body"></tbody>
-    </table>
-  </div>
-
-  <!-- Performance -->
-  <div class="card" id="c-perf">
-    <h3>Performance Metrics</h3>
-    <div class="stat"><span class="label">Wins / Losses</span><span class="val" id="wl">--</span></div>
-    <div class="stat"><span class="label">Max Drawdown</span><span class="val red" id="max-dd">--</span></div>
-    <div class="stat"><span class="label">Profit Factor</span><span class="val" id="pf">--</span></div>
-    <div class="stat"><span class="label">Avg PnL/Trade</span><span class="val" id="avg-pnl">--</span></div>
-  </div>
-
-  <!-- Kill Switch Status -->
-  <div class="card" id="c-kill">
-    <h3>Kill Switch Status</h3>
-    <div style="margin-bottom:8px;">
-      <div style="display:flex;justify-content:space-between;font-size:12px;"><span>Daily PnL</span><span id="kill-daily">--</span></div>
-      <div class="bar-track"><div class="bar-fill" id="bar-daily" style="width:0%;background:var(--green)"></div><div class="bar-label">/ -3%</div></div>
-    </div>
-    <div style="margin-bottom:8px;">
-      <div style="display:flex;justify-content:space-between;font-size:12px;"><span>Weekly PnL</span><span id="kill-weekly">--</span></div>
-      <div class="bar-track"><div class="bar-fill" id="bar-weekly" style="width:0%;background:var(--green)"></div><div class="bar-label">/ -5%</div></div>
-    </div>
-    <div>
-      <div style="display:flex;justify-content:space-between;font-size:12px;"><span>All-Time DD</span><span id="kill-dd">--</span></div>
-      <div class="bar-track"><div class="bar-fill" id="bar-dd" style="width:0%;background:var(--green)"></div><div class="bar-label">/ -8%</div></div>
-    </div>
-  </div>
-
-  <!-- Per-Asset Breakdown -->
-  <div class="card" id="c-asset">
-    <h3>Per-Asset Breakdown</h3>
-    <table>
-      <thead><tr><th>Class</th><th>Trades</th><th>WR</th><th>PnL</th></tr></thead>
-      <tbody id="asset-body"></tbody>
-    </table>
-  </div>
-
-  <!-- Equity Curve -->
-  <div class="card wide" id="c-chart">
-    <h3>Equity Curve</h3>
-    <canvas id="equity-chart"></canvas>
-  </div>
-
-  <!-- Trade Log -->
-  <div class="card wide" id="c-trades">
-    <h3>Recent Trades (last 50)</h3>
-    <div style="overflow-x:auto;">
-    <table>
-      <thead><tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Result</th><th>RL Conf</th><th>TP Adj</th><th>Class</th></tr></thead>
-      <tbody id="trade-body"></tbody>
-    </table>
-    </div>
-  </div>
-</div>
+<!-- Toast notification -->
+<div class="toast" id="toast"></div>
 
 <script>
-let chart = null;
-function pnlClass(v) { return v > 0 ? 'green' : v < 0 ? 'red' : ''; }
-function fmt(v, d=2) { return Number(v).toFixed(d); }
-function barPct(val, limit) {
-  let pct = Math.min(Math.abs(val / limit) * 100, 100);
-  return pct;
-}
-function barColor(val, limit) {
-  let ratio = Math.abs(val / limit);
-  if (ratio > 0.8) return 'var(--red)';
-  if (ratio > 0.5) return 'var(--yellow)';
-  return 'var(--green)';
+function getPin() {
+  return document.getElementById('pin').value;
 }
 
-async function refresh() {
-  try {
-    const r = await fetch('/api/stats');
-    const d = await r.json();
+function showToast(msg, type) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + type;
+  setTimeout(function() { t.className = 'toast'; }, 3000);
+}
 
-    // Status
-    const el = document.getElementById('status');
-    el.textContent = d.bot_running ? 'RUNNING' : 'STOPPED';
-    el.className = 'status ' + (d.bot_running ? 'running' : 'stopped');
-    document.getElementById('updated').textContent = d.updated;
+function confirmStop() {
+  if (!getPin()) { showToast('Enter PIN first', 'error'); return; }
+  document.getElementById('confirm-overlay').classList.add('active');
+}
 
-    // Header
-    document.getElementById('uptime').textContent = d.uptime;
-    document.getElementById('equity').textContent = '$' + fmt(d.total_equity);
-    const pnlEl = document.getElementById('pnl');
-    pnlEl.textContent = (d.total_pnl >= 0 ? '+' : '') + '$' + fmt(d.total_pnl);
-    pnlEl.className = 'val ' + pnlClass(d.total_pnl);
-    document.getElementById('positions').textContent = d.active_positions;
-    document.getElementById('trades').textContent = d.total_trades;
-    const wrEl = document.getElementById('wr');
-    wrEl.textContent = fmt(d.win_rate, 1) + '%';
-    wrEl.className = 'val ' + (d.win_rate >= 50 ? 'green' : d.win_rate >= 35 ? 'yellow' : 'red');
+function cancelStop() {
+  document.getElementById('confirm-overlay').classList.remove('active');
+}
 
-    // RL
-    document.getElementById('rl-acc').textContent = d.rl_accepted;
-    document.getElementById('rl-rej').textContent = d.rl_rejected;
-    const rateEl = document.getElementById('rl-rate');
-    rateEl.textContent = fmt(d.rl_rate, 1) + '%';
-    rateEl.className = 'val ' + (d.rl_rate < 10 || d.rl_rate > 95 ? 'red' : 'green');
-    document.getElementById('tp-adj').textContent = d.tp_adjusted;
-    document.getElementById('be-trig').textContent = d.be_triggered;
+function doStop() {
+  document.getElementById('confirm-overlay').classList.remove('active');
+  var fd = new FormData();
+  fd.append('pin', getPin());
+  fetch('/api/control/stop', { method: 'POST', body: fd })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (res.ok) { showToast('Bot stopped (PID ' + res.data.pid + ')', 'success'); }
+      else { showToast(res.data.error || 'Failed', 'error'); }
+      refreshStatus();
+    })
+    .catch(function() { showToast('Network error', 'error'); });
+}
 
-    // Performance
-    let losses = d.total_trades - d.total_wins;
-    document.getElementById('wl').textContent = d.total_wins + ' / ' + losses;
-    document.getElementById('max-dd').textContent = fmt(d.max_dd_pct, 2) + '%';
-    let avgPnl = d.total_trades > 0 ? d.total_pnl / d.total_trades : 0;
-    const avgEl = document.getElementById('avg-pnl');
-    avgEl.textContent = '$' + fmt(avgPnl);
-    avgEl.className = 'val ' + pnlClass(avgPnl);
-    // Rough PF estimate
-    let winPnl = d.total_pnl > 0 ? d.total_pnl : 0;
-    let lossPnl = d.total_pnl < 0 ? Math.abs(d.total_pnl) : 0.01;
-    let pf = d.total_trades > 0 ? (winPnl / lossPnl) : 0;
-    document.getElementById('pf').textContent = fmt(pf > 99 ? 99 : pf, 2);
+function doPause() {
+  if (!getPin()) { showToast('Enter PIN first', 'error'); return; }
+  var fd = new FormData();
+  fd.append('pin', getPin());
+  fetch('/api/control/pause', { method: 'POST', body: fd })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (res.ok) { showToast('Trading paused', 'success'); }
+      else { showToast(res.data.error || 'Failed', 'error'); }
+      refreshStatus();
+    })
+    .catch(function() { showToast('Network error', 'error'); });
+}
 
-    // Kill switches
-    let dpnl = d.daily_pnl_pct;
-    document.getElementById('kill-daily').textContent = fmt(dpnl, 2) + '%';
-    document.getElementById('bar-daily').style.width = barPct(dpnl, -3) + '%';
-    document.getElementById('bar-daily').style.background = barColor(dpnl, -3);
-    document.getElementById('kill-weekly').textContent = fmt(dpnl, 2) + '%';
-    document.getElementById('bar-weekly').style.width = barPct(dpnl, -5) + '%';
-    document.getElementById('bar-weekly').style.background = barColor(dpnl, -5);
-    document.getElementById('kill-dd').textContent = fmt(d.max_dd_pct, 2) + '%';
-    document.getElementById('bar-dd').style.width = barPct(d.max_dd_pct, 8) + '%';
-    document.getElementById('bar-dd').style.background = barColor(d.max_dd_pct, 8);
+function doResume() {
+  if (!getPin()) { showToast('Enter PIN first', 'error'); return; }
+  var fd = new FormData();
+  fd.append('pin', getPin());
+  fetch('/api/control/resume', { method: 'POST', body: fd })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (res.ok) { showToast('Trading resumed', 'success'); }
+      else { showToast(res.data.error || 'Failed', 'error'); }
+      refreshStatus();
+    })
+    .catch(function() { showToast('Network error', 'error'); });
+}
 
-    // Model status
-    let mb = document.getElementById('model-body');
-    mb.innerHTML = '';
-    for (let [name, info] of Object.entries(d.model_status || {})) {
-      let sClass = info.loaded ? 'green' : 'red';
-      let sText = info.loaded ? 'LOADED' : 'MISSING';
-      mb.innerHTML += '<tr><td>' + name + '</td><td class="' + sClass + '">' + sText +
-        '</td><td>' + (info.features || '-') + '</td></tr>';
-    }
-
-    // Asset class status
-    let cb = document.getElementById('class-body');
-    cb.innerHTML = '';
-    for (let [cls, info] of Object.entries(d.class_status || {})) {
-      let sClass = info.status === 'connected' ? 'green' : info.status === 'disabled' ? 'red' : 'yellow';
-      let errStr = info.errors > 0 ? '<span class="red">' + info.errors + '</span>' : '0';
-      cb.innerHTML += '<tr><td>' + cls + '</td><td>' + info.adapter + '</td><td class="' + sClass + '">' +
-        info.status + '</td><td>' + errStr + '</td></tr>';
-    }
-
-    // Per-asset
-    let ab = document.getElementById('asset-body');
-    ab.innerHTML = '';
-    for (let [cls, s] of Object.entries(d.per_class || {})) {
-      let wr = s.trades > 0 ? (s.wins / s.trades * 100).toFixed(1) : '0.0';
-      ab.innerHTML += '<tr><td>' + cls + '</td><td>' + s.trades +
-        '</td><td>' + wr + '%</td><td class="' + pnlClass(s.pnl) + '">$' + fmt(s.pnl) + '</td></tr>';
-    }
-
-    // Trade log
-    let tb = document.getElementById('trade-body');
-    tb.innerHTML = '';
-    for (let t of d.trade_log || []) {
-      if (t.type === 'CLOSE') {
-        let cls = t.outcome === 'WIN' ? 'green' : 'red';
-        let rlConf = t.rl_confidence > 0 ? fmt(t.rl_confidence, 3) : '<span class="yellow">N/A</span>';
-        let tpAdj = t.tp_adjusted ? '<span class="green">Yes</span>' : '-';
-        tb.innerHTML += '<tr><td>' + t.time + '</td><td>' + t.symbol +
-          '</td><td>' + (t.direction||'') + '</td><td>' + fmt(t.entry, 4) +
-          '</td><td>' + fmt(t.exit||0, 4) + '</td><td class="' + pnlClass(t.pnl) + '">$' + fmt(t.pnl) +
-          '</td><td class="' + cls + '">' + t.outcome + '</td><td>' + rlConf +
-          '</td><td>' + tpAdj + '</td><td>' + (t.asset_class||'') + '</td></tr>';
-      } else if (t.type === 'OPEN') {
-        let rlConf = t.rl_confidence > 0 ? fmt(t.rl_confidence, 3) : '<span class="yellow">N/A</span>';
-        let rlTag = t.rl_filtered ? '<span class="green">RL</span>' : '<span class="yellow">RAW</span>';
-        let tpAdj = t.tp_adjusted ? '<span class="green">Yes</span>' : '-';
-        tb.innerHTML += '<tr style="opacity:0.7"><td>' + t.time + '</td><td>' + t.symbol +
-          '</td><td>' + (t.direction||'') + '</td><td>' + fmt(t.entry, 4) +
-          '</td><td>-</td><td>-</td><td>' + rlTag +
-          '</td><td>' + rlConf + '</td><td>' + tpAdj + '</td><td>' + (t.asset_class||'') + '</td></tr>';
-      }
-    }
-    if (tb.innerHTML === '') {
-      tb.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text2)">No trades yet</td></tr>';
-    }
-
-    // Equity chart
-    let pts = d.equity_points || [];
-    if (pts.length > 0) {
-      let labels = pts.map(p => p.time ? p.time.substring(11, 19) : '');
-      let data = pts.map(p => p.pnl);
-      let colors = data.map(v => v >= 0 ? 'rgba(63,185,80,0.5)' : 'rgba(248,81,73,0.5)');
-      if (!chart) {
-        chart = new Chart(document.getElementById('equity-chart'), {
-          type: 'line',
-          data: {
-            labels: labels,
-            datasets: [{
-              label: 'Cumulative PnL',
-              data: data,
-              borderColor: 'rgba(88,166,255,0.8)',
-              backgroundColor: 'rgba(88,166,255,0.1)',
-              fill: true,
-              tension: 0.3,
-              pointRadius: 0,
-              borderWidth: 2,
-            }]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { display: false } },
-            scales: {
-              x: { ticks: { color: '#8b949e', maxTicksLimit: 10 }, grid: { color: '#21262d' } },
-              y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } }
-            }
-          }
-        });
+function doToggle(component, enabled) {
+  if (!getPin()) {
+    showToast('Enter PIN first', 'error');
+    document.getElementById('tog-' + component).checked = !enabled;
+    return;
+  }
+  var fd = new FormData();
+  fd.append('pin', getPin());
+  fd.append('component', component);
+  fd.append('enabled', enabled ? 'true' : 'false');
+  fetch('/api/control/toggle', { method: 'POST', body: fd })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (res.ok) {
+        showToast(res.data.component + ': ' + (res.data.enabled ? 'ON' : 'OFF'), 'success');
       } else {
-        chart.data.labels = labels;
-        chart.data.datasets[0].data = data;
-        chart.update('none');
+        showToast(res.data.error || 'Failed', 'error');
+        document.getElementById('tog-' + component).checked = !enabled;
       }
-    }
-  } catch(e) { console.error('Refresh failed:', e); }
+    })
+    .catch(function() {
+      showToast('Network error', 'error');
+      document.getElementById('tog-' + component).checked = !enabled;
+    });
 }
 
-refresh();
-setInterval(refresh, 60000);
+function refreshStatus() {
+  fetch('/api/control/status')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      // Status indicator
+      var dot = document.getElementById('status-dot');
+      var txt = document.getElementById('status-text');
+      if (d.state === 'running') {
+        dot.className = 'status-dot dot-green';
+        txt.textContent = 'RUNNING';
+        txt.style.color = '#27ae60';
+      } else if (d.state === 'paused') {
+        dot.className = 'status-dot dot-yellow';
+        txt.textContent = 'PAUSED';
+        txt.style.color = '#f39c12';
+      } else {
+        dot.className = 'status-dot dot-red';
+        txt.textContent = 'STOPPED';
+        txt.style.color = '#e74c3c';
+      }
+
+      // PID + uptime
+      document.getElementById('bot-pid').textContent = d.pid || '--';
+      document.getElementById('bot-uptime').textContent = d.uptime || '--';
+
+      // Toggle states
+      if (d.toggles) {
+        for (var key in d.toggles) {
+          var el = document.getElementById('tog-' + key);
+          if (el) el.checked = d.toggles[key];
+        }
+      }
+
+      // Models table
+      var tbody = document.getElementById('model-tbody');
+      tbody.innerHTML = '';
+      if (d.models) {
+        for (var name in d.models) {
+          var m = d.models[name];
+          var statusCls = m.exists ? 'green' : 'red';
+          var statusTxt = m.exists ? 'LOADED' : 'MISSING';
+          var size = m.size_mb ? m.size_mb + ' MB' : '--';
+          var modified = m.modified ? m.modified.replace('T', ' ').replace('Z', '') : '--';
+          tbody.innerHTML += '<tr><td>' + name + '</td><td class="' + statusCls + '">' +
+            statusTxt + '</td><td>' + size + '</td><td>' + modified + '</td></tr>';
+        }
+      }
+
+      // Last retrain
+      var ri = document.getElementById('retrain-info');
+      if (d.last_retrain) {
+        ri.textContent = 'Last retrain: ' + (d.last_retrain.timestamp || d.last_retrain.date || 'unknown');
+      } else {
+        ri.textContent = 'No retrain history';
+      }
+
+      // Last trade
+      var lti = document.getElementById('last-trade-info');
+      if (d.last_trade) {
+        var lt = d.last_trade;
+        var pnlCls = lt.pnl >= 0 ? 'green' : 'red';
+        var pnlSign = lt.pnl >= 0 ? '+' : '';
+        lti.innerHTML = '<span style="font-size:15px;font-weight:600;">' + lt.symbol + '</span>' +
+          ' &mdash; ' + lt.direction.toUpperCase() +
+          ' &mdash; <span class="' + pnlCls + '">' + pnlSign + '$' + Number(lt.pnl).toFixed(2) + '</span>' +
+          ' (<span class="' + (lt.outcome === 'WIN' ? 'green' : 'red') + '">' + lt.outcome + '</span>)';
+      }
+    })
+    .catch(function(e) { console.error('Status refresh failed:', e); });
+
+  // Also fetch aggregate stats for equity/trades/positions
+  fetch('/api/stats')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      document.getElementById('st-equity').textContent = '$' + Number(d.total_equity).toFixed(2);
+      document.getElementById('st-trades').textContent = d.total_trades;
+      document.getElementById('st-positions').textContent = d.active_positions;
+    })
+    .catch(function() {});
+}
+
+// Initial load + auto-refresh every 30s
+refreshStatus();
+setInterval(refreshStatus, 30000);
 </script>
 </body>
 </html>"""
@@ -895,6 +1233,17 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
-    print(f"Dashboard starting on http://0.0.0.0:{args.port}")
-    app.run(host="0.0.0.0", port=args.port, debug=False)
+    # Override from config if available
+    try:
+        with open("config/default_config.yaml") as f:
+            cfg = yaml.safe_load(f)
+        dash_cfg = cfg.get("dashboard", {})
+        host = args.host if args.host != "0.0.0.0" else dash_cfg.get("host", "0.0.0.0")
+        port = args.port if args.port != 8080 else dash_cfg.get("port", 8080)
+    except Exception:
+        host = args.host
+        port = args.port
+    print(f"Dashboard starting on http://{host}:{port}")
+    app.run(host=host, port=port, debug=False)

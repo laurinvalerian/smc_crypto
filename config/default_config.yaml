@@ -293,3 +293,11 @@ journal:
   max_concurrent_watchers: 20
   max_db_size_mb: 1024              # Disable writes if journal.db > 1GB
   min_disk_free_mb: 500             # Disable writes if free disk < 500MB
+
+# ═══════════════════════════════════════════════════════
+# Dashboard Configuration
+# ═══════════════════════════════════════════════════════
+dashboard:
+  pin: "1234"
+  host: "0.0.0.0"
+  port: 8080

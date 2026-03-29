@@ -1193,7 +1193,8 @@ class PaperBot:
 
                 # ── ML exit prediction (acts when enabled + gates pass) ────
                 if (self.rl_suite is not None and
-                        hasattr(self.rl_suite, "predict_early_exit")):
+                        hasattr(self.rl_suite, "predict_early_exit") and
+                        self._check_component_enabled("exit_classifier")):
                     try:
                         _risk_pct = float(trade.get("risk_pct", 0.01))
                         _prev_pnl = float(trade.get("_prev_unrealized_pnl_pct", 0.0))
@@ -1669,6 +1670,18 @@ class PaperBot:
 
     # ── Signal preparation (called from on_candle) ──────────────────
 
+    def _check_component_enabled(self, component: str) -> bool:
+        """Check if a component is enabled via dashboard toggles."""
+        toggles_path = Path("live_results/component_toggles.json")
+        if not toggles_path.exists():
+            return True  # Default: all enabled
+        try:
+            with open(toggles_path) as f:
+                toggles = json.load(f)
+            return toggles.get(component, True)
+        except Exception:
+            return True
+
     def _prepare_signal(
         self,
         symbol: str,
@@ -1683,6 +1696,10 @@ class PaperBot:
         4. Setup quality tier classification (AAA+/A/SPEC)
         5. ATR-based minimum SL distance (not just fixed %)
         """
+        # ── Pause flag check ──────────────────────────────────────────
+        if Path("live_results/.pause_flag").exists():
+            return  # Paused — don't generate new signals
+
         # ── Trading hours check (forex/stocks have limited hours) ────
         if self.adapter is not None and not self.adapter.is_market_open(self.symbol):
             self._pending_signal = None
@@ -1975,6 +1992,10 @@ class PaperBot:
         If a pending signal exists and the live price is inside the
         entry zone, place a real bracket order on the testnet.
         """
+        # ── Pause flag check ──────────────────────────────────────────
+        if Path("live_results/.pause_flag").exists():
+            return  # Paused — don't enter new trades
+
         sig = self._pending_signal
         if sig is None:
             return
@@ -2009,7 +2030,7 @@ class PaperBot:
         rl_confidence = 1.0
 
         # XGBoost entry filter (RLBrainSuite) — always active, no warmup
-        if self.rl_suite is not None and self.rl_suite.entry_filter_enabled:
+        if self.rl_suite is not None and self.rl_suite.entry_filter_enabled and self._check_component_enabled("entry_filter"):
             xgb_take, rl_confidence = self.rl_suite.predict_entry(sig.get("features", {}))
             if not xgb_take:
                 self._rl_rejected += 1
@@ -2078,7 +2099,7 @@ class PaperBot:
         # ── RL TP adjustment ───────────────────────────────────────────
         rl_be_level = 0.0
         if self.rl_suite is not None:
-            if self.rl_suite.tp_enabled and sl_dist > 0:
+            if self.rl_suite.tp_enabled and sl_dist > 0 and self._check_component_enabled("tp_optimizer"):
                 planned_tp_rr = tp_dist / sl_dist
                 adjusted_tp_rr = self.rl_suite.predict_tp_adjustment(
                     sig.get("features", {}), planned_tp_rr,
@@ -2092,7 +2113,7 @@ class PaperBot:
                         symbol, old_tp, tp, planned_tp_rr, adjusted_tp_rr,
                     )
 
-            if self.rl_suite.be_enabled and sl_dist > 0:
+            if self.rl_suite.be_enabled and sl_dist > 0 and self._check_component_enabled("be_manager"):
                 # Match training formula: cost_rr in R-multiples
                 _tc = _TRAIN_COMMISSION.get(self.asset_class, 0.0004)
                 _ts = _TRAIN_SLIPPAGE.get(self.asset_class, 0.0002)
