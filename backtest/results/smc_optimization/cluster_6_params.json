@@ -1,0 +1,26 @@
+{
+  "cluster_name": "high_vol_crypto_24h",
+  "old_params": {
+    "swing_length": 8,
+    "fvg_threshold": 0.0006,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.01
+  },
+  "optimized_params": {
+    "swing_length": 27,
+    "fvg_threshold": 0.0027903671397643006,
+    "order_block_lookback": 10,
+    "liquidity_range_percent": 0.006719680376751885
+  },
+  "old_pf": 1.4004496486165514,
+  "optimized_pf": 3.551787822584247,
+  "improvement_pct": 153.61767387302476,
+  "n_trials": 30,
+  "representative_symbols": [
+    "ADAUSDT",
+    "BNBUSDT",
+    "DOGEUSDT",
+    "DOTUSDT",
+    "LINKUSDT"
+  ]
+}

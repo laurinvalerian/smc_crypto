@@ -1,0 +1,22 @@
+{
+  "cluster_name": "high_vol_crypto_24h",
+  "old_params": {
+    "swing_length": 8,
+    "fvg_threshold": 0.0006,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.01
+  },
+  "optimized_params": {
+    "swing_length": 17,
+    "fvg_threshold": 0.0007624707537075286,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.0038245089550015703
+  },
+  "old_pf": 0.9827763154619035,
+  "optimized_pf": 3.913664844862629,
+  "improvement_pct": 298.2253930308864,
+  "n_trials": 30,
+  "representative_symbols": [
+    "ETHUSDT"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "cluster_name": "med_vol_crypto_24h",
+  "old_params": {
+    "swing_length": 8,
+    "fvg_threshold": 0.0006,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.01
+  },
+  "optimized_params": {
+    "swing_length": 18,
+    "fvg_threshold": 0.0014901845841197746,
+    "order_block_lookback": 34,
+    "liquidity_range_percent": 0.007628905209590758
+  },
+  "old_pf": 1.5355050463126545,
+  "optimized_pf": 3.2666768325761217,
+  "improvement_pct": 112.74282623952847,
+  "n_trials": 30,
+  "representative_symbols": [
+    "BTCUSDT"
+  ]
+}

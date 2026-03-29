@@ -1,0 +1,26 @@
+{
+  "cluster_name": "med_vol_stocks_market_hours",
+  "old_params": {
+    "swing_length": 10,
+    "fvg_threshold": 0.0003,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.005
+  },
+  "optimized_params": {
+    "swing_length": 25,
+    "fvg_threshold": 0.00010541906217549178,
+    "order_block_lookback": 33,
+    "liquidity_range_percent": 0.0031706774062478433
+  },
+  "old_pf": 1.5153477561198747,
+  "optimized_pf": 2.1466910303420783,
+  "improvement_pct": 41.66325991327498,
+  "n_trials": 30,
+  "representative_symbols": [
+    "NVDA",
+    "INTC",
+    "TSLA",
+    "AMD",
+    "AAPL"
+  ]
+}

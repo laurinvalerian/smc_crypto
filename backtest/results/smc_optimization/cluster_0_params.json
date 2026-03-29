@@ -1,0 +1,26 @@
+{
+  "cluster_name": "low_vol_forex_extended",
+  "old_params": {
+    "swing_length": 8,
+    "fvg_threshold": 0.0006,
+    "order_block_lookback": 20,
+    "liquidity_range_percent": 0.01
+  },
+  "optimized_params": {
+    "swing_length": 6,
+    "fvg_threshold": 0.0009612244053182399,
+    "order_block_lookback": 13,
+    "liquidity_range_percent": 0.011895126084687775
+  },
+  "old_pf": 1.1297418110096429,
+  "optimized_pf": 1.3778123158850626,
+  "improvement_pct": 21.958159152640437,
+  "n_trials": 30,
+  "representative_symbols": [
+    "EUR_USD",
+    "EUR_GBP",
+    "GBP_USD",
+    "EUR_JPY",
+    "AUD_JPY"
+  ]
+}
