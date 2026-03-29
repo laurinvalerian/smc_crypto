@@ -140,7 +140,10 @@ def load_training_data(
 
 def prepare_features(df: pd.DataFrame, task: str = "entry_quality") -> tuple[np.ndarray, list[str]]:
     """Extract feature matrix with dead feature removal, clipping, and asset_class_id."""
-    exclude = META_COLS | DEAD_FEATURES | (ENTRY_QUALITY_EXCLUDE if task == "entry_quality" else set())
+    exclude = set(META_COLS) | DEAD_FEATURES | (ENTRY_QUALITY_EXCLUDE if task == "entry_quality" else set())
+    if task == "early_exit":
+        # bar_unrealized_rr is the most important feature for exit decisions
+        exclude.discard("bar_unrealized_rr")
     feat_cols = [c for c in df.columns if c not in exclude]
 
     X = df[feat_cols].values.astype(np.float32)
@@ -159,8 +162,8 @@ def prepare_features(df: pd.DataFrame, task: str = "entry_quality") -> tuple[np.
                        n_nan, n_inf, X.shape[0], X.shape[1])
     X = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0)
 
-    # Add asset_class_id as a feature
-    if "asset_class" in df.columns:
+    # Add asset_class_id as a feature (skip if already present, e.g. exit episodes)
+    if "asset_class" in df.columns and "asset_class_id" not in feat_cols:
         ac_ids = df["asset_class"].map(ASSET_CLASS_MAP).fillna(0).values.astype(np.float32).reshape(-1, 1)
         X = np.hstack([X, ac_ids])
         feat_cols = feat_cols + ["asset_class_id"]
@@ -1393,11 +1396,13 @@ def run_walk_forward_exit(
             logger.warning("[exit] Could not load existing model for agreement check: %s", e)
 
     # Save model
+    from features.feature_extractor import SCHEMA_VERSION as _EXIT_SCHEMA
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model_data = {
         "model": model,
         "feat_names": feat_cols,
         "clip_ranges": CLIP_RANGES,
+        "schema_version": _EXIT_SCHEMA,
         "auc": test_auc,
         "f1": test_f1,
         "n_train": len(X_tr),
@@ -1769,6 +1774,12 @@ class RLBrainSuite:
             return False, 0.0  # shadow mode / model not yet trained
 
         try:
+            # Schema version check: warn if model was trained on different feature schema
+            model_schema = self._exit_model.get("schema_version")
+            if model_schema is not None:
+                from features.feature_extractor import FeatureExtractor
+                FeatureExtractor.check_schema(model_schema)
+
             x = self._build_features(bar_features, self._exit_model)
             proba = self._exit_model["model"].predict_proba(x)[0]
             # proba[1] = P(label_hold_better=1) = P(HOLD is better)

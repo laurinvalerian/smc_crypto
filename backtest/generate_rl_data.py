@@ -854,6 +854,10 @@ def _simulate_forward(
     be_ratchet_r: float = 1.5,
     asset_class: str = "crypto",
     emit_bar_rows: bool = False,
+    rsi_5m_arr: np.ndarray | None = None,
+    adx_1h_arr: np.ndarray | None = None,
+    atr_5m_arr: np.ndarray | None = None,
+    asset_class_id: float = 0.0,
 ) -> tuple[str, float, int, float, int] | tuple[str, float, int, float, int, list[dict]]:
     """
     Simulate a trade forward from entry_idx.
@@ -915,13 +919,35 @@ def _simulate_forward(
 
         # Collect bar state for exit episodes (causal: only data known at this bar)
         if emit_bar_rows:
+            # -- derived features for 15-col schema --
+            rsi_val = float(rsi_5m_arr[i]) if rsi_5m_arr is not None and i < len(rsi_5m_arr) else 50.0
+            adx_val = float(adx_1h_arr[i]) if adx_1h_arr is not None and i < len(adx_1h_arr) else 25.0
+            atr_val = float(atr_5m_arr[i]) if atr_5m_arr is not None and i < len(atr_5m_arr) else 0.0
+            atr_norm = atr_val / bar_close if bar_close > 0 and atr_val > 0 else 0.005
+            prev_rr = bar_rows[-1]["bar_unrealized_rr"] if bar_rows else 0.0
+            pnl_velocity = unrealized_rr - prev_rr
+            mfe_dd = (best_favorable_rr - unrealized_rr) / best_favorable_rr if best_favorable_rr > 0 else 0.0
+            bars_in_profit = sum(1 for r in bar_rows if r["bar_unrealized_rr"] > 0) + (1 if unrealized_rr > 0 else 0)
+            time_in_profit_ratio = bars_in_profit / max(bars_held, 1)
+            sl_dist_atr = max(sl_dist_pct, 0.0) / max(atr_norm, 1e-6)
+
             bar_rows.append({
                 "bar_index": bars_held,
+                "bars_held": bars_held,
                 "bar_unrealized_rr": unrealized_rr,
                 "sl_distance_pct": max(sl_dist_pct, 0.0),
                 "max_favorable_seen": best_favorable_rr,
-                "bars_held": bars_held,
                 "be_triggered": int(be_triggered),
+                "asset_class_id": asset_class_id,
+                "rsi_5m": rsi_val / 100.0,
+                "adx_1h": adx_val / 50.0,
+                "bars_held_normalized": bars_held / MAX_FORWARD_BARS,
+                "pnl_velocity": float(np.clip(pnl_velocity, -1.0, 1.0)),
+                "mfe_drawdown": float(np.clip(mfe_dd, 0.0, 1.0)),
+                "time_in_profit_ratio": float(np.clip(time_in_profit_ratio, 0.0, 1.0)),
+                "sl_distance_atr": float(np.clip(sl_dist_atr, 0.0, 5.0)),
+                "regime_volatility": 1.0,
+                "opposing_structure_count": 0,
                 # label_hold_better backfilled after exit (two-pass)
                 "label_hold_better": None,
             })
@@ -1520,6 +1546,37 @@ def _process_exit_episodes_worker(args: tuple) -> "pd.DataFrame | None":
 
         window_start_ts = pd.Timestamp(w_start, tz="UTC")
 
+        # Pre-compute indicator arrays for bar-level exit features (causal)
+        from features.feature_extractor import ASSET_CLASS_MAP as _EXIT_AC_MAP
+        close_5m = df_5m["close"].values.astype(float)
+        high_5m = df_5m["high"].values.astype(float)
+        low_5m = df_5m["low"].values.astype(float)
+        rsi_5m_arr = _compute_rsi(close_5m, period=14)
+        atr_5m_arr = _compute_atr(high_5m, low_5m, close_5m, period=14)
+
+        # ADX on 1h if available, else default array
+        df_1h = frames.get("1h")
+        if df_1h is not None and len(df_1h) >= 30:
+            adx_1h_full = _compute_adx(
+                df_1h["high"].values.astype(float),
+                df_1h["low"].values.astype(float),
+                df_1h["close"].values.astype(float),
+                period=14,
+            )
+            # Upsample 1h ADX to 5m resolution via forward-fill index mapping
+            ts_1h = df_1h["timestamp"].values
+            ts_5m_vals = df_5m["timestamp"].values
+            adx_1h_arr = np.full(len(df_5m), 25.0)
+            j = 0
+            for k in range(len(ts_5m_vals)):
+                while j + 1 < len(ts_1h) and ts_1h[j + 1] <= ts_5m_vals[k]:
+                    j += 1
+                adx_1h_arr[k] = adx_1h_full[j]
+        else:
+            adx_1h_arr = np.full(len(df_5m), 25.0)
+
+        ac_id = _EXIT_AC_MAP.get(ac, 0.0)
+
         # Get teacher-labeled entries (lookahead for detection, not for bar features)
         label_df = generate_teacher_labels(
             frames, lookahead_inds, ac, smc_params,
@@ -1567,6 +1624,8 @@ def _process_exit_episodes_worker(args: tuple) -> "pd.DataFrame | None":
                 df_5m, entry_idx, entry_price, stop_loss, take_profit,
                 direction, commission_pct=commission, slippage_pct=slippage,
                 asset_class=ac, emit_bar_rows=True,
+                rsi_5m_arr=rsi_5m_arr, adx_1h_arr=adx_1h_arr,
+                atr_5m_arr=atr_5m_arr, asset_class_id=ac_id,
             )
             if len(result) != 6:
                 continue
