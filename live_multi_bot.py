@@ -1149,7 +1149,7 @@ class PaperBot:
                             be_triggered=bool(trade.get("be_triggered", False)),
                             asset_class=self.asset_class,
                             rsi_5m=rsi_val,  # raw [0,100], extractor normalizes
-                            adx_1h=_adx_1h_val * 50.0,  # convert back to raw for extractor
+                            adx_1h=_adx_1h_val,  # raw [0,100] from compute_adx; extractor normalizes
                             atr_5m=float(trade.get("_atr_5m", 0.001)),
                             prev_unrealized_pnl_pct=_prev_pnl,
                             bars_in_profit=_bars_in_profit,
