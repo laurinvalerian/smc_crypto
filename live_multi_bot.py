@@ -73,6 +73,7 @@ from filters.trend_strength import compute_adx, check_momentum_confluence, multi
 from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
+from features.feature_extractor import FeatureExtractor
 from exchanges import BinanceAdapter
 from exchanges.base import ExchangeAdapter
 from risk.circuit_breaker import CircuitBreaker
@@ -1090,6 +1091,30 @@ class PaperBot:
                         unrealized_pnl_pct = (entry_price - bar_close) / entry_price
                         sl_dist_pct = max((current_sl - bar_close) / bar_close, 0.0)
 
+                # Track bar-level stats for exit feature extraction
+                if "_prev_unrealized_pnl_pct" not in trade:
+                    trade["_prev_unrealized_pnl_pct"] = 0.0
+                    trade["_bars_in_profit"] = 0
+                    trade["_struct_breaks_against"] = 0
+                if unrealized_pnl_pct > 0:
+                    trade["_bars_in_profit"] = trade.get("_bars_in_profit", 0) + 1
+                trade["_prev_unrealized_pnl_pct"] = unrealized_pnl_pct
+
+                # Compute ADX for journal recording (matching generate_rl_data logic)
+                _adx_1h_val = 0.0
+                if not self.buffer_1h.empty and len(self.buffer_1h) >= 20:
+                    try:
+                        _h1_highs = self.buffer_1h["high"].values.astype(np.float64)
+                        _h1_lows = self.buffer_1h["low"].values.astype(np.float64)
+                        _h1_closes = self.buffer_1h["close"].values.astype(np.float64)
+                        if len(_h1_highs) >= 14:
+                            _adx_result, _, _ = compute_adx(
+                                _h1_highs, _h1_lows, _h1_closes, period=14
+                            )
+                            _adx_1h_val = float(_adx_result) if _adx_result is not None and not np.isnan(_adx_result) else 0.0
+                    except Exception:
+                        pass
+
                 try:
                     self.journal.record_bar(
                         trade_id=trade_id,
@@ -1102,6 +1127,7 @@ class PaperBot:
                         unrealized_pnl_pct=unrealized_pnl_pct,
                         sl_distance_pct=sl_dist_pct,
                         rsi_5m=rsi_val / 100.0,  # normalise to [0,1]
+                        adx_1h=_adx_1h_val,
                     )
                 except Exception as exc:
                     self.logger.debug("journal.record_bar error: %s", exc)
@@ -1110,15 +1136,27 @@ class PaperBot:
                 if (self.rl_suite is not None and
                         hasattr(self.rl_suite, "predict_early_exit")):
                     try:
-                        bar_features = {
-                            "bars_held": float(bars_held),
-                            "bar_unrealized_rr": unrealized_pnl_pct / max(float(trade.get("risk_pct", 0.01)), 1e-6),
-                            "sl_distance_pct": sl_dist_pct,
-                            "max_favorable_seen": self.journal._max_favorable.get(trade_id, 0.0),
-                            "be_triggered": float(trade.get("be_triggered", False)),
-                            "asset_class_id": float({"crypto": 0, "forex": 1, "stocks": 2, "commodities": 3}.get(self.asset_class, 0)),
-                            "rsi_5m": rsi_val / 100.0,
-                        }
+                        _risk_pct = float(trade.get("risk_pct", 0.01))
+                        _prev_pnl = float(trade.get("_prev_unrealized_pnl_pct", 0.0))
+                        _bars_in_profit = int(trade.get("_bars_in_profit", 0))
+
+                        bar_features = FeatureExtractor.extract_exit_bar_features(
+                            bars_held=bars_held,
+                            unrealized_pnl_pct=unrealized_pnl_pct,
+                            risk_pct=_risk_pct,
+                            sl_distance_pct=sl_dist_pct,
+                            max_favorable_seen=self.journal._max_favorable.get(trade_id, 0.0),
+                            be_triggered=bool(trade.get("be_triggered", False)),
+                            asset_class=self.asset_class,
+                            rsi_5m=rsi_val,  # raw [0,100], extractor normalizes
+                            adx_1h=_adx_1h_val * 50.0,  # convert back to raw for extractor
+                            atr_5m=float(trade.get("_atr_5m", 0.001)),
+                            prev_unrealized_pnl_pct=_prev_pnl,
+                            bars_in_profit=_bars_in_profit,
+                            std_returns_50=float(trade.get("_std_ret_50", 0.01)),
+                            std_returns_200=float(trade.get("_std_ret_200", 0.01)),
+                            structure_breaks_against=int(trade.get("_struct_breaks_against", 0)),
+                        )
                         should_exit, exit_conf = self.rl_suite.predict_early_exit(bar_features)
                         if should_exit:
                             self.logger.info(
@@ -1839,8 +1877,7 @@ class PaperBot:
 
         # ── RL Brain gate ────────────────────────────────────────────
         # XGBoost models are pre-trained (19M rows) — no warmup needed.
-        # PPO brain (legacy) still uses warmup for online learning.
-        use_ppo_brain = self.trades >= WARMUP_TRADES
+        use_ppo_brain = False  # PPO gate removed (v2)
         rl_tracked = False
         rl_trade_id: str | None = None
         take_trade = True
@@ -1873,20 +1910,9 @@ class PaperBot:
                 self._rl_accepted, self._rl_rejected,
             )
 
-        # PPO brain (legacy, runs after XGBoost filter — warmup gated)
-        if use_ppo_brain and self.brain is not None:
-            rl_decision, rl_trade_id = self.brain.should_trade(obs, coin_id=self.symbol)
-            rl_tracked = True
-            take_trade = rl_decision
-            if not take_trade:
-                self.logger.info(
-                    "RL skipped trade for %s because decision=0 (score=%.2f)",
-                    symbol,
-                    score,
-                )
-                self.brain.record_outcome(trade_id=rl_trade_id, reward=0.0, done=True)
-                self._pending_signal = None
-                return
+        # PPO brain gate REMOVED (v2) -- XGBoost entry filter is sole ML gate.
+        # PPO with 256-buffer and 100-trade warmup learned nothing useful.
+        # Module kept on disk for legacy compatibility.
 
         # ── Fetch real balance (1 % risk) ─────────────────────────
         balance = await self._fetch_balance()

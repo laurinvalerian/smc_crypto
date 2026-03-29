@@ -233,3 +233,63 @@ rl_brain:
     model_path: "models/rl_be_manager.pkl"
     min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
     fee_buffer: true         # Add fee buffer when moving to BE
+
+# ═══════════════════════════════════════════════════════
+# Exit Classifier Configuration (Phase 2A)
+# ═══════════════════════════════════════════════════════
+exit_classifier:
+  enabled: false                    # Shadow mode until validated
+  confidence_threshold: 0.75        # Conservative — only exit when very confident
+  model_path: "models/rl_exit_classifier.pkl"
+  min_favorable_rr: 0.5            # Only consider exit after 0.5R favorable
+  min_bars_held: 6                  # Minimum 30 minutes before ML exit
+  shadow_log: true                  # Log predictions even when disabled
+  be_ratchet_priority: true         # Suppress between 0.5R and BE trigger level
+
+# ═══════════════════════════════════════════════════════
+# DQN Exit Manager Configuration (Phase 2B)
+# ═══════════════════════════════════════════════════════
+dqn_exit_manager:
+  enabled: false                    # Shadow mode until validated vs XGBoost
+  model_path: "models/dqn_exit_manager.zip"
+  shadow_log: true
+  agreement_mode: "xgb_primary"    # xgb_primary | dqn_primary | both_agree
+  # Training params (MacBook only, not used on server)
+  training:
+    buffer_size: 500000
+    batch_size: 256
+    learning_rate: 0.0003
+    gamma: 0.99
+    net_arch: [128, 128]
+    gradient_steps: 4
+    target_update_interval: 1000
+    exploration_final_eps: 0.02
+
+# ═══════════════════════════════════════════════════════
+# Continuous Learning Configuration (Phase 4)
+# ═══════════════════════════════════════════════════════
+continuous_learner:
+  enabled: false
+  retrain_interval_hours: 168       # Weekly
+  min_trades_for_retrain: 200
+  recency_halflife_trades: 200      # Exponential decay w(t) = exp(-ln2 * age/halflife)
+  auc_gate: 0.55                    # Exit classifier minimum AUC
+  agreement_gate: 0.80              # 80% prediction overlap required
+  model_versions_keep: 5
+  rollback_min_trades: 20           # Min trades before evaluating rollback
+  rollback_cumulative_pnl: -0.03    # Rollback if cumPnL < -3% after min_trades
+  rollback_min_winrate: 0.20        # Rollback if WR < 20% after min_trades
+
+# ═══════════════════════════════════════════════════════
+# Trade Journal Configuration
+# ═══════════════════════════════════════════════════════
+journal:
+  enabled: true
+  db_path: "trade_journal/journal.db"
+  batch_flush_seconds: 30
+  max_error_count: 10
+  error_window_seconds: 300
+  post_trade_bars: 50
+  max_concurrent_watchers: 20
+  max_db_size_mb: 1024              # Disable writes if journal.db > 1GB
+  min_disk_free_mb: 500             # Disable writes if free disk < 500MB
