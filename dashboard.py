@@ -18,19 +18,91 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import secrets
+from functools import wraps
+
 import yaml
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, session, redirect, url_for
 
 app = Flask(__name__)
 RESULTS_DIR = Path("live_results")
 
-# ── PIN from config ────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────
 try:
     with open("config/default_config.yaml") as _f:
         _cfg = yaml.safe_load(_f)
     DASHBOARD_PIN = str(_cfg.get("dashboard", {}).get("pin", "1234"))
+    DASHBOARD_USER = str(_cfg.get("dashboard", {}).get("username", "admin"))
+    DASHBOARD_PASS = str(_cfg.get("dashboard", {}).get("password", "changeme123"))
 except Exception:
     DASHBOARD_PIN = "1234"
+    DASHBOARD_USER = "admin"
+    DASHBOARD_PASS = "changeme123"
+
+app.secret_key = secrets.token_hex(32)
+app.permanent_session_lifetime = timedelta(hours=24)
+
+
+# ── Auth ───────────────────────────────────────────────────────────
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SMC Bot — Login</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;
+     display:flex;justify-content:center;align-items:center;min-height:100vh}
+.login-card{background:#16213e;border-radius:16px;padding:40px;width:340px;
+            box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+h1{font-size:22px;text-align:center;margin-bottom:24px;color:#a0c4ff}
+input{width:100%;padding:14px;margin:8px 0;background:#0f3460;border:1px solid #333;
+      color:white;border-radius:8px;font-size:16px}
+input:focus{outline:none;border-color:#4a9eff}
+button{width:100%;padding:14px;margin-top:16px;background:#27ae60;color:white;
+       border:none;border-radius:8px;font-size:18px;font-weight:bold;cursor:pointer}
+button:hover{background:#2ecc71}
+.error{color:#e74c3c;text-align:center;margin-top:12px;font-size:14px}
+.subtitle{text-align:center;color:#666;font-size:13px;margin-bottom:20px}
+</style></head><body>
+<div class="login-card">
+<h1>SMC Trading Bot</h1>
+<p class="subtitle">Paper Trading Dashboard</p>
+<form method="POST" action="/login">
+<input type="text" name="username" placeholder="Username" autocomplete="username" required>
+<input type="password" name="password" placeholder="Password" autocomplete="current-password" required>
+<button type="submit">Login</button>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+</form></div></body></html>"""
+
+
+def login_required(f):
+    """Decorator: redirect to /login if not authenticated."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("authenticated"):
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        user = request.form.get("username", "")
+        pwd = request.form.get("password", "")
+        if user == DASHBOARD_USER and pwd == DASHBOARD_PASS:
+            session.permanent = True
+            session["authenticated"] = True
+            return redirect(url_for("index"))
+        return render_template_string(LOGIN_HTML, error="Invalid credentials"), 401
+    return render_template_string(LOGIN_HTML, error=None)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 # ── Bot symbol -> asset class mapping (parsed once from logs) ─────
 _BOT_MAP: dict[str, dict] = {}
@@ -587,21 +659,25 @@ def _get_trade_detail(trade_id: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/api/stats")
+@login_required
 def api_stats():
     return jsonify(_aggregate_stats())
 
 
 @app.route("/api/ml-metrics")
+@login_required
 def api_ml_metrics():
     return jsonify(_get_ml_metrics())
 
 
 @app.route("/api/journal/recent")
+@login_required
 def api_journal_recent():
     return jsonify(_get_journal_recent())
 
 
 @app.route("/api/journal/trade/<trade_id>")
+@login_required
 def api_journal_trade(trade_id: str):
     return jsonify(_get_trade_detail(trade_id))
 
@@ -611,6 +687,7 @@ def api_journal_trade(trade_id: str):
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/api/control/stop", methods=["POST"])
+@login_required
 def api_stop():
     """Kill the trading bot process."""
     err = _verify_pin()
@@ -641,6 +718,7 @@ def api_stop():
 
 
 @app.route("/api/control/pause", methods=["POST"])
+@login_required
 def api_pause():
     """Pause new trades (existing trades continue)."""
     err = _verify_pin()
@@ -654,6 +732,7 @@ def api_pause():
 
 
 @app.route("/api/control/resume", methods=["POST"])
+@login_required
 def api_resume():
     """Resume trading."""
     err = _verify_pin()
@@ -667,6 +746,7 @@ def api_resume():
 
 
 @app.route("/api/control/toggle", methods=["POST"])
+@login_required
 def api_toggle_component():
     """Toggle a component on/off."""
     err = _verify_pin()
@@ -698,6 +778,7 @@ def api_toggle_component():
 
 
 @app.route("/api/control/status")
+@login_required
 def api_control_status():
     """Get bot status without PIN."""
     pid = _find_bot_pid()
@@ -799,6 +880,7 @@ def api_control_status():
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/")
+@login_required
 def index():
     return render_template_string(CONTROL_PANEL_HTML)
 
@@ -922,6 +1004,7 @@ input:checked + .slider:before { transform: translateX(24px); }
   <!-- Header -->
   <div class="header">
     <h1>SMC Trading Bot &mdash; Control Panel</h1>
+    <a href="/logout" style="position:absolute;top:16px;right:16px;color:#888;font-size:13px;text-decoration:none;padding:6px 12px;border:1px solid #444;border-radius:6px;">Logout</a>
     <div class="header-right">
       <div class="status-indicator">
         <span class="status-dot dot-red" id="status-dot"></span>
