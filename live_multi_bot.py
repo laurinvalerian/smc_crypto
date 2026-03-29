@@ -211,6 +211,8 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
 FIXED_SMC_PARAMS: dict[str, Any] = ASSET_SMC_PARAMS["crypto"]
 
 
+_smc_log = logging.getLogger(__name__)
+
 def _load_optimized_smc_params() -> dict[str, dict]:
     """Load per-cluster optimized SMC params. Falls back to ASSET_SMC_PARAMS if not available."""
     clusters_path = Path("config/instrument_clusters.json")
@@ -245,10 +247,10 @@ def _load_optimized_smc_params() -> dict[str, dict]:
                 # Forex/commodities already use OANDA format (EUR_USD)
 
         if symbol_params:
-            logger.info("Loaded optimized SMC params for %d symbol keys", len(symbol_params))
+            _smc_log.info("Loaded optimized SMC params for %d symbol keys", len(symbol_params))
         return symbol_params
     except Exception as e:
-        logger.warning("Failed loading optimized SMC params: %s", e)
+        _smc_log.warning("Failed loading optimized SMC params: %s", e)
         return {}
 
 
