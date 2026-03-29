@@ -44,7 +44,7 @@ def _get_dqn_kwargs() -> dict:
         target_update_interval=1000,
         exploration_fraction=0.3,
         exploration_final_eps=0.02,
-        optimize_memory_usage=True,
+        optimize_memory_usage=False,
         learning_starts=1000,
         verbose=1,
     )

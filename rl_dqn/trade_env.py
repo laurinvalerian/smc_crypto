@@ -155,9 +155,26 @@ def _load_episodes_from_parquet(
         if walk_forward_end:
             data = data[data[ts_col] <= pd.Timestamp(walk_forward_end)]
 
+    # Synthesize trade_id if missing: detect episode boundaries where bars_held resets
     if "trade_id" not in data.columns:
-        logger.warning("No trade_id column -- using dummy episodes")
-        return _generate_dummy_episodes()
+        if "bars_held" in data.columns:
+            # Episode boundary = where bars_held decreases (new trade starts)
+            bh = data["bars_held"].values
+            boundaries = np.where(np.diff(bh) < 0)[0] + 1
+            trade_ids = np.zeros(len(data), dtype=np.int64)
+            tid = 0
+            prev = 0
+            for b in boundaries:
+                trade_ids[prev:b] = tid
+                tid += 1
+                prev = b
+            trade_ids[prev:] = tid
+            data = data.copy()
+            data["trade_id"] = trade_ids
+            logger.info("Synthesized %d trade_ids from bars_held boundaries", tid + 1)
+        else:
+            logger.warning("No trade_id or bars_held column -- using dummy episodes")
+            return _generate_dummy_episodes()
 
     # Determine which feature columns are present
     available_feats = [f for f in EXIT_BAR_FEATURE_NAMES if f in data.columns]
