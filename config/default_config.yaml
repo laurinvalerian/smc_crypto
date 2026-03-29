@@ -238,8 +238,8 @@ rl_brain:
 # Exit Classifier Configuration (Phase 2A)
 # ═══════════════════════════════════════════════════════
 exit_classifier:
-  enabled: false                    # Shadow mode until validated
-  confidence_threshold: 0.75        # Conservative — only exit when very confident
+  enabled: true                     # AUC 0.68, Sharpe +381% in backtest
+  confidence_threshold: 0.65        # Optimal balance at 46% exit rate, +82% Sharpe
   model_path: "models/rl_exit_classifier.pkl"
   min_favorable_rr: 0.5            # Only consider exit after 0.5R favorable
   min_bars_held: 6                  # Minimum 30 minutes before ML exit

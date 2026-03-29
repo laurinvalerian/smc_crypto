@@ -25,6 +25,7 @@ SCHEMA_VERSION = "1.0"
 # Ordered feature names (positions matter for the model)
 # ---------------------------------------------------------------------------
 EXIT_BAR_FEATURE_NAMES: list[str] = [
+    "bar_index",
     "bars_held",
     "bar_unrealized_rr",
     "sl_distance_pct",
@@ -56,6 +57,7 @@ ASSET_CLASS_MAP: Dict[str, float] = {
 # Expected value ranges per feature (for validate_features)
 # ---------------------------------------------------------------------------
 _FEATURE_RANGES: Dict[str, tuple[float, float]] = {
+    "bar_index":                 (0.0, 576.0),
     "bars_held":                 (0.0, 576.0),
     "bar_unrealized_rr":         (-3.0, 10.0),
     "sl_distance_pct":           (0.0, 0.1),
@@ -127,12 +129,15 @@ class FeatureExtractor:
         structure_breaks_against: int,
         max_hold_bars: int = 576,
     ) -> dict[str, float]:
-        """Build the 15-element exit-bar feature dict.
+        """Build the 16-element exit-bar feature dict.
 
         All heavy normalisation / clamping happens here so callers pass raw
         values and always get a model-ready dict back.
         """
         safe_risk = max(risk_pct, 1e-6)
+
+        # 0. bar_index (identical to bars_held -- kept for model compatibility)
+        f_bar_index = float(np.clip(bars_held, 0, max_hold_bars))
 
         # 1. bars_held (raw, integer-valued float)
         f_bars_held = float(np.clip(bars_held, 0, max_hold_bars))
@@ -206,6 +211,7 @@ class FeatureExtractor:
         f_opposing_structure_count = float(min(structure_breaks_against, 10))
 
         return {
+            "bar_index":                 f_bar_index,
             "bars_held":                 f_bars_held,
             "bar_unrealized_rr":         f_bar_unrealized_rr,
             "sl_distance_pct":           f_sl_distance_pct,
@@ -236,7 +242,7 @@ class FeatureExtractor:
 
     @staticmethod
     def validate_features(features: dict[str, float]) -> list[str]:
-        """Check all 15 keys are present and values fall in expected ranges.
+        """Check all 16 keys are present and values fall in expected ranges.
 
         Returns a list of human-readable violation strings (empty == all OK).
         """

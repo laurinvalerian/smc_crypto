@@ -74,6 +74,7 @@ from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
 from features.feature_extractor import FeatureExtractor
+from rl_dqn.dqn_inference import DQNExitManager
 from exchanges import BinanceAdapter
 from exchanges.base import ExchangeAdapter
 from risk.circuit_breaker import CircuitBreaker
@@ -208,6 +209,42 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
 
 # Legacy alias (used by some methods that haven't been migrated yet)
 FIXED_SMC_PARAMS: dict[str, Any] = ASSET_SMC_PARAMS["crypto"]
+
+
+def _load_optimized_smc_params() -> dict[str, dict]:
+    """Load per-cluster optimized SMC params. Falls back to ASSET_SMC_PARAMS if not available."""
+    clusters_path = Path("config/instrument_clusters.json")
+    results_dir = Path("backtest/results/smc_optimization")
+
+    if not clusters_path.exists() or not results_dir.exists():
+        return {}  # No optimized params available
+
+    try:
+        with open(clusters_path) as f:
+            clusters = json.load(f)
+
+        symbol_params: dict[str, dict] = {}
+        for cid, info in clusters.get("clusters", {}).items():
+            params_file = results_dir / f"cluster_{cid}_params.json"
+            if not params_file.exists():
+                continue
+            with open(params_file) as f:
+                opt = json.load(f)
+            optimized = opt.get("optimized_params", {})
+            if not optimized:
+                continue
+            # Map optimized params to all instruments in this cluster
+            for sym in info.get("instruments", []):
+                symbol_params[sym] = optimized
+
+        return symbol_params
+    except Exception as e:
+        logger.warning("Failed loading optimized SMC params: %s", e)
+        return {}
+
+
+# Module-level cache
+_OPTIMIZED_SMC_PARAMS: dict[str, dict] = _load_optimized_smc_params()
 
 # ── Asset-Class Leverage Caps ────────────────────────────────────
 ASSET_MAX_LEVERAGE: dict[str, int] = {
@@ -431,8 +468,11 @@ class PaperBot:
         # Backward-compat: raw ccxt.pro exchange (only BinanceAdapter has .raw)
         # Legacy self.exchange removed — all calls go through self.adapter now
 
-        # Asset-class-specific SMC parameters
-        smc = ASSET_SMC_PARAMS.get(asset_class, ASSET_SMC_PARAMS["crypto"])
+        # Use per-symbol optimized params merged on top of per-class defaults
+        smc = ASSET_SMC_PARAMS.get(asset_class, ASSET_SMC_PARAMS["crypto"]).copy()
+        _opt = _OPTIMIZED_SMC_PARAMS.get(self.symbol)
+        if _opt:
+            smc.update(_opt)
         self.swing_length: int = smc["swing_length"]
         self.fvg_threshold: float = smc["fvg_threshold"]
         self.ob_lookback: int = smc.get("order_block_lookback", 15)
@@ -499,6 +539,11 @@ class PaperBot:
             raise ValueError("central_brain must be provided")
         self.brain = central_brain
         self.rl_suite = rl_suite
+
+        # DQN exit manager (shadow mode -- logs alongside XGBoost for comparison)
+        self._dqn_exit = None
+        self._dqn_cfg = config.get("dqn_exit_manager", {})
+
         # RL monitoring stats
         self._rl_accepted: int = 0
         self._rl_rejected: int = 0
@@ -522,6 +567,20 @@ class PaperBot:
             "Initialised %s | symbol=%s | class=%s | equity=%.2f",
             self.tag, symbol, self.asset_class, self.equity,
         )
+        if self.symbol in _OPTIMIZED_SMC_PARAMS:
+            self.logger.info("Using OPTIMIZED SMC params for %s (cluster-tuned)", self.symbol)
+        else:
+            self.logger.info("Using DEFAULT SMC params for %s (%s class)", self.symbol, asset_class)
+
+        # DQN exit manager init (deferred until logger is ready)
+        if self._dqn_cfg.get("shadow_log", False):
+            _dqn_path = self._dqn_cfg.get("model_path", "models/dqn_exit_manager.zip")
+            self._dqn_exit = DQNExitManager(_dqn_path)
+            if self._dqn_exit.is_available():
+                self.logger.info("DQN exit manager loaded (shadow mode)")
+            else:
+                self.logger.info("DQN exit manager not available (model missing or SB3 not installed)")
+                self._dqn_exit = None
 
         # Near-miss diagnostic state (rate-limiting)
         self._last_neutral_bias_log_hour = -1
@@ -1132,7 +1191,7 @@ class PaperBot:
                 except Exception as exc:
                     self.logger.debug("journal.record_bar error: %s", exc)
 
-                # ── Shadow exit prediction (logs only, never acts) ────
+                # ── ML exit prediction (acts when enabled + gates pass) ────
                 if (self.rl_suite is not None and
                         hasattr(self.rl_suite, "predict_early_exit")):
                     try:
@@ -1158,15 +1217,81 @@ class PaperBot:
                             structure_breaks_against=int(trade.get("_struct_breaks_against", 0)),
                         )
                         should_exit, exit_conf = self.rl_suite.predict_early_exit(bar_features)
-                        if should_exit:
+
+                        # Safety gates
+                        _exit_conf_threshold = self.rl_suite.exit_threshold
+                        _exit_min_bars = 6
+                        _exit_min_favorable = 0.5
+                        _exit_be_priority = True
+
+                        bars_count = int(trade.get("_bars_held_count", bars_held))
+                        unrealized_rr = bar_features.get("bar_unrealized_rr", 0)
+                        be_trig = bool(trade.get("be_triggered", False))
+                        be_ratchet_r = self.rl_suite.min_be_rr if self.rl_suite.be_enabled else 1.5
+
+                        gate_pass = (
+                            should_exit
+                            and exit_conf >= _exit_conf_threshold
+                            and bars_count >= _exit_min_bars
+                            and unrealized_rr >= _exit_min_favorable
+                        )
+
+                        # BE ratchet priority: suppress between 0.5R and BE trigger if BE not yet active
+                        if _exit_be_priority and not be_trig and _exit_min_favorable < unrealized_rr < be_ratchet_r:
+                            gate_pass = False
+
+                        if gate_pass and self.rl_suite.exit_enabled:
                             self.logger.info(
-                                "EXIT_SHADOW %s %s bar=%d conf=%.3f unrealized=%.2f%% "
-                                "[SHADOW MODE — no action taken]",
-                                symbol, direction.upper(), bars_held, exit_conf,
-                                unrealized_pnl_pct * 100,
+                                "ML_EXIT %s %s bar=%d conf=%.3f rr=%.2f — requesting close",
+                                symbol, direction.upper(), bars_count, exit_conf, unrealized_rr,
+                            )
+                            trade["_ml_exit_requested"] = True
+                            trade["_ml_exit_reason"] = "ml_exit"
+                        elif should_exit:
+                            self.logger.info(
+                                "EXIT_SHADOW %s %s bar=%d conf=%.3f rr=%.2f "
+                                "[gates: enabled=%s conf_ok=%s bars_ok=%s pnl_ok=%s be_ok=%s]",
+                                symbol, direction.upper(), bars_count, exit_conf, unrealized_rr,
+                                self.rl_suite.exit_enabled, exit_conf >= _exit_conf_threshold,
+                                bars_count >= _exit_min_bars, unrealized_rr >= _exit_min_favorable,
+                                not (_exit_be_priority and not be_trig and _exit_min_favorable < unrealized_rr < be_ratchet_r),
                             )
                     except Exception as exc:
-                        self.logger.debug("shadow exit prediction error: %s", exc)
+                        self.logger.debug("exit prediction error: %s", exc)
+
+                # DQN shadow prediction (alongside XGBoost)
+                if self._dqn_exit is not None and self._dqn_exit.is_available():
+                    try:
+                        _risk_pct_dqn = float(trade.get("risk_pct", 0.01))
+                        _prev_pnl_dqn = float(trade.get("_prev_unrealized_pnl_pct", 0.0))
+                        _bars_in_profit_dqn = int(trade.get("_bars_in_profit", 0))
+                        dqn_features = FeatureExtractor.extract_exit_bar_features(
+                            bars_held=bars_held,
+                            unrealized_pnl_pct=unrealized_pnl_pct,
+                            risk_pct=_risk_pct_dqn,
+                            sl_distance_pct=sl_dist_pct,
+                            max_favorable_seen=self.journal._max_favorable.get(trade_id, 0.0) if self.journal else 0.0,
+                            be_triggered=bool(trade.get("be_triggered", False)),
+                            asset_class=self.asset_class,
+                            rsi_5m=rsi_val,
+                            adx_1h=_adx_1h_val,
+                            atr_5m=float(trade.get("_atr_5m", 0.001)),
+                            prev_unrealized_pnl_pct=_prev_pnl_dqn,
+                            bars_in_profit=_bars_in_profit_dqn,
+                            std_returns_50=float(trade.get("_std_ret_50", 0.01)),
+                            std_returns_200=float(trade.get("_std_ret_200", 0.01)),
+                            structure_breaks_against=int(trade.get("_struct_breaks_against", 0)),
+                        )
+                        dqn_action, dqn_conf = self._dqn_exit.predict(dqn_features)
+                        action_names = {0: "HOLD", 1: "EXIT", 2: "MOVE_SL", 3: "PARTIAL"}
+                        self.logger.info(
+                            "DQN_SHADOW %s %s bar=%d action=%s conf=%.3f rr=%.2f",
+                            symbol, direction.upper(), bars_held,
+                            action_names.get(dqn_action, "?"), dqn_conf,
+                            unrealized_pnl_pct / max(float(trade.get("risk_pct", 0.01)), 1e-6),
+                        )
+                    except Exception as exc:
+                        self.logger.debug("DQN shadow error: %s", exc)
 
     # ── Simple alignment score ────────────────────────────────────
 
@@ -3697,14 +3822,18 @@ class LiveMultiBotRunner:
 
                         outcome_str = "win" if net_pnl > 0 else "loss"
                         # Determine exit reason from price proximity to SL/TP
-                        tp_price = float(trade.get("tp", 0.0))
-                        sl_price = float(trade.get("sl", 0.0))
-                        if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.003:
-                            exit_reason = "tp_hit"
-                        elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.003:
-                            exit_reason = "sl_hit"
+                        _override_reason = trade.get("_exit_reason_override")
+                        if _override_reason:
+                            exit_reason = _override_reason
                         else:
-                            exit_reason = "manual"
+                            tp_price = float(trade.get("tp", 0.0))
+                            sl_price = float(trade.get("sl", 0.0))
+                            if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.003:
+                                exit_reason = "tp_hit"
+                            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.003:
+                                exit_reason = "sl_hit"
+                            else:
+                                exit_reason = "manual"
 
                         # MFE/MAE from journal's running tracker
                         max_fav = bot.journal._max_favorable.get(trade_id_j, abs(pnl_pct / 100))
@@ -3941,6 +4070,39 @@ class LiveMultiBotRunner:
                                                 current_rr,
                                             )
 
+                        # ── ML exit: close via market when flag is set ────
+                        if trade.get("_ml_exit_requested") and bot.adapter is not None:
+                            _ml_exit_side = "sell" if trade["direction"] == "long" else "buy"
+                            try:
+                                # Cancel existing SL/TP orders
+                                for _oid_key in ("sl_order_id", "tp_order_id"):
+                                    _oid = trade.get(_oid_key)
+                                    if _oid:
+                                        try:
+                                            await bot.adapter.cancel_order(_oid, bot.symbol)
+                                        except Exception:
+                                            pass
+                                # Place market close order
+                                _ml_close = await bot.adapter.create_market_order(
+                                    bot.symbol, _ml_exit_side, trade["qty"],
+                                    {"reduceOnly": True},
+                                )
+                                _ml_exit_price = float(
+                                    _ml_close.avg_price or _ml_close.price or trade["entry"]
+                                )
+                                bot.logger.info(
+                                    "ML_EXIT CLOSED %s %s @ %.6f | order=%s",
+                                    bot.symbol, _ml_exit_side.upper(),
+                                    _ml_exit_price, _ml_close.order_id,
+                                )
+                                trade["_exit_reason_override"] = "ml_exit"
+                                await _record_close(bot, trade, _ml_exit_price)
+                                continue
+                            except Exception as _ml_exc:
+                                bot.logger.error("ML exit market close failed %s: %s", bot.symbol, _ml_exc)
+                                trade.pop("_ml_exit_requested", None)
+                                # Fall through to normal exit detection
+
                         exit_side = "sell" if trade["direction"] == "long" else "buy"
                         entry_ms = int(trade["entry_time"].timestamp() * 1000)
 
@@ -4151,6 +4313,34 @@ class LiveMultiBotRunner:
             except asyncio.TimeoutError:
                 pass
 
+    # ── Model hot-swap loop ────────────────────────────────────────
+
+    async def _model_reload_loop(self) -> None:
+        """Check for updated model files every 60 seconds and reload if changed."""
+        _MODEL_RELOAD_SEC = 60
+        while not self._shutdown.is_set():
+            try:
+                rl_suite = self.bots[0].rl_suite if self.bots else None
+                if rl_suite is not None and hasattr(rl_suite, "check_and_reload_models"):
+                    try:
+                        rl_suite.check_and_reload_models()
+                    except Exception as exc:
+                        logger.debug("Model reload check error: %s", exc)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug("Model reload loop error: %s", exc)
+
+            # Sleep until next check (or shutdown)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown.wait(),
+                    timeout=_MODEL_RELOAD_SEC,
+                )
+                return  # shutdown requested
+            except asyncio.TimeoutError:
+                pass
+
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _fetch_real_total_equity(self) -> float:
@@ -4296,6 +4486,9 @@ class LiveMultiBotRunner:
         # Periodic zombie order sweep (catches any orphans missed by per-trade cleanup)
         zombie_task = asyncio.create_task(self._sweep_zombie_orders())
 
+        # Model hot-swap check (reload updated model files every 60s)
+        model_reload_task = asyncio.create_task(self._model_reload_loop())
+
         # Rich dashboard
         dashboard_task = asyncio.create_task(self._dashboard_loop())
 
@@ -4307,13 +4500,14 @@ class LiveMultiBotRunner:
         dashboard_task.cancel()
         poll_task.cancel()
         zombie_task.cancel()
+        model_reload_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
         for t in self._ticker_tasks.values():
             t.cancel()
 
         all_tasks = (
-            [dashboard_task, poll_task, zombie_task]
+            [dashboard_task, poll_task, zombie_task, model_reload_task]
             + list(self._watcher_tasks.values())
             + list(self._ticker_tasks.values())
         )
