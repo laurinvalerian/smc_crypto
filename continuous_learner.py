@@ -206,6 +206,12 @@ def merge_training_data(
     else:
         merged = merged.reset_index(drop=True)
 
+    # Cap training data to prevent OOM on memory-constrained servers
+    if len(merged) > MAX_TRAINING_ROWS:
+        merged = merged.sample(n=MAX_TRAINING_ROWS, random_state=42)
+        merged = merged.sort_index().reset_index(drop=True)
+        logger.info("Subsampled training data to %d rows (OOM prevention)", MAX_TRAINING_ROWS)
+
     # Compute recency weights
     weights = compute_recency_weights(len(merged), halflife=halflife)
     logger.info(
@@ -642,11 +648,34 @@ def manual_rollback(slot_name: str = "entry_filter") -> bool:
 #  CLI Commands
 # ===================================================================
 
+MAX_TRAINING_ROWS = 500_000  # Cap at 500K rows to prevent OOM on 4GB server
+
+
+def _check_available_ram(min_gb: float = 1.0) -> bool:
+    """Check if enough RAM is available for training."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if "MemAvailable" in line:
+                    avail_kb = int(line.split()[1])
+                    avail_gb = avail_kb / 1024 / 1024
+                    return avail_gb >= min_gb
+    except Exception:
+        pass
+    # Fallback: can't check (macOS, etc.), proceed cautiously
+    return True
+
+
 def cmd_retrain(cfg: dict, dry_run: bool = False) -> None:
     """Full retrain pipeline: export -> merge -> train -> gate -> deploy."""
     logger.info("=" * 70)
     logger.info("CONTINUOUS LEARNER -- %s", "DRY RUN" if dry_run else "RETRAIN")
     logger.info("=" * 70)
+
+    # Pre-flight RAM check
+    if not _check_available_ram(min_gb=1.5):
+        logger.warning("[RETRAIN] Skipping -- available RAM < 1.5 GB (OOM risk)")
+        return
 
     # Step 1: Export journal
     journal_path, n_trades = export_journal(cfg)

@@ -640,7 +640,7 @@ class PaperBot:
 
     # === PERSISTENCE ===
     def _save_state(self) -> None:
-        """Persist core bot state to JSON."""
+        """Persist core bot state to JSON (atomic write)."""
         try:
             def _ser(trade: dict[str, Any]) -> dict[str, Any]:
                 d = dict(trade)
@@ -657,8 +657,10 @@ class PaperBot:
                 "peak_equity": self.peak_equity,
                 "active_trades": [_ser(t) for t in self._active_trades],
             }
-            with open(self._state_path, "w", encoding="utf-8") as f:
+            tmp_path = self._state_path.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, default=str)
+            os.replace(str(tmp_path), str(self._state_path))  # atomic on POSIX
         except Exception as exc:
             self.logger.warning("State save failed: %s", exc)
 
@@ -4358,6 +4360,13 @@ class LiveMultiBotRunner:
                         rl_suite.check_and_reload_models()
                     except Exception as exc:
                         logger.debug("Model reload check error: %s", exc)
+
+                # Periodic state persistence (every 60s, crash-safe)
+                for bot in self.bots:
+                    try:
+                        bot._save_state()
+                    except Exception:
+                        pass
             except asyncio.CancelledError:
                 return
             except Exception as exc:

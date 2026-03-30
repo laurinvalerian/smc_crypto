@@ -1702,8 +1702,12 @@ class RLBrainSuite:
         if not path.exists():
             logger.warning("Model not found: %s", path)
             return None
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError, OSError) as exc:
+            logger.error("Corrupt model file %s: %s -- skipping", path, exc)
+            return None
         logger.info("Loaded model: %s (%d features)", path, len(data.get("feat_names", [])))
         return data
 
