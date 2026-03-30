@@ -644,25 +644,6 @@ def api_connections():
     for ac in ["crypto", "forex", "stocks", "commodities"]:
         per_class[ac] = {"last_candle": None, "stale": True, "connected": False}
 
-    # Read heartbeat.json for real candle timestamps (written by bot on each candle)
-    hb_data = None
-    if heartbeat_path.exists():
-        try:
-            with open(heartbeat_path) as f:
-                hb_data = json.load(f)
-        except Exception:
-            pass
-
-    if hb_data and "per_class" in hb_data:
-        for ac in ["crypto", "forex", "stocks", "commodities"]:
-            hb_ac = hb_data["per_class"].get(ac, {})
-            if hb_ac.get("last_candle_iso"):
-                per_class[ac]["last_candle"] = hb_ac["last_candle_iso"]
-                per_class[ac]["connected"] = True
-                per_class[ac]["candles_total"] = hb_ac.get("candles_total", 0)
-                per_class[ac]["symbols_active"] = hb_ac.get("symbols_active", 0)
-                per_class[ac]["symbols_total"] = hb_ac.get("symbols_total", 0)
-
     if not log_path.exists():
         return jsonify({"exchanges": exchanges, "per_class": per_class})
 
@@ -743,6 +724,26 @@ def api_connections():
         "stocks": "Mon-Fri 13:30 UTC" if not market_open["stocks"] else None,
         "commodities": "Sun 23:00 UTC" if not market_open["commodities"] else None,
     }
+
+    # Override with heartbeat.json (real candle timestamps, written by bot on each candle)
+    # Read AFTER log parsing so heartbeat.json takes precedence
+    hb_data = None
+    if heartbeat_path.exists():
+        try:
+            with open(heartbeat_path) as f:
+                hb_data = json.load(f)
+        except Exception:
+            pass
+
+    if hb_data and "per_class" in hb_data:
+        for ac in ["crypto", "forex", "stocks", "commodities"]:
+            hb_ac = hb_data["per_class"].get(ac, {})
+            if hb_ac.get("last_candle_iso"):
+                per_class[ac]["last_candle"] = hb_ac["last_candle_iso"]
+                per_class[ac]["connected"] = True
+                per_class[ac]["candles_total"] = hb_ac.get("candles_total", 0)
+                per_class[ac]["symbols_active"] = hb_ac.get("symbols_active", 0)
+                per_class[ac]["symbols_total"] = hb_ac.get("symbols_total", 0)
 
     # Check staleness (>10 min old) and compute age
     # Use the freshest of last_candle or last_heartbeat for staleness
