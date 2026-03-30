@@ -634,6 +634,7 @@ def _format_age(seconds: int) -> str:
 def api_connections():
     """Per-exchange connection status + last candle timestamps."""
     log_path = Path("paper_trading.log")
+    heartbeat_path = Path("live_results/heartbeat.json")
     exchanges = {
         "Binance": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "crypto"},
         "OANDA": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "forex"},
@@ -642,6 +643,25 @@ def api_connections():
     per_class = {}
     for ac in ["crypto", "forex", "stocks", "commodities"]:
         per_class[ac] = {"last_candle": None, "stale": True, "connected": False}
+
+    # Read heartbeat.json for real candle timestamps (written by bot on each candle)
+    hb_data = None
+    if heartbeat_path.exists():
+        try:
+            with open(heartbeat_path) as f:
+                hb_data = json.load(f)
+        except Exception:
+            pass
+
+    if hb_data and "per_class" in hb_data:
+        for ac in ["crypto", "forex", "stocks", "commodities"]:
+            hb_ac = hb_data["per_class"].get(ac, {})
+            if hb_ac.get("last_candle_iso"):
+                per_class[ac]["last_candle"] = hb_ac["last_candle_iso"]
+                per_class[ac]["connected"] = True
+                per_class[ac]["candles_total"] = hb_ac.get("candles_total", 0)
+                per_class[ac]["symbols_active"] = hb_ac.get("symbols_active", 0)
+                per_class[ac]["symbols_total"] = hb_ac.get("symbols_total", 0)
 
     if not log_path.exists():
         return jsonify({"exchanges": exchanges, "per_class": per_class})
@@ -1408,6 +1428,7 @@ function updateConnections(d){
     else if(pc.age_seconds > 300 && isOpen){ ageColor='#d29922'; }
     else if(pc.age_seconds !== undefined && pc.age_seconds <= 300){ ageColor='#3fb950'; }
     if(pc.heartbeat_age){ ageText += ' <span style="color:#8b949e;font-size:11px;">(heartbeat: '+pc.heartbeat_age+')</span>'; }
+    if(pc.symbols_active !== undefined){ ageText += ' <span style="color:#8b949e;font-size:11px;">['+pc.symbols_active+'/'+pc.symbols_total+' symbols]</span>'; }
 
     // Error display: red only if recent (<5 min), gray if old
     var errHtml;

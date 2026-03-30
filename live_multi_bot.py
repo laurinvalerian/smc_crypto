@@ -3568,6 +3568,7 @@ class LiveMultiBotRunner:
         self._near_misses_total: int = 0
         self._symbol_restart_times: dict[str, list[float]] = {}  # symbol -> timestamps of watchdog restarts
         self._rest_fallback_symbols: set[str] = set()  # symbols degraded from WS to REST
+        self._last_status_write: float = 0.0  # debounce heartbeat.json writes
 
     # ── WebSocket OHLCV watcher with auto-reconnect ───────────────
 
@@ -3631,6 +3632,11 @@ class LiveMultiBotRunner:
                             if self.ws_status.get(symbol) != "connected":
                                 self.ws_status[symbol] = "connected"
                                 logger.info("WS %s: first candle received — connected", symbol)
+                            # Debounced status file write (max every 30s)
+                            now_t = time.time()
+                            if now_t - self._last_status_write > 30:
+                                self._last_status_write = now_t
+                                self._write_heartbeat_status()
                         except Exception as exc:
                             bot.logger.error(
                                 "Error processing candle for %s: %s", symbol, exc
@@ -3772,6 +3778,11 @@ class LiveMultiBotRunner:
                             ac = bot.asset_class
                             self._candles_by_class[ac] = self._candles_by_class.get(ac, 0) + 1
                             self._candles_since_heartbeat[ac] = self._candles_since_heartbeat.get(ac, 0) + 1
+                            # Debounced status file write (max every 30s)
+                            now_t = time.time()
+                            if now_t - self._last_status_write > 30:
+                                self._last_status_write = now_t
+                                self._write_heartbeat_status()
                         except Exception as exc:
                             bot.logger.error("Poll candle error %s: %s", bot.symbol, exc)
             except asyncio.CancelledError:
@@ -3842,6 +3853,40 @@ class LiveMultiBotRunner:
             # Reset per-heartbeat counters
             for ac in self._candles_since_heartbeat:
                 self._candles_since_heartbeat[ac] = 0
+            # Write heartbeat status file for dashboard
+            self._write_heartbeat_status()
+
+    def _write_heartbeat_status(self) -> None:
+        """Write heartbeat.json with real candle timestamps for the dashboard."""
+        now = time.time()
+        per_class: dict[str, dict[str, Any]] = {}
+        for ac in ["crypto", "forex", "stocks", "commodities"]:
+            # Find the most recent candle timestamp for this class
+            class_symbols = [b.symbol for b in self.bots if b.asset_class == ac]
+            latest = 0.0
+            for sym in class_symbols:
+                ts = self._last_candle_ts.get(sym, 0.0)
+                if ts > latest:
+                    latest = ts
+            per_class[ac] = {
+                "last_candle_epoch": latest,
+                "last_candle_iso": datetime.fromtimestamp(latest, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if latest > 0 else None,
+                "candles_total": self._candles_by_class.get(ac, 0),
+                "symbols_active": sum(1 for s in class_symbols if self._last_candle_ts.get(s, 0) > now - 600),
+                "symbols_total": len(class_symbols),
+            }
+        status = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_epoch": now,
+            "per_class": per_class,
+            "rest_fallbacks": list(self._rest_fallback_symbols),
+        }
+        try:
+            status_path = OUTPUT_DIR / "heartbeat.json"
+            with open(status_path, "w") as f:
+                json.dump(status, f)
+        except Exception:
+            pass
 
     async def _watchdog_loop(self) -> None:
         """Monitor per-symbol candle flow, restart stuck symbols, degrade to REST."""
