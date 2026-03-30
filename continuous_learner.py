@@ -648,7 +648,7 @@ def manual_rollback(slot_name: str = "entry_filter") -> bool:
 #  CLI Commands
 # ===================================================================
 
-MAX_TRAINING_ROWS = 500_000  # Cap at 500K rows to prevent OOM on 4GB server
+MAX_TRAINING_ROWS = 5_000_000  # Cap at 5M rows (safe on 8GB server)
 
 
 def _check_available_ram(min_gb: float = 1.0) -> bool:
@@ -673,8 +673,8 @@ def cmd_retrain(cfg: dict, dry_run: bool = False) -> None:
     logger.info("=" * 70)
 
     # Pre-flight RAM check
-    if not _check_available_ram(min_gb=1.5):
-        logger.warning("[RETRAIN] Skipping -- available RAM < 1.5 GB (OOM risk)")
+    if not _check_available_ram(min_gb=2.0):
+        logger.warning("[RETRAIN] Skipping -- available RAM < 2.0 GB (OOM risk)")
         return
 
     # Step 1: Export journal

@@ -250,7 +250,7 @@ exit_classifier:
 # DQN Exit Manager Configuration (Phase 2B)
 # ═══════════════════════════════════════════════════════
 dqn_exit_manager:
-  enabled: false                    # Shadow mode until validated vs XGBoost
+  enabled: true                     # Shadow mode — logs predictions alongside XGBoost
   model_path: "models/dqn_exit_manager.zip"
   shadow_log: true
   agreement_mode: "xgb_primary"    # xgb_primary | dqn_primary | both_agree
