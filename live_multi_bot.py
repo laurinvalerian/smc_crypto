@@ -285,10 +285,10 @@ ASSET_CLASS_ID: dict[str, float] = {
 }
 
 # ── REST Polling interval for OANDA/Alpaca (no WebSocket) ────────
-REST_POLL_INTERVAL_SEC = 10
-# Stocks: longer intervals to stay within Alpaca free-tier rate limits (200 req/min)
-REST_POLL_INTERVAL_STOCKS_CANDLE = 60   # 5m candles — no need to poll faster
+REST_POLL_INTERVAL_SEC = 30             # Forex/commodities: 30s (5m candles, no need for 10s)
+REST_POLL_INTERVAL_STOCKS_CANDLE = 60   # Stocks: 60s (5m candles)
 REST_POLL_INTERVAL_STOCKS_TICKER = 30
+REST_STAGGER_SEC = 2.0                  # Stagger between REST bots (was 0.5, caused OANDA timeouts)
 
 
 def symbol_to_asset_class(symbol: str) -> str:
@@ -4503,7 +4503,7 @@ class LiveMultiBotRunner:
                     stagger = _stock_idx * 2.0
                     _stock_idx += 1
                 else:
-                    stagger = _rest_idx * 0.5
+                    stagger = _rest_idx * REST_STAGGER_SEC
                     _rest_idx += 1
                 self._watcher_tasks[bot.symbol] = asyncio.create_task(
                     self._poll_candles(bot, stagger_sec=stagger)

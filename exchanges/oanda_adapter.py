@@ -252,9 +252,16 @@ class OandaAdapter(ExchangeAdapter):
             kwargs["fromTime"] = from_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             kwargs.pop("count", None)
 
-        response = await asyncio.to_thread(
-            self._api.instrument.candles, oanda_sym, **kwargs,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.instrument.candles, oanda_sym, **kwargs,
+                ),
+                timeout=15.0,  # 15s max per candle request
+            )
+        except asyncio.TimeoutError:
+            logger.debug("OANDA candle request timed out for %s", oanda_sym)
+            return []
 
         candles: list[list[float]] = []
         if hasattr(response, "body") and "candles" in response.body:

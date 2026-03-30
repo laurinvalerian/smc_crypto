@@ -269,9 +269,9 @@ dqn_exit_manager:
 # Continuous Learning Configuration (Phase 4)
 # ═══════════════════════════════════════════════════════
 continuous_learner:
-  enabled: false
-  retrain_interval_hours: 168       # Weekly
-  min_trades_for_retrain: 200
+  enabled: true                      # Auto-retrain on server
+  retrain_interval_hours: 1          # Check every hour if enough new trades
+  min_trades_for_retrain: 50         # Retrain after 50 new trades (was 200)
   recency_halflife_trades: 200      # Exponential decay w(t) = exp(-ln2 * age/halflife)
   auc_gate: 0.55                    # Exit classifier minimum AUC
   agreement_gate: 0.80              # 80% prediction overlap required
