@@ -264,7 +264,7 @@ class OandaAdapter(ExchangeAdapter):
             return []
 
         candles: list[list[float]] = []
-        if hasattr(response, "body") and "candles" in response.body:
+        if hasattr(response, "body") and response.body and "candles" in response.body:
             for c in response.body["candles"]:
                 if not c.complete:
                     continue
