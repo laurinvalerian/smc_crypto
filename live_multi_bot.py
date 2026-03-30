@@ -38,8 +38,10 @@ import csv
 import json
 import logging
 import os
+import random
 import signal
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -111,6 +113,10 @@ ZOMBIE_SWEEP_SEC = 60             # Interval (seconds) for periodic zombie order
 WS_MAX_RECONNECT = 5              # Max reconnect attempts per symbol
 WS_RECONNECT_BASE_DELAY = 2       # Base delay (seconds) for exponential backoff
 WS_GROUP_SIZE = 10                 # Symbols per WebSocket watcher group
+WS_STAGGER_SEC = 1.0              # Delay between crypto WebSocket subscriptions at startup
+HEARTBEAT_SEC = 300               # Heartbeat logging interval (5 minutes)
+WATCHDOG_SEC = 600                # Watchdog check interval (10 minutes)
+WATCHDOG_RESTART_LIMIT = 3        # Max per-symbol restarts before REST fallback
 
 # ── Top 30 Crypto (ranked by liquidity, same as backtester) ──────
 TOP_30_CRYPTO: list[str] = [
@@ -3555,24 +3561,36 @@ class LiveMultiBotRunner:
         self._watcher_tasks: dict[str, asyncio.Task[None]] = {}
         self._ticker_tasks: dict[str, asyncio.Task[None]] = {}
 
+        # ── Candle tracking + watchdog state ──────────────────────
+        self._last_candle_ts: dict[str, float] = {}  # symbol -> time.time()
+        self._candles_by_class: dict[str, int] = {ac: 0 for ac in ["crypto", "forex", "stocks", "commodities"]}
+        self._candles_since_heartbeat: dict[str, int] = {ac: 0 for ac in ["crypto", "forex", "stocks", "commodities"]}
+        self._near_misses_total: int = 0
+        self._symbol_restart_times: dict[str, list[float]] = {}  # symbol -> timestamps of watchdog restarts
+        self._rest_fallback_symbols: set[str] = set()  # symbols degraded from WS to REST
+
     # ── WebSocket OHLCV watcher with auto-reconnect ───────────────
 
-    async def _watch_symbol(self, symbol: str) -> None:
+    async def _watch_symbol(self, symbol: str, stagger_delay: float = 0.0) -> None:
         """
         Subscribe to 5 m OHLCV candles for *symbol* and feed the
         assigned bot only.
-        Auto-reconnects up to WS_MAX_RECONNECT times with exponential backoff.
+        Auto-reconnects up to WS_MAX_RECONNECT times with exponential backoff + jitter.
         """
         bot = self._symbol_to_bot.get(symbol)
         if bot is None:
             return
+
+        # Stagger startup to avoid thundering herd on ccxt.pro WebSocket
+        if stagger_delay > 0:
+            await asyncio.sleep(stagger_delay)
 
         last_ts: int | None = None
         reconnect_count = 0
 
         while not self._shutdown.is_set():
             try:
-                self.ws_status[symbol] = "connected"
+                self.ws_status[symbol] = "subscribing"
                 reconnect_count = 0  # reset on successful connection
 
                 while not self._shutdown.is_set():
@@ -3605,6 +3623,14 @@ class LiveMultiBotRunner:
 
                         try:
                             bot.on_candle(symbol, candle)
+                            # Track candle for heartbeat/watchdog
+                            self._last_candle_ts[symbol] = time.time()
+                            self._candles_by_class["crypto"] += 1
+                            self._candles_since_heartbeat["crypto"] += 1
+                            # Mark connected after first successful candle
+                            if self.ws_status.get(symbol) != "connected":
+                                self.ws_status[symbol] = "connected"
+                                logger.info("WS %s: first candle received — connected", symbol)
                         except Exception as exc:
                             bot.logger.error(
                                 "Error processing candle for %s: %s", symbol, exc
@@ -3624,13 +3650,14 @@ class LiveMultiBotRunner:
                     )
                     return
 
+                # Exponential backoff + random jitter to prevent reconnect thundering herd
                 delay = min(
                     WS_RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
                     60,
-                )
+                ) + random.uniform(0, 5)
                 self.ws_status[symbol] = f"reconnecting_{reconnect_count}"
                 logger.warning(
-                    "🔄 %s: reconnect attempt %d/%d in %.0fs: %s",
+                    "🔄 %s: reconnect attempt %d/%d in %.1fs: %s",
                     symbol, reconnect_count, WS_MAX_RECONNECT, delay, exc,
                 )
                 try:
@@ -3644,7 +3671,7 @@ class LiveMultiBotRunner:
 
     # ── WebSocket ticker watcher for real-time entry ──────────────
 
-    async def _watch_ticker(self, symbol: str) -> None:
+    async def _watch_ticker(self, symbol: str, stagger_delay: float = 0.0) -> None:
         """
         Subscribe to live ticker updates for *symbol* and feed the
         assigned bot's ``on_tick`` for real-time entry decisions.
@@ -3654,6 +3681,10 @@ class LiveMultiBotRunner:
         bot = self._symbol_to_bot.get(symbol)
         if bot is None:
             return
+
+        # Stagger startup (paired with _watch_symbol for same symbol)
+        if stagger_delay > 0:
+            await asyncio.sleep(stagger_delay)
 
         reconnect_count = 0
 
@@ -3693,12 +3724,13 @@ class LiveMultiBotRunner:
                     )
                     return
 
+                # Exponential backoff + jitter (same as _watch_symbol)
                 delay = min(
                     WS_RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)),
                     60,
-                )
+                ) + random.uniform(0, 5)
                 logger.warning(
-                    "🔄 Ticker %s: reconnect %d/%d in %.0fs: %s",
+                    "🔄 Ticker %s: reconnect %d/%d in %.1fs: %s",
                     symbol, reconnect_count, WS_MAX_RECONNECT, delay, exc,
                 )
                 try:
@@ -3735,6 +3767,11 @@ class LiveMultiBotRunner:
                         }
                         try:
                             bot.on_candle(bot.symbol, candle)
+                            # Track candle for heartbeat/watchdog
+                            self._last_candle_ts[bot.symbol] = time.time()
+                            ac = bot.asset_class
+                            self._candles_by_class[ac] = self._candles_by_class.get(ac, 0) + 1
+                            self._candles_since_heartbeat[ac] = self._candles_since_heartbeat.get(ac, 0) + 1
                         except Exception as exc:
                             bot.logger.error("Poll candle error %s: %s", bot.symbol, exc)
             except asyncio.CancelledError:
@@ -3772,6 +3809,146 @@ class LiveMultiBotRunner:
                 return
             except asyncio.TimeoutError:
                 pass
+
+    # ── Heartbeat + Watchdog ────────────────────────────────────────
+
+    async def _heartbeat_loop(self) -> None:
+        """Log a HEARTBEAT every 5 minutes with per-class candle counts."""
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=HEARTBEAT_SEC)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+            # Per-class candle counts since last heartbeat
+            counts = " ".join(
+                f"{ac}={self._candles_since_heartbeat.get(ac, 0)}"
+                for ac in ["crypto", "forex", "stocks", "commodities"]
+            )
+            totals = " ".join(
+                f"{ac}={self._candles_by_class.get(ac, 0)}"
+                for ac in ["crypto", "forex", "stocks", "commodities"]
+            )
+            active_positions = sum(
+                1 for b in self.bots if b._active_trades
+            )
+            total_trades = sum(b.trades for b in self.bots)
+            total_pnl = sum(b.total_pnl for b in self.bots)
+            rest_fallbacks = len(self._rest_fallback_symbols)
+            logger.info(
+                "HEARTBEAT: candles_5m=[%s] total=[%s] | trades=%d pnl=%.2f positions=%d | rest_fallbacks=%d",
+                counts, totals, total_trades, total_pnl, active_positions, rest_fallbacks,
+            )
+            # Reset per-heartbeat counters
+            for ac in self._candles_since_heartbeat:
+                self._candles_since_heartbeat[ac] = 0
+
+    async def _watchdog_loop(self) -> None:
+        """Monitor per-symbol candle flow, restart stuck symbols, degrade to REST."""
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=WATCHDOG_SEC)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            stuck_symbols: list[str] = []
+
+            for bot in self.bots:
+                sym = bot.symbol
+                last = self._last_candle_ts.get(sym)
+
+                # Skip symbols that haven't received any candle yet (still starting up)
+                if last is None:
+                    # If bot has been running > 5 min with no candle, it's stuck
+                    startup_elapsed = now - self._start_time.timestamp()
+                    if startup_elapsed < 300:
+                        continue
+
+                # Check market hours — only flag as stuck if market is open
+                try:
+                    if not await bot.adapter.is_market_open(sym):
+                        continue
+                except Exception:
+                    pass  # assume open if check fails
+
+                age = now - (last or 0)
+                if age > WATCHDOG_SEC:  # No candle in 10 minutes
+                    stuck_symbols.append(sym)
+
+            if not stuck_symbols:
+                continue
+
+            logger.warning(
+                "WATCHDOG: %d stuck symbols (no candle >%ds): %s",
+                len(stuck_symbols), WATCHDOG_SEC,
+                ", ".join(stuck_symbols[:10]) + ("..." if len(stuck_symbols) > 10 else ""),
+            )
+
+            # Check for total silence across ALL classes → catastrophic failure
+            total_recent = sum(self._candles_since_heartbeat.values())
+            all_class_total = sum(self._candles_by_class.values())
+            if len(stuck_symbols) == len(self.bots) and all_class_total > 0:
+                # Had candles before but now ALL are stuck → trigger full restart
+                logger.critical(
+                    "WATCHDOG CRITICAL: ALL %d symbols stuck — triggering SIGTERM for systemd restart",
+                    len(stuck_symbols),
+                )
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+            # Restart individual stuck symbols
+            for sym in stuck_symbols:
+                bot = self._symbol_to_bot.get(sym)
+                if bot is None:
+                    continue
+
+                # Only handle crypto WS symbols (REST bots self-recover via polling)
+                if bot.asset_class != "crypto":
+                    continue
+
+                # Track restart count (within last hour)
+                restart_times = self._symbol_restart_times.get(sym, [])
+                restart_times = [t for t in restart_times if now - t < 3600]
+                restart_times.append(now)
+                self._symbol_restart_times[sym] = restart_times
+
+                if len(restart_times) > WATCHDOG_RESTART_LIMIT:
+                    # Too many restarts → degrade to REST polling
+                    if sym not in self._rest_fallback_symbols:
+                        self._rest_fallback_symbols.add(sym)
+                        logger.warning(
+                            "WATCHDOG: %s failed %d times in 1h — degrading to REST polling",
+                            sym, len(restart_times),
+                        )
+                        # Cancel WS tasks
+                        if sym in self._watcher_tasks:
+                            self._watcher_tasks[sym].cancel()
+                        if sym in self._ticker_tasks:
+                            self._ticker_tasks[sym].cancel()
+                        # Start REST polling instead
+                        self._watcher_tasks[sym] = asyncio.create_task(
+                            self._poll_candles(bot, stagger_sec=0)
+                        )
+                        self._ticker_tasks[sym] = asyncio.create_task(
+                            self._poll_ticker(bot, stagger_sec=0)
+                        )
+                        self.ws_status[sym] = "polling"
+                else:
+                    # Restart the WS watcher with a stagger
+                    logger.info("WATCHDOG: restarting WS watcher for %s (attempt %d)", sym, len(restart_times))
+                    if sym in self._watcher_tasks:
+                        self._watcher_tasks[sym].cancel()
+                    if sym in self._ticker_tasks:
+                        self._ticker_tasks[sym].cancel()
+                    stagger = random.uniform(0, 5)
+                    self._watcher_tasks[sym] = asyncio.create_task(
+                        self._watch_symbol(sym, stagger_delay=stagger)
+                    )
+                    self._ticker_tasks[sym] = asyncio.create_task(
+                        self._watch_ticker(sym, stagger_delay=stagger)
+                    )
 
     # ── Exchange position polling (replaces candle-based exit check) ─
 
@@ -4508,18 +4685,22 @@ class LiveMultiBotRunner:
                 logger.warning("Startup zombie sweep [%s] failed: %s", ac, exc)
 
         # Start watchers: WebSocket for crypto, REST polling for others
-        # Stagger REST bots to avoid rate limits (stocks: 2s apart, others: 0.5s)
+        # Crypto: stagger WS subscriptions (1s apart) to avoid thundering herd on ccxt.pro
+        # REST: stagger to avoid rate limits (stocks: 2s apart, others: 2s)
+        _crypto_idx = 0
         _stock_idx = 0
         _rest_idx = 0
         for bot in self.bots:
             if bot.asset_class == "crypto":
-                # WebSocket-based (existing methods)
+                # WebSocket-based — staggered to prevent subscription deadlock
+                stagger = _crypto_idx * WS_STAGGER_SEC
                 self._watcher_tasks[bot.symbol] = asyncio.create_task(
-                    self._watch_symbol(bot.symbol)
+                    self._watch_symbol(bot.symbol, stagger_delay=stagger)
                 )
                 self._ticker_tasks[bot.symbol] = asyncio.create_task(
-                    self._watch_ticker(bot.symbol)
+                    self._watch_ticker(bot.symbol, stagger_delay=stagger)
                 )
+                _crypto_idx += 1
             else:
                 # REST polling for OANDA/Alpaca — staggered start
                 if bot.asset_class == "stocks":
@@ -4535,6 +4716,11 @@ class LiveMultiBotRunner:
                     self._poll_ticker(bot, stagger_sec=stagger)
                 )
 
+        logger.info(
+            "All watchers started: %d crypto (staggered %.0fs apart), %d REST",
+            _crypto_idx, WS_STAGGER_SEC, _stock_idx + _rest_idx,
+        )
+
         # Position poller (detects TP/SL fills on exchange)
         poll_task = asyncio.create_task(self._poll_positions())
 
@@ -4547,6 +4733,10 @@ class LiveMultiBotRunner:
         # Rich dashboard
         dashboard_task = asyncio.create_task(self._dashboard_loop())
 
+        # Heartbeat + watchdog
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        watchdog_task = asyncio.create_task(self._watchdog_loop())
+
         # Wait until shutdown
         await self._shutdown.wait()
         logger.info("Shutdown signal received – stopping …")
@@ -4556,13 +4746,16 @@ class LiveMultiBotRunner:
         poll_task.cancel()
         zombie_task.cancel()
         model_reload_task.cancel()
+        heartbeat_task.cancel()
+        watchdog_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
         for t in self._ticker_tasks.values():
             t.cancel()
 
         all_tasks = (
-            [dashboard_task, poll_task, zombie_task, model_reload_task]
+            [dashboard_task, poll_task, zombie_task, model_reload_task,
+             heartbeat_task, watchdog_task]
             + list(self._watcher_tasks.values())
             + list(self._ticker_tasks.values())
         )

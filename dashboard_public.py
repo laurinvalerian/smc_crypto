@@ -692,6 +692,22 @@ def api_connections():
                 per_class["commodities"]["last_candle"] = ts_str
                 per_class["commodities"]["connected"] = True
 
+        # HEARTBEAT entries prove the bot is alive and processing candles
+        if ts_str and "HEARTBEAT:" in line:
+            # HEARTBEAT updates freshness for ALL classes that report candles > 0
+            # Format: HEARTBEAT: candles_5m=[crypto=X forex=Y ...] ...
+            for ac in ["crypto", "forex", "stocks", "commodities"]:
+                # Check if this class had candles (e.g. "crypto=42" means active)
+                m = re.search(rf"{ac}=(\d+)", line)
+                if m and int(m.group(1)) > 0:
+                    per_class[ac]["last_candle"] = ts_str
+                    per_class[ac]["connected"] = True
+            # Even if no per-class candles, heartbeat proves bot is alive
+            for ac in ["crypto", "forex", "stocks", "commodities"]:
+                if "last_heartbeat" not in per_class[ac]:
+                    per_class[ac]["last_heartbeat"] = ts_str
+                per_class[ac]["last_heartbeat"] = ts_str
+
     # Market hours (UTC)
     hour = now.hour
     weekday = now.weekday()  # 0=Mon, 6=Sun
@@ -709,16 +725,42 @@ def api_connections():
     }
 
     # Check staleness (>10 min old) and compute age
+    # Use the freshest of last_candle or last_heartbeat for staleness
     for ac, info in per_class.items():
         info["market_open"] = market_open.get(ac, True)
         info["next_open"] = next_open.get(ac)
-        if info["last_candle"]:
+
+        # Determine freshest timestamp (candle activity OR heartbeat)
+        freshest_ts = info.get("last_candle")
+        heartbeat_ts = info.get("last_heartbeat")
+        if heartbeat_ts:
+            if not freshest_ts:
+                freshest_ts = heartbeat_ts
+            else:
+                try:
+                    candle_dt = datetime.strptime(freshest_ts, "%Y-%m-%d %H:%M:%S")
+                    hb_dt = datetime.strptime(heartbeat_ts, "%Y-%m-%d %H:%M:%S")
+                    if hb_dt > candle_dt:
+                        freshest_ts = heartbeat_ts
+                except Exception:
+                    pass
+
+        if freshest_ts:
             try:
-                last = datetime.strptime(info["last_candle"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                last = datetime.strptime(freshest_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 delta = (now - last).total_seconds()
                 info["stale"] = delta > 600 and info["market_open"]  # Only stale if market is open
                 info["age_seconds"] = int(delta)
                 info["age_text"] = _format_age(int(delta))
+                # Add heartbeat info
+                if heartbeat_ts:
+                    try:
+                        hb_last = datetime.strptime(heartbeat_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        hb_age = int((now - hb_last).total_seconds())
+                        info["heartbeat_age"] = _format_age(hb_age)
+                        info["heartbeat_fresh"] = hb_age < 600
+                    except Exception:
+                        pass
             except Exception:
                 info["stale"] = True
                 info["age_text"] = "unknown"
@@ -1353,12 +1395,13 @@ function updateConnections(d){
       badge = '<span style="background:#333;color:#999;padding:2px 8px;border-radius:4px;font-size:12px;margin-left:6px;">Closed'+(nextOpen ? ' — opens '+nextOpen : '')+'</span>';
     }
 
-    // Age text
+    // Age text + heartbeat info
     var ageText = pc.age_text || 'no data';
     var ageColor = '#c9d1d9';
     if(pc.stale && isOpen){ ageColor='#f85149'; ageText='<b>'+ageText+' STALE</b>'; }
     else if(pc.age_seconds > 300 && isOpen){ ageColor='#d29922'; }
     else if(pc.age_seconds !== undefined && pc.age_seconds <= 300){ ageColor='#3fb950'; }
+    if(pc.heartbeat_age){ ageText += ' <span style="color:#8b949e;font-size:11px;">(heartbeat: '+pc.heartbeat_age+')</span>'; }
 
     // Error display: red only if recent (<5 min), gray if old
     var errHtml;
