@@ -3604,7 +3604,6 @@ class LiveMultiBotRunner:
                         }
 
                         try:
-                            logger.info("WS_HEARTBEAT %s ts=%s", symbol, ts)
                             bot.on_candle(symbol, candle)
                         except Exception as exc:
                             bot.logger.error(
@@ -3735,7 +3734,6 @@ class LiveMultiBotRunner:
                             "volume": float(row[5]),
                         }
                         try:
-                            logger.info("REST_HEARTBEAT %s ts=%s", bot.symbol, ts)
                             bot.on_candle(bot.symbol, candle)
                         except Exception as exc:
                             bot.logger.error("Poll candle error %s: %s", bot.symbol, exc)
