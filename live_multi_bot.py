@@ -3576,7 +3576,14 @@ class LiveMultiBotRunner:
                 reconnect_count = 0  # reset on successful connection
 
                 while not self._shutdown.is_set():
-                    ohlcv_list = await self._crypto_adapter.watch_ohlcv(symbol, "5m")
+                    try:
+                        ohlcv_list = await asyncio.wait_for(
+                            self._crypto_adapter.watch_ohlcv(symbol, "5m"),
+                            timeout=120.0,  # 2 min max — force reconnect if hung
+                        )
+                    except asyncio.TimeoutError:
+                        bot.logger.warning("WS OHLCV timeout %s — forcing reconnect", symbol)
+                        break  # break inner loop → triggers reconnect logic
 
                     if not ohlcv_list:
                         continue
@@ -3654,7 +3661,14 @@ class LiveMultiBotRunner:
             try:
                 reconnect_count = 0
                 while not self._shutdown.is_set():
-                    ticker = await self._crypto_adapter.watch_ticker(symbol)
+                    try:
+                        ticker = await asyncio.wait_for(
+                            self._crypto_adapter.watch_ticker(symbol),
+                            timeout=60.0,  # 1 min — tickers should arrive every few seconds
+                        )
+                    except asyncio.TimeoutError:
+                        bot.logger.warning("WS ticker timeout %s — forcing reconnect", symbol)
+                        break  # triggers reconnect
                     if ticker is None:
                         continue
                     last_price = ticker.get("last")
