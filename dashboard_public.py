@@ -1014,9 +1014,15 @@ a:hover{text-decoration:underline}
     <!-- Connection Status -->
     <div class="section">
       <div class="section-title">Connection Status</div>
-      <table class="trade-table" id="conn-table">
-        <thead><tr><th>Exchange</th><th>Status</th><th>Asset Class</th><th>Last Data</th><th>Last Error</th></tr></thead>
-        <tbody id="conn-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+      <table class="tbl" id="conn-table" style="border-spacing:0;">
+        <thead><tr>
+          <th style="padding:10px 16px;">Exchange</th>
+          <th style="padding:10px 16px;">Status</th>
+          <th style="padding:10px 16px;">Asset Class</th>
+          <th style="padding:10px 16px;">Last Data</th>
+          <th style="padding:10px 16px;">Last Error</th>
+        </tr></thead>
+        <tbody id="conn-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
 
@@ -1414,11 +1420,11 @@ function updateConnections(d){
     }
 
     rows += '<tr>'
-      + '<td><b>'+item.name+'</b></td>'
-      + '<td>'+dot+statusText+badge+'</td>'
-      + '<td>'+item.ac+'</td>'
-      + '<td style="color:'+ageColor+'">'+ageText+'</td>'
-      + '<td>'+errHtml+'</td>'
+      + '<td style="padding:12px 16px;"><b>'+item.name+'</b></td>'
+      + '<td style="padding:12px 16px;">'+dot+statusText+badge+'</td>'
+      + '<td style="padding:12px 16px;">'+item.ac+'</td>'
+      + '<td style="padding:12px 16px;color:'+ageColor+'">'+ageText+'</td>'
+      + '<td style="padding:12px 16px;">'+errHtml+'</td>'
       + '</tr>';
   }
   b.innerHTML = rows;
