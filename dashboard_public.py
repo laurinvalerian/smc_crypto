@@ -619,6 +619,90 @@ def api_system():
     return jsonify(_system_stats())
 
 
+@app.route("/api/public/connections")
+def api_connections():
+    """Per-exchange connection status + last candle timestamps."""
+    log_path = Path("paper_trading.log")
+    exchanges = {
+        "Binance": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "crypto"},
+        "OANDA": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "forex"},
+        "Alpaca": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "stocks"},
+    }
+    per_class = {}
+    for ac in ["crypto", "forex", "stocks", "commodities"]:
+        per_class[ac] = {"last_candle": None, "stale": True, "connected": False}
+
+    if not log_path.exists():
+        return jsonify({"exchanges": exchanges, "per_class": per_class})
+
+    try:
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        return jsonify({"exchanges": exchanges, "per_class": per_class})
+
+    now = datetime.now(timezone.utc)
+
+    for line in lines:
+        ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        ts_str = ts_match.group(1) if ts_match else None
+
+        # Exchange connection status
+        if "Binance (crypto): connected" in line:
+            exchanges["Binance"]["status"] = "connected"
+        if "OANDA (forex+commodities): connected" in line:
+            exchanges["OANDA"]["status"] = "connected"
+        if "Alpaca (stocks): connected" in line or "AlpacaAdapter connected" in line:
+            exchanges["Alpaca"]["status"] = "connected"
+
+        # Track errors per exchange
+        if "ERROR" in line and ts_str:
+            if any(fx in line for fx in ["EUR_", "GBP_", "USD_", "AUD_", "NZD_", "CAD_", "CHF_"]):
+                exchanges["OANDA"]["last_error"] = ts_str
+            elif "XAU_" in line or "XAG_" in line or "WTICO_" in line or "BCO_" in line:
+                exchanges["OANDA"]["last_error"] = ts_str
+            elif "USDT" in line:
+                exchanges["Binance"]["last_error"] = ts_str
+
+        # Track last candle per class (from NEAR-MISS or Loaded lines)
+        if ts_str and ("NEAR-MISS" in line or "Loaded" in line or "on_candle" in line):
+            for ac in ["crypto", "forex", "stocks", "commodities"]:
+                if f"class={ac}" in line:
+                    per_class[ac]["last_candle"] = ts_str
+                    per_class[ac]["connected"] = True
+            # Infer from symbol patterns
+            if any(s in line for s in ["USDT", "/USDT"]):
+                per_class["crypto"]["last_candle"] = ts_str
+                per_class["crypto"]["connected"] = True
+            if any(s in line for s in ["EUR_", "GBP_", "USD_J", "AUD_", "NZD_", "CAD_", "CHF_"]):
+                per_class["forex"]["last_candle"] = ts_str
+                per_class["forex"]["connected"] = True
+            if any(s in line for s in ["XAU_", "XAG_", "WTICO_", "BCO_"]):
+                per_class["commodities"]["last_candle"] = ts_str
+                per_class["commodities"]["connected"] = True
+
+    # Check staleness (>10 min old)
+    for ac, info in per_class.items():
+        if info["last_candle"]:
+            try:
+                last = datetime.strptime(info["last_candle"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                delta = (now - last).total_seconds()
+                info["stale"] = delta > 600  # 10 minutes
+                info["age_seconds"] = int(delta)
+            except Exception:
+                info["stale"] = True
+
+    # Set exchange last_data from per_class
+    if per_class["crypto"]["last_candle"]:
+        exchanges["Binance"]["last_data"] = per_class["crypto"]["last_candle"]
+    if per_class["forex"]["last_candle"]:
+        exchanges["OANDA"]["last_data"] = per_class["forex"]["last_candle"]
+    if per_class["stocks"]["last_candle"]:
+        exchanges["Alpaca"]["last_data"] = per_class["stocks"]["last_candle"]
+
+    return jsonify({"exchanges": exchanges, "per_class": per_class})
+
+
 @app.route("/api/public/trade/<trade_id>")
 def api_trade_detail(trade_id: str):
     if not _journal_has_table("trades"):
@@ -837,6 +921,15 @@ a:hover{text-decoration:underline}
     <div class="section">
       <div class="section-title">Near-Miss Monitor</div>
       <div class="nm-list" id="nm-list"><div class="empty">No near-misses recorded</div></div>
+    </div>
+
+    <!-- Connection Status -->
+    <div class="section">
+      <div class="section-title">Connection Status</div>
+      <table class="trade-table" id="conn-table">
+        <thead><tr><th>Exchange</th><th>Status</th><th>Asset Class</th><th>Last Data</th><th>Age</th><th>Last Error</th></tr></thead>
+        <tbody id="conn-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+      </table>
     </div>
 
     <!-- Risk Dashboard -->
@@ -1174,6 +1267,48 @@ setInterval(function(){ fetchJ('/api/public/near-misses', updateNearMisses); }, 
 setInterval(function(){ fetchJ('/api/public/risk', updateRisk); }, 15000);
 setInterval(function(){ fetchJ('/api/public/logs', updateLogs); }, 5000);
 setInterval(function(){ fetchJ('/api/public/system', updateSystem); }, 30000);
+
+// ── Connection Status ────────────────────────────────────────────
+function updateConnections(d){
+  var b = document.getElementById('conn-body');
+  if(!b) return;
+  var rows = '';
+  var exMap = {'Binance':'crypto','OANDA':'forex','Alpaca':'stocks'};
+  for(var name in d.exchanges){
+    var ex = d.exchanges[name];
+    var ac = exMap[name] || '';
+    var pcInfo = d.per_class[ac] || {};
+    var statusColor = ex.status==='connected' ? '#3fb950' : '#f85149';
+    var statusDot = '<span style="color:'+statusColor+'">&#9679;</span> '+ex.status;
+    var lastData = ex.last_data || '--';
+    var age = '--';
+    var ageColor = '#c9d1d9';
+    if(pcInfo.age_seconds !== undefined){
+      var m = Math.floor(pcInfo.age_seconds/60);
+      age = m + 'm ago';
+      if(pcInfo.stale){ ageColor='#f85149'; age='<b>'+age+' STALE</b>'; }
+      else if(m > 5){ ageColor='#d29922'; }
+      else { ageColor='#3fb950'; }
+    }
+    var lastErr = ex.last_error ? '<span style="color:#f85149">'+ex.last_error+'</span>' : '<span style="color:#3fb950">none</span>';
+    rows += '<tr><td><b>'+name+'</b></td><td>'+statusDot+'</td><td>'+ac+'</td><td>'+lastData+'</td><td style="color:'+ageColor+'">'+age+'</td><td>'+lastErr+'</td></tr>';
+  }
+  // Add commodities row (via OANDA)
+  var cmd = d.per_class['commodities'] || {};
+  var cmdAge = '--';
+  var cmdColor = '#c9d1d9';
+  if(cmd.age_seconds !== undefined){
+    var cm = Math.floor(cmd.age_seconds/60);
+    cmdAge = cm + 'm ago';
+    if(cmd.stale){ cmdColor='#f85149'; cmdAge='<b>'+cmdAge+' STALE</b>'; }
+    else if(cm > 5){ cmdColor='#d29922'; }
+    else { cmdColor='#3fb950'; }
+  }
+  rows += '<tr><td><b>OANDA</b></td><td><span style="color:'+(cmd.connected?'#3fb950':'#f85149')+'">&#9679;</span> '+(cmd.connected?'connected':'unknown')+'</td><td>commodities</td><td>'+(cmd.last_candle||'--')+'</td><td style="color:'+cmdColor+'">'+cmdAge+'</td><td>--</td></tr>';
+  b.innerHTML = rows;
+}
+fetchJ('/api/public/connections', updateConnections);
+setInterval(function(){ fetchJ('/api/public/connections', updateConnections); }, 15000);
 </script>
 </body>
 </html>
