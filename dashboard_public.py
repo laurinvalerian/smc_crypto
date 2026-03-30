@@ -619,6 +619,17 @@ def api_system():
     return jsonify(_system_stats())
 
 
+def _format_age(seconds: int) -> str:
+    """Human-readable age string."""
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m ago"
+    return f"{seconds // 86400}d ago"
+
+
 @app.route("/api/public/connections")
 def api_connections():
     """Per-exchange connection status + last candle timestamps."""
@@ -681,24 +692,58 @@ def api_connections():
                 per_class["commodities"]["last_candle"] = ts_str
                 per_class["commodities"]["connected"] = True
 
-    # Check staleness (>10 min old)
+    # Market hours (UTC)
+    hour = now.hour
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+    market_open = {
+        "crypto": True,  # 24/7
+        "forex": 0 <= weekday <= 4 or (weekday == 6 and hour >= 22),  # Sun 22:00 - Fri 22:00
+        "stocks": 0 <= weekday <= 4 and 13 <= hour < 20,  # Mon-Fri 13:30-20:00 UTC
+        "commodities": 0 <= weekday <= 4 or (weekday == 6 and hour >= 23),  # ~23h/day
+    }
+    next_open = {
+        "crypto": None,
+        "forex": "Sun 22:00 UTC" if not market_open["forex"] else None,
+        "stocks": "Mon-Fri 13:30 UTC" if not market_open["stocks"] else None,
+        "commodities": "Sun 23:00 UTC" if not market_open["commodities"] else None,
+    }
+
+    # Check staleness (>10 min old) and compute age
     for ac, info in per_class.items():
+        info["market_open"] = market_open.get(ac, True)
+        info["next_open"] = next_open.get(ac)
         if info["last_candle"]:
             try:
                 last = datetime.strptime(info["last_candle"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 delta = (now - last).total_seconds()
-                info["stale"] = delta > 600  # 10 minutes
+                info["stale"] = delta > 600 and info["market_open"]  # Only stale if market is open
                 info["age_seconds"] = int(delta)
+                info["age_text"] = _format_age(int(delta))
             except Exception:
                 info["stale"] = True
+                info["age_text"] = "unknown"
+        else:
+            info["age_text"] = "no data yet"
+            info["stale"] = False  # No data != stale (could be warming up)
 
-    # Set exchange last_data from per_class
-    if per_class["crypto"]["last_candle"]:
-        exchanges["Binance"]["last_data"] = per_class["crypto"]["last_candle"]
-    if per_class["forex"]["last_candle"]:
-        exchanges["OANDA"]["last_data"] = per_class["forex"]["last_candle"]
-    if per_class["stocks"]["last_candle"]:
-        exchanges["Alpaca"]["last_data"] = per_class["stocks"]["last_candle"]
+    # Set exchange last_data and error age from per_class
+    for exch_name, ac_key in [("Binance", "crypto"), ("OANDA", "forex"), ("Alpaca", "stocks")]:
+        if per_class[ac_key]["last_candle"]:
+            exchanges[exch_name]["last_data"] = per_class[ac_key]["last_candle"]
+        exchanges[exch_name]["market_open"] = market_open.get(ac_key, True)
+        exchanges[exch_name]["next_open"] = next_open.get(ac_key)
+        # Error age: only show as "recent" if < 5 min old
+        if exchanges[exch_name]["last_error"]:
+            try:
+                err_ts = datetime.strptime(exchanges[exch_name]["last_error"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                err_age = (now - err_ts).total_seconds()
+                exchanges[exch_name]["error_recent"] = err_age < 300  # < 5 min
+                exchanges[exch_name]["error_age_text"] = _format_age(int(err_age))
+            except Exception:
+                exchanges[exch_name]["error_recent"] = False
+                exchanges[exch_name]["error_age_text"] = "unknown"
+        else:
+            exchanges[exch_name]["error_recent"] = False
 
     return jsonify({"exchanges": exchanges, "per_class": per_class})
 
@@ -831,6 +876,7 @@ a:hover{text-decoration:underline}
 
 /* Fade in */
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes pulse{0%{opacity:1}50%{opacity:0.3}100%{opacity:1}}
 .section,.card{animation:fadeIn .3s ease}
 </style>
 </head>
@@ -927,7 +973,7 @@ a:hover{text-decoration:underline}
     <div class="section">
       <div class="section-title">Connection Status</div>
       <table class="trade-table" id="conn-table">
-        <thead><tr><th>Exchange</th><th>Status</th><th>Asset Class</th><th>Last Data</th><th>Age</th><th>Last Error</th></tr></thead>
+        <thead><tr><th>Exchange</th><th>Status</th><th>Asset Class</th><th>Last Data</th><th>Last Error</th></tr></thead>
         <tbody id="conn-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
@@ -1274,37 +1320,64 @@ function updateConnections(d){
   if(!b) return;
   var rows = '';
   var exMap = {'Binance':'crypto','OANDA':'forex','Alpaca':'stocks'};
-  for(var name in d.exchanges){
-    var ex = d.exchanges[name];
-    var ac = exMap[name] || '';
-    var pcInfo = d.per_class[ac] || {};
-    var statusColor = ex.status==='connected' ? '#3fb950' : '#f85149';
-    var statusDot = '<span style="color:'+statusColor+'">&#9679;</span> '+ex.status;
-    var lastData = ex.last_data || '--';
-    var age = '--';
-    var ageColor = '#c9d1d9';
-    if(pcInfo.age_seconds !== undefined){
-      var m = Math.floor(pcInfo.age_seconds/60);
-      age = m + 'm ago';
-      if(pcInfo.stale){ ageColor='#f85149'; age='<b>'+age+' STALE</b>'; }
-      else if(m > 5){ ageColor='#d29922'; }
-      else { ageColor='#3fb950'; }
+  var allClasses = [
+    {name:'Binance', ac:'crypto'},
+    {name:'OANDA', ac:'forex'},
+    {name:'Alpaca', ac:'stocks'},
+    {name:'OANDA', ac:'commodities'},
+  ];
+  for(var i=0; i<allClasses.length; i++){
+    var item = allClasses[i];
+    var ex = d.exchanges[item.name] || {};
+    var pc = d.per_class[item.ac] || {};
+    var isOpen = pc.market_open !== false;
+    var isConnected = ex.status === 'connected' || pc.connected;
+
+    // Big status indicator
+    var dotColor, dotStyle='', statusText;
+    if(!isOpen){
+      dotColor = '#666'; statusText = 'Market Closed';
+    } else if(pc.stale){
+      dotColor = '#f85149'; dotStyle = 'animation:pulse 1s infinite;'; statusText = 'STALE';
+    } else if(isConnected){
+      dotColor = '#3fb950'; statusText = 'Healthy';
+    } else {
+      dotColor = '#d29922'; statusText = 'Connecting...';
     }
-    var lastErr = ex.last_error ? '<span style="color:#f85149">'+ex.last_error+'</span>' : '<span style="color:#3fb950">none</span>';
-    rows += '<tr><td><b>'+name+'</b></td><td>'+statusDot+'</td><td>'+ac+'</td><td>'+lastData+'</td><td style="color:'+ageColor+'">'+age+'</td><td>'+lastErr+'</td></tr>';
+    var dot = '<span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:'+dotColor+';margin-right:8px;vertical-align:middle;'+dotStyle+'"></span>';
+
+    // Market badge
+    var badge = '';
+    if(!isOpen){
+      var nextOpen = pc.next_open || ex.next_open || '';
+      badge = '<span style="background:#333;color:#999;padding:2px 8px;border-radius:4px;font-size:12px;margin-left:6px;">Closed'+(nextOpen ? ' — opens '+nextOpen : '')+'</span>';
+    }
+
+    // Age text
+    var ageText = pc.age_text || 'no data';
+    var ageColor = '#c9d1d9';
+    if(pc.stale && isOpen){ ageColor='#f85149'; ageText='<b>'+ageText+' STALE</b>'; }
+    else if(pc.age_seconds > 300 && isOpen){ ageColor='#d29922'; }
+    else if(pc.age_seconds !== undefined && pc.age_seconds <= 300){ ageColor='#3fb950'; }
+
+    // Error display: red only if recent (<5 min), gray if old
+    var errHtml;
+    if(!ex.last_error || item.ac==='commodities'){
+      errHtml = '<span style="color:#3fb950;">none</span>';
+    } else if(ex.error_recent){
+      errHtml = '<span style="color:#f85149;">'+ex.error_age_text+'</span>';
+    } else {
+      errHtml = '<span style="color:#666;">'+ex.error_age_text+' (resolved)</span>';
+    }
+
+    rows += '<tr>'
+      + '<td><b>'+item.name+'</b></td>'
+      + '<td>'+dot+statusText+badge+'</td>'
+      + '<td>'+item.ac+'</td>'
+      + '<td style="color:'+ageColor+'">'+ageText+'</td>'
+      + '<td>'+errHtml+'</td>'
+      + '</tr>';
   }
-  // Add commodities row (via OANDA)
-  var cmd = d.per_class['commodities'] || {};
-  var cmdAge = '--';
-  var cmdColor = '#c9d1d9';
-  if(cmd.age_seconds !== undefined){
-    var cm = Math.floor(cmd.age_seconds/60);
-    cmdAge = cm + 'm ago';
-    if(cmd.stale){ cmdColor='#f85149'; cmdAge='<b>'+cmdAge+' STALE</b>'; }
-    else if(cm > 5){ cmdColor='#d29922'; }
-    else { cmdColor='#3fb950'; }
-  }
-  rows += '<tr><td><b>OANDA</b></td><td><span style="color:'+(cmd.connected?'#3fb950':'#f85149')+'">&#9679;</span> '+(cmd.connected?'connected':'unknown')+'</td><td>commodities</td><td>'+(cmd.last_candle||'--')+'</td><td style="color:'+cmdColor+'">'+cmdAge+'</td><td>--</td></tr>';
   b.innerHTML = rows;
 }
 fetchJ('/api/public/connections', updateConnections);
