@@ -881,18 +881,13 @@ class PaperBot:
                         _mid = (_sh + _sl) / 2.0
                         _cur = float(self.buffer_5m["close"].iloc[-1])
                         comp["_premium_discount"] = 1.0 if _cur > _mid else -1.0
-                        if daily_bias == "bullish" and _cur > _mid:
-                            self.logger.info(
-                                "NEAR-MISS D/P EXIT %s | class=%s dir=%s bias=%s zone=premium price=%.5f mid=%.5f",
-                                self.symbol, self.asset_class, direction, daily_bias, _cur, _mid,
-                            )
-                            return 0.0, direction, comp  # Long in premium
-                        if daily_bias == "bearish" and _cur < _mid:
-                            self.logger.info(
-                                "NEAR-MISS D/P EXIT %s | class=%s dir=%s bias=%s zone=discount price=%.5f mid=%.5f",
-                                self.symbol, self.asset_class, direction, daily_bias, _cur, _mid,
-                            )
-                            return 0.0, direction, comp  # Short in discount
+                        # D/P is now a soft feature — brain learns when it matters.
+                        # Previously this was a hard return (blocked 97% of signals).
+                        # Wrong-zone signals get a score penalty instead of instant rejection.
+                        if (daily_bias == "bullish" and _cur > _mid) or \
+                           (daily_bias == "bearish" and _cur < _mid):
+                            comp["_dp_wrong_zone"] = True  # brain feature
+                            score -= 0.10  # penalty, not rejection
             except Exception as exc:
                 self.logger.debug("D/P filter failed: %s", exc)
 
