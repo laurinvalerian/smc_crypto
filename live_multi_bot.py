@@ -192,25 +192,25 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
     "crypto": {
         "swing_length": 8, "fvg_threshold": 0.0006,
         "order_block_lookback": 20, "liquidity_range_percent": 0.01,
-        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
         "min_daily_atr_pct": 0.008, "min_5m_atr_pct": 0.0015,
     },
     "forex": {
         "swing_length": 20, "fvg_threshold": 0.001,
         "order_block_lookback": 30, "liquidity_range_percent": 0.008,
-        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
         "min_daily_atr_pct": 0.004, "min_5m_atr_pct": 0.0005,
     },
     "stocks": {
         "swing_length": 10, "fvg_threshold": 0.0003,
         "order_block_lookback": 20, "liquidity_range_percent": 0.005,
-        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
         "min_daily_atr_pct": 0.010, "min_5m_atr_pct": 0.0010,
     },
     "commodities": {
         "swing_length": 10, "fvg_threshold": 0.0004,
         "order_block_lookback": 20, "liquidity_range_percent": 0.005,
-        "alignment_threshold": 0.65, "weight_day": 1.25, "bos_choch_filter": "medium",
+        "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
         "min_daily_atr_pct": 0.006, "min_5m_atr_pct": 0.0008,
     },
 }
@@ -387,8 +387,8 @@ TIER_AAA_PLUS_PLUS = "AAA++"
 TIER_AAA_PLUS = "AAA+"
 
 TIER_THRESHOLDS: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 3.0},
-    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 2.0},
+    TIER_AAA_PLUS_PLUS: {"min_score": 0.75, "min_rr": 2.5},  # lowered from 0.88/3.0 — XGBoost is primary filter
+    TIER_AAA_PLUS:      {"min_score": 0.60, "min_rr": 2.0},  # lowered from 0.78/2.0 — let brain evaluate more signals
 }
 
 TIER_RISK: dict[str, dict[str, float]] = {
