@@ -1285,7 +1285,7 @@ def generate_teacher_labels(
             continue
         bias = "bullish" if bias_val > 0 else "bearish"
 
-        # Step 2: 1H structure
+        # Step 2: 1H structure (soft gate — contributes to quality, not hard requirement)
         vl_1h = int(vlen_1h[i])
         h1_ok = False
         if len(running_struct_1h) > 0 and vl_1h > 0:
@@ -1293,8 +1293,7 @@ def generate_teacher_labels(
             if (bias == "bullish" and running_struct_1h[idx] > 0) or \
                (bias == "bearish" and running_struct_1h[idx] < 0):
                 h1_ok = True
-        if not h1_ok:
-            continue
+        # NOTE: h1_ok is NO LONGER a hard gate — brain learns from h1_ok as a feature
 
         # Step 3: Entry zone (15m) — lookahead finds more zones
         entry_zone = None
@@ -1312,8 +1311,10 @@ def generate_teacher_labels(
             elif bias == "bearish":
                 precision_ok = bool(bear_trigger[i])
 
-        # Teacher is more lenient: only needs 2 of 3 (H1 + zone OR H1 + trigger)
-        if entry_zone is None and not precision_ok:
+        # Widened gate: only skip if we have NOTHING (no zone, no trigger, no H1)
+        # Previously required zone OR trigger. Now only requires daily bias (already checked above).
+        # Swing-based SL fallback handles entries without zones.
+        if not h1_ok and entry_zone is None and not precision_ok:
             continue
 
         # ── Entry/SL/TP ──────────────────────────────────────────
@@ -1349,11 +1350,11 @@ def generate_teacher_labels(
             entry_price=entry_price,
             bias=bias,
             sl_dist=sl_dist,
-            min_rr=1.5,  # Teacher uses lower min RR
+            min_rr=1.0,  # Widened to capture more diverse training examples
         )
 
         actual_rr = abs(tp_price - entry_price) / sl_dist
-        if actual_rr < 1.5:
+        if actual_rr < 1.0:  # lowered from 1.5 — brain learns to filter bad RR
             continue
 
         # ── Simulate forward ─────────────────────────────────────
