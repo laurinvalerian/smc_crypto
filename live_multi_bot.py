@@ -291,8 +291,8 @@ ASSET_CLASS_ID: dict[str, float] = {
 }
 
 # ── REST Polling interval for OANDA/Alpaca (no WebSocket) ────────
-REST_POLL_INTERVAL_SEC = 30             # Forex/commodities: 30s (5m candles, no need for 10s)
-REST_POLL_INTERVAL_STOCKS_CANDLE = 60   # Stocks: 60s (5m candles)
+REST_POLL_INTERVAL_SEC = 10             # Forex/commodities: 10s (faster candle detection)
+REST_POLL_INTERVAL_STOCKS_CANDLE = 15   # Stocks: 15s (faster candle detection)
 REST_POLL_INTERVAL_STOCKS_TICKER = 30
 REST_STAGGER_SEC = 2.0                  # Stagger between REST bots (was 0.5, caused OANDA timeouts)
 
