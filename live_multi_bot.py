@@ -1142,11 +1142,7 @@ class PaperBot:
                 self.buffer_5m = self.buffer_5m.iloc[-1500:].reset_index(drop=True)
 
         if len(buf) >= self.swing_length + 5:
-            try:
-                self._prepare_signal(symbol, buf, candle)
-            except Exception as _sig_exc:
-                import traceback
-                self.logger.error("SIGNAL_ERROR %s: %s\n%s", symbol, _sig_exc, traceback.format_exc())
+            self._prepare_signal(symbol, buf, candle)
 
         # ── Trade Journal: record bar for each active trade ──────────
         # Fires only on confirmed closed 5m candles (not poll ticks).
@@ -3736,7 +3732,7 @@ class LiveMultiBotRunner:
                     try:
                         ticker = await asyncio.wait_for(
                             self._crypto_adapter.watch_ticker(symbol),
-                            timeout=60.0,  # 1 min — tickers should arrive every few seconds
+                            timeout=300.0,  # 5 min — Binance testnet has sparse ticker data
                         )
                     except asyncio.TimeoutError:
                         bot.logger.warning("WS ticker timeout %s — forcing reconnect", symbol)
