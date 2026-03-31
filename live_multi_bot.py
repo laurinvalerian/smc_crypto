@@ -647,6 +647,26 @@ class PaperBot:
                     "History load failed %s/%s: %s", self.symbol, tf, exc,
                 )
 
+        # Pre-fill _candle_buf from loaded 5m history so _prepare_signal
+        # can run immediately instead of waiting 65-125 min for live candles
+        if not self.buffer_5m.empty:
+            for _, row in self.buffer_5m.tail(300).iterrows():
+                candle = {
+                    "timestamp": row["timestamp"],
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+                if self.symbol not in self._candle_buf:
+                    self._candle_buf[self.symbol] = []
+                self._candle_buf[self.symbol].append(candle)
+            self.logger.info(
+                "Pre-filled candle buffer with %d 5m bars for %s",
+                len(self._candle_buf.get(self.symbol, [])), self.symbol,
+            )
+
     # === PERSISTENCE ===
     def _save_state(self) -> None:
         """Persist core bot state to JSON (atomic write)."""
