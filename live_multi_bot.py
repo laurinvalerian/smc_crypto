@@ -294,7 +294,7 @@ ASSET_CLASS_ID: dict[str, float] = {
 
 # ── REST Polling interval for OANDA/Alpaca (no WebSocket) ────────
 REST_POLL_INTERVAL_SEC = 10             # Forex/commodities: 10s (faster candle detection)
-REST_POLL_INTERVAL_STOCKS_CANDLE = 15   # Stocks: 15s (faster candle detection)
+REST_POLL_INTERVAL_STOCKS_CANDLE = 60   # Stocks: 60s (Alpaca rate limit: 200 req/min for 50 symbols)
 REST_POLL_INTERVAL_STOCKS_TICKER = 30
 REST_STAGGER_SEC = 2.0                  # Stagger between REST bots (was 0.5, caused OANDA timeouts)
 
@@ -3756,6 +3756,16 @@ class LiveMultiBotRunner:
             await asyncio.sleep(stagger_sec)
         last_ts: int | None = None
         while not self._shutdown.is_set():
+            # Skip polling when market is closed (saves API calls, avoids rate limits)
+            try:
+                if not await bot.adapter.is_market_open(bot.symbol):
+                    try:
+                        await asyncio.wait_for(self._shutdown.wait(), timeout=300)  # check again in 5 min
+                        return
+                    except asyncio.TimeoutError:
+                        continue
+            except Exception:
+                pass  # assume open if check fails
             try:
                 candles = await bot.adapter.fetch_ohlcv(bot.symbol, "5m", limit=2)
                 if candles:
@@ -3802,6 +3812,16 @@ class LiveMultiBotRunner:
         if stagger_sec > 0:
             await asyncio.sleep(stagger_sec)
         while not self._shutdown.is_set():
+            # Skip polling when market is closed
+            try:
+                if not await bot.adapter.is_market_open(bot.symbol):
+                    try:
+                        await asyncio.wait_for(self._shutdown.wait(), timeout=300)
+                        return
+                    except asyncio.TimeoutError:
+                        continue
+            except Exception:
+                pass
             try:
                 ticker = await bot.adapter.watch_ticker(bot.symbol)
                 if ticker:
