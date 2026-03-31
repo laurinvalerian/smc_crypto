@@ -918,10 +918,20 @@ class PaperBot:
                 )
                 if entry_zone is not None:
                     comp["entry_zone"] = entry_zone
-                    # Compute zone quality with decay
+
+                # Compute zone quality on the NEAREST matching zone (even without penetration).
+                # entry_zone requires 30% penetration which rarely happens bar-by-bar in live.
+                # Zone quality should reflect whether good zones EXIST nearby.
+                zone_for_quality = entry_zone
+                if zone_for_quality is None:
+                    # Find nearest zone matching bias WITHOUT penetration requirement
+                    zone_for_quality = self._find_nearest_zone(
+                        ind_15m, self.buffer_15m, daily_bias, fvg_thresh, _zone_bars * 3,
+                    )
+
+                if zone_for_quality is not None:
                     closes_15m = self.buffer_15m["close"].values.astype(np.float64)
-                    # Estimate zone bar index (within last 6 bars as per _find_entry_zone_at)
-                    zone_bar_idx = max(0, len(self.buffer_15m) - 4)  # approximate
+                    zone_bar_idx = max(0, len(self.buffer_15m) - 4)
                     # ATR on 15m
                     atr_15m = 0.0
                     if len(self.buffer_15m) >= 15:
@@ -934,7 +944,7 @@ class PaperBot:
                         atr_15m = float(np.mean(trs)) if trs else 0.0
 
                     zone_quality_result = compute_zone_quality(
-                        zone_data=entry_zone,
+                        zone_data=zone_for_quality,
                         zone_bar_idx=zone_bar_idx,
                         current_bar_idx=len(self.buffer_15m) - 1,
                         closes_15m=closes_15m,
@@ -950,7 +960,7 @@ class PaperBot:
                     score += _w_zone * zq
                     comp["zone_fresh"] = zone_quality_result.get("decay_factor", 0.0) > 0.5
             except Exception as exc:
-                self.logger.debug("15m entry zone computation failed: %s", exc)
+                self.logger.warning("15m entry zone computation failed: %s", exc)
 
         # ═══ STEP 5: 5m – Precision trigger (0.10) ═══════════════
         if len(self.buffer_5m) >= swing_len * 2:
@@ -1493,6 +1503,60 @@ class PaperBot:
 
     # XGBoost asset class mapping (must match rl_brain_v2.ASSET_CLASS_MAP)
     _XGB_AC_MAP = {"crypto": 0, "forex": 1, "stocks": 2, "commodities": 3}
+
+    @staticmethod
+    def _find_nearest_zone(
+        ind_15m: dict, df_15m: pd.DataFrame, bias: str,
+        fvg_thresh: float, max_bars: int,
+    ) -> dict | None:
+        """Find nearest FVG/OB matching bias WITHOUT penetration requirement.
+
+        Used for zone_quality scoring when _find_entry_zone_at returns None
+        (which requires 30% penetration that rarely happens in live bar-by-bar).
+        """
+        valid_len = len(df_15m)
+        if valid_len <= 0 or bias not in ("bullish", "bearish"):
+            return None
+        current_price = float(df_15m["close"].iloc[-1])
+
+        # Check FVGs (wider lookback, no penetration required)
+        fvg_data = ind_15m.get("fvg")
+        if fvg_data is not None and not fvg_data.empty:
+            end = min(valid_len, len(fvg_data))
+            scan_start = max(0, end - max_bars)
+            for idx in range(end - 1, scan_start - 1, -1):
+                row = fvg_data.iloc[idx]
+                fvg_dir = row.get("FVG", 0)
+                top_val = row.get("Top", np.nan)
+                bottom_val = row.get("Bottom", np.nan)
+                if pd.isna(top_val) or pd.isna(bottom_val) or pd.isna(fvg_dir) or fvg_dir == 0:
+                    continue
+                gap_size = abs(top_val - bottom_val) / current_price if current_price > 0 else 0
+                if gap_size < fvg_thresh:
+                    continue
+                # Match direction to bias (no penetration check)
+                if bias == "bullish" and fvg_dir > 0:
+                    return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bullish"}
+                if bias == "bearish" and fvg_dir < 0:
+                    return {"type": "fvg", "top": float(top_val), "bottom": float(bottom_val), "direction": "bearish"}
+
+        # Fallback: Order Blocks
+        ob_data = ind_15m.get("order_blocks")
+        if ob_data is not None and not ob_data.empty:
+            end = min(valid_len, len(ob_data))
+            scan_start = max(0, end - max_bars)
+            for idx in range(end - 1, scan_start - 1, -1):
+                row = ob_data.iloc[idx]
+                ob_dir = row.get("OB", 0)
+                ob_top = row.get("Top", np.nan)
+                ob_bottom = row.get("Bottom", np.nan)
+                if pd.isna(ob_top) or pd.isna(ob_bottom) or pd.isna(ob_dir) or ob_dir == 0:
+                    continue
+                if bias == "bullish" and ob_dir > 0:
+                    return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bullish"}
+                if bias == "bearish" and ob_dir < 0:
+                    return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bearish"}
+        return None
 
     def _build_xgb_features(self, components: dict, score: float) -> dict[str, float]:
         """Build 37-feature dict matching XGBoost model expectations.
