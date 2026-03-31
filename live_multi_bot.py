@@ -1142,7 +1142,11 @@ class PaperBot:
                 self.buffer_5m = self.buffer_5m.iloc[-1500:].reset_index(drop=True)
 
         if len(buf) >= self.swing_length + 5:
-            self._prepare_signal(symbol, buf, candle)
+            try:
+                self._prepare_signal(symbol, buf, candle)
+            except Exception as _sig_exc:
+                import traceback
+                self.logger.error("SIGNAL_ERROR %s: %s\n%s", symbol, _sig_exc, traceback.format_exc())
 
         # ── Trade Journal: record bar for each active trade ──────────
         # Fires only on confirmed closed 5m candles (not poll ticks).
