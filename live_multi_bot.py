@@ -1821,16 +1821,11 @@ class PaperBot:
                 self.logger.info("CIRCUIT BREAKER SKIP %s: %s", symbol, cb_reason)
                 return
 
-        # ── Volatility gate (skip coins with too little movement) ─
+        # ── Volatility check (soft — training has no volatility gate) ─
         tradeable, daily_atr, fivem_atr = self._check_volatility()
         if not tradeable:
-            self._pending_signal = None
-            self.logger.debug(
-                "VOLATILITY SKIP %s | daily_atr=%.4f%% (min %.4f%%) 5m_atr=%.4f%% (min %.4f%%)",
-                symbol, daily_atr * 100, self.min_daily_atr_pct * 100,
-                fivem_atr * 100, self.min_5m_atr_pct * 100,
-            )
-            return
+            # Soft penalty instead of hard gate (training doesn't filter on volatility)
+            score -= 0.05
 
         # ── Volume filter (basic pre-check – detailed scoring in alignment) ─
         # Quick reject if volume is clearly dead (< 0.5x avg)
@@ -1969,41 +1964,19 @@ class PaperBot:
             tp_dist = price * style_cfg["max_tp_pct"]
             tp = (price + tp_dist) if direction == "long" else (price - tp_dist)
 
-        # ── RR check (style-specific minimum) ─────────────────────
+        # ── RR check (global minimum, matching training pipeline) ──
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
-        if rr < style_cfg["min_rr"]:
+        if rr < 1.0:  # training uses global 1.0, not per-style
             self._pending_signal = None
-            self.logger.debug("RR TOO LOW %s | rr=%.2f min=%.1f style=%s", symbol, rr, style_cfg["min_rr"], style)
+            self.logger.debug("RR TOO LOW %s | rr=%.2f min=1.0", symbol, rr)
             return
 
-        # ── Setup quality tier classification ─────────────────────
-        tier = self._classify_setup_tier(score, rr, components)
-        if not tier:
-            self._pending_signal = None
-            _flags = {
-                "bias_strong": bool(components.get("bias_strong")),
-                "h4_confirms": bool(components.get("h4_confirms")),
-                "h4_poi": bool(components.get("h4_poi")),
-                "h1_confirms": bool(components.get("h1_confirms")),
-                "h1_choch": bool(components.get("h1_choch")),
-                "entry_zone": components.get("entry_zone") is not None,
-                "precision_trigger": bool(components.get("precision_trigger")),
-                "volume_ok": bool(components.get("volume_ok")),
-                "adx_strong": bool(components.get("adx_strong")),
-                "session_optimal": bool(components.get("session_optimal")),
-                "zone_quality_ok": bool(components.get("zone_quality_ok")),
-            }
-            _passing = sum(1 for v in _flags.values() if v)
-            _failing = [k for k, v in _flags.items() if not v]
-            _skipped = [k for k in _failing if k in self._tier_skip_flags]
-            _real_failing = [k for k in _failing if k not in self._tier_skip_flags]
-            self.logger.info(
-                "NEAR-MISS TIER %s | class=%s score=%.3f RR=%.1f dir=%s | "
-                "flags=%d/11 | missing=%s | skipped=%s",
-                symbol, self.asset_class, score, rr, direction,
-                _passing, _real_failing, _skipped,
-            )
-            return
+        # ── Tier removed — XGBoost brain is the primary filter ─────
+        # Training has no tier system; brain learned on raw score+features.
+        # Assign tier label for logging/risk only (not as a gate).
+        tier = TIER_AAA_PLUS  # default tier for risk sizing
+        if score >= 0.75:
+            tier = TIER_AAA_PLUS_PLUS
 
         # ── Signal rate limiting (per-class safety throttle) ──────
         now = datetime.now(timezone.utc)
