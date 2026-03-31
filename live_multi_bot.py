@@ -1823,9 +1823,7 @@ class PaperBot:
 
         # ── Volatility check (soft — training has no volatility gate) ─
         tradeable, daily_atr, fivem_atr = self._check_volatility()
-        if not tradeable:
-            # Soft penalty instead of hard gate (training doesn't filter on volatility)
-            score -= 0.05
+        _vol_penalty = 0.05 if not tradeable else 0.0
 
         # ── Volume filter (basic pre-check – detailed scoring in alignment) ─
         # Quick reject if volume is clearly dead (< 0.5x avg)
@@ -1840,6 +1838,7 @@ class PaperBot:
 
         # ── Multi-TF alignment score (granular) ───────────────────
         score, direction, components = self._multi_tf_alignment_score(candle)
+        score -= _vol_penalty  # apply volatility penalty (training has no vol gate)
         if score < self.alignment_threshold:
             if score >= 0.50:
                 self.logger.info(
