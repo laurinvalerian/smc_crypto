@@ -607,7 +607,7 @@ def api_near_misses():
 @app.route("/api/public/paper-grid")
 def api_paper_grid():
     """Return Paper Grid variant performance and recent trades."""
-    state_path = RESULTS_DIR / "paper_grid_state.json"
+    state_path = Path("paper_grid_results/paper_grid_state.json")
     if not state_path.exists():
         return jsonify({"variants": [], "recent_trades": []})
     try:
