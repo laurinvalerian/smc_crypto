@@ -57,7 +57,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from rl_brain import CentralRLBrain, extract_features, compute_shaped_reward
+# rl_brain.py (PPO) is superseded by rl_brain_v2.py (XGBoost).
+# Keep import for extract_features (used for obs vector) but CentralRLBrain is no longer needed.
+from rl_brain import extract_features
 from rl_brain_v2 import RLBrainSuite
 from trade_journal import TradeJournal
 from utils.indicators import compute_rsi_wilders, compute_atr_wilders
@@ -474,7 +476,7 @@ class PaperBot:
         output_dir: Path,
         asset_class: str = "crypto",
         adapter: ExchangeAdapter | None = None,
-        central_brain: CentralRLBrain | None = None,
+        central_brain: Any | None = None,  # Legacy PPO brain, no longer used
         rl_suite: RLBrainSuite | None = None,
     ) -> None:
         self.bot_id = bot_id
@@ -554,9 +556,7 @@ class PaperBot:
         # Paper Grid (multi-variant A/B testing, set by Runner)
         self.paper_grid: PaperGrid | None = None
 
-        # Shared RL Brain (central PPO)
-        if central_brain is None:
-            raise ValueError("central_brain must be provided")
+        # Legacy PPO brain (superseded by XGBoost rl_brain_v2, kept for compat)
         self.brain = central_brain
         self.rl_suite = rl_suite
 
@@ -3517,9 +3517,7 @@ class LiveMultiBotRunner:
         self.adapters = adapters
         # Crypto adapter for WebSocket feeds
         self._crypto_adapter = adapters.get("crypto")
-        self.brain: CentralRLBrain | None = None
-        if bots:
-            self.brain = bots[0].brain
+        self.brain = None  # Legacy PPO brain, no longer used
 
         # Build lookups
         self._symbol_to_bot: dict[str, PaperBot] = {
@@ -4065,18 +4063,6 @@ class LiveMultiBotRunner:
             # Record trade close in Paper Grid (A/B testing)
             if bot.paper_grid is not None:
                 bot.paper_grid.record_trade_close(exit_price, bot.symbol)
-
-            # Feed shaped reward to central RL brain when the decision was tracked
-            if trade.get("rl_tracked") and trade.get("rl_trade_id"):
-                shaped_rew = compute_shaped_reward(
-                    pnl_pct=pnl_pct,
-                    rr_ratio=trade.get("rr", 3.0),
-                    expected_rr=trade.get("rr", 3.0),
-                    tier=trade.get("tier", "AAA+"),
-                    bars_to_exit=trade.get("bars_held", 0),
-                    hit_sl=(pnl_pct < 0),
-                )
-                bot.brain.record_outcome(trade_id=trade["rl_trade_id"], reward=shaped_rew, done=True)
 
             # ── Trade Journal: record trade close ─────────────────────
             if bot.journal is not None:
@@ -4809,13 +4795,6 @@ class LiveMultiBotRunner:
         )
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-        # Flush central RL brain (save remaining buffer)
-        if self.brain is not None:
-            try:
-                self.brain.flush()
-            except Exception:
-                pass
-
         # Fetch final equity before closing exchange
         final_equity = await self._fetch_real_total_equity()
         for b in self.bots:
@@ -4914,13 +4893,6 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     logger.info("%d instruments active: %s", len(active), count_str)
     console.print(f"[bold cyan]Creating {len(active)} bots ({count_str}) ...[/bold cyan]")
 
-    # ── Create RL Brain ───────────────────────────────────────────
-    all_symbols = [sym for sym, _ in active]
-    central_brain = CentralRLBrain(
-        model_dir=output_dir / "rl_models",
-        coin_ids=all_symbols,
-    )
-
     # ── Create RL Brain Suite (XGBoost models) ────────────────────
     rl_suite = RLBrainSuite(config)
 
@@ -4934,7 +4906,6 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             output_dir=output_dir,
             asset_class=ac,
             adapter=adapters[ac],
-            central_brain=central_brain,
             rl_suite=rl_suite,
         )
         bots.append(bot)
@@ -4953,6 +4924,32 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
 
     # ── Runner ────────────────────────────────────────────────────
     runner = LiveMultiBotRunner(bots=bots, adapters=adapters)
+
+    # ── Sync initial equity from exchange for bots without saved state ─
+    seen_adapters: dict[int, float] = {}
+    for ac, adapter in adapters.items():
+        aid = id(adapter)
+        if aid in seen_adapters:
+            continue
+        try:
+            bal = await adapter.fetch_balance()
+            real_equity = bal.free if bal else 0.0
+            seen_adapters[aid] = real_equity
+            logger.info("Initial equity [%s]: %.2f", ac, real_equity)
+        except Exception as exc:
+            logger.warning("Failed to fetch initial equity [%s]: %s", ac, exc)
+            seen_adapters[aid] = 0.0
+
+    for bot in bots:
+        if bot.equity <= 0:
+            adapter_equity = seen_adapters.get(id(adapters.get(bot.asset_class)), 0.0)
+            if adapter_equity > 0:
+                bot.equity = adapter_equity
+                bot.peak_equity = adapter_equity
+                bot._account_equity = adapter_equity
+
+    equity_summary = {ac: seen_adapters.get(id(adapters.get(ac)), 0.0) for ac in adapters}
+    logger.info("Equity synced: %s", equity_summary)
 
     # Signal handlers
     loop = asyncio.get_event_loop()
