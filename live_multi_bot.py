@@ -527,9 +527,12 @@ class PaperBot:
         self._pending_signal: dict[str, Any] | None = None
 
         # Per-class tier flag skip list and signal rate limiting
-        self._tier_skip_flags: set[str] = set(
-            TIER_SKIP_FLAGS.get(asset_class, [])
-        )
+        # On testnet, skip volume_ok for crypto (unrealistic testnet volumes)
+        _skip = list(TIER_SKIP_FLAGS.get(asset_class, []))
+        if asset_class == "crypto" and getattr(adapter, "_testnet", False):
+            if "volume_ok" not in _skip:
+                _skip.append("volume_ok")
+        self._tier_skip_flags: set[str] = set(_skip)
         self._max_signals_per_4h: int = MAX_SIGNALS_PER_SYMBOL_4H.get(asset_class, 5)
         self._recent_signal_times: list[datetime] = []
 
