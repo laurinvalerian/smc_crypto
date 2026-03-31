@@ -358,7 +358,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_sl_pct": 0.008,    # 0.8% max SL
         "min_tp_pct": 0.006,    # 0.6% min TP
         "max_tp_pct": 0.015,    # 1.5% max TP
-        "min_rr": 2.0,
+        "min_rr": 1.5,          # lowered from 2.0 — brain filters bad RR
         "cooldown_minutes": 20,
     },
     STYLE_DAY: {
@@ -366,7 +366,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_sl_pct": 0.025,    # 2.5% max SL
         "min_tp_pct": 0.008,    # 0.8% min TP
         "max_tp_pct": 0.06,     # 6% max TP
-        "min_rr": 2.5,
+        "min_rr": 1.5,          # lowered from 2.5 — brain filters bad RR
         "cooldown_minutes": 60,
     },
     STYLE_SWING: {
@@ -374,7 +374,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_sl_pct": 0.05,     # 5% max SL
         "min_tp_pct": 0.02,     # 2% min TP
         "max_tp_pct": 0.15,     # 15% max TP
-        "min_rr": 3.0,
+        "min_rr": 2.0,          # lowered from 3.0 — brain filters bad RR
         "cooldown_minutes": 240,
     },
 }
@@ -1955,12 +1955,14 @@ class PaperBot:
 
         if tp_dist <= 0:
             self._pending_signal = None
+            self.logger.debug("TP_DIST<=0 %s | style=%s", symbol, style)
             return
 
         # ── Enforce TP constraints for style ──────────────────────
         tp_pct = tp_dist / price
         if tp_pct < style_cfg["min_tp_pct"]:
             self._pending_signal = None
+            self.logger.debug("TP TOO SMALL %s | tp=%.4f%% min=%.4f%% style=%s", symbol, tp_pct * 100, style_cfg["min_tp_pct"] * 100, style)
             return
         if tp_pct > style_cfg["max_tp_pct"]:
             # Clamp TP to max for this style
@@ -1971,6 +1973,7 @@ class PaperBot:
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
         if rr < style_cfg["min_rr"]:
             self._pending_signal = None
+            self.logger.debug("RR TOO LOW %s | rr=%.2f min=%.1f style=%s", symbol, rr, style_cfg["min_rr"], style)
             return
 
         # ── Setup quality tier classification ─────────────────────
