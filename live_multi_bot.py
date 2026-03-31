@@ -354,17 +354,17 @@ STYLE_SWING = "swing"
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
-        "min_sl_pct": 0.004,    # 0.4% min SL (prevents 1-tick SLs on low-price coins)
+        "min_sl_pct": 0.002,    # 0.2% min SL (lowered — brain validates)
         "max_sl_pct": 0.008,    # 0.8% max SL
-        "min_tp_pct": 0.006,    # 0.6% min TP
+        "min_tp_pct": 0.002,    # 0.2% min TP (lowered from 0.6% — was blocking forex)
         "max_tp_pct": 0.015,    # 1.5% max TP
         "min_rr": 1.5,          # lowered from 2.0 — brain filters bad RR
         "cooldown_minutes": 20,
     },
     STYLE_DAY: {
-        "min_sl_pct": 0.0035,   # 0.35% min SL
+        "min_sl_pct": 0.002,    # 0.2% min SL (lowered — brain validates)
         "max_sl_pct": 0.025,    # 2.5% max SL
-        "min_tp_pct": 0.008,    # 0.8% min TP
+        "min_tp_pct": 0.004,    # 0.4% min TP (lowered from 0.8%)
         "max_tp_pct": 0.06,     # 6% max TP
         "min_rr": 1.5,          # lowered from 2.5 — brain filters bad RR
         "cooldown_minutes": 60,
