@@ -1920,47 +1920,23 @@ class PaperBot:
             sl_dist = min_sl_dist
             sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
 
-        # ── Enforce maximum SL for style (with auto-upgrade) ─────
-        # If SL widening pushed beyond current style limits,
-        # upgrade to next style (SCALP → DAY → SWING) instead of rejecting
-        max_sl_dist = price * style_cfg["max_sl_pct"]
+        # ── SL safety cap (training has no style-based SL limits) ──
+        # Just cap at swing max (5%) as safety — no style upgrades needed
+        max_sl_pct = 0.05  # 5% absolute max SL
+        max_sl_dist = price * max_sl_pct
         if sl_dist > max_sl_dist:
-            upgraded = False
-            upgrade_chain = {STYLE_SCALP: STYLE_DAY, STYLE_DAY: STYLE_SWING}
-            next_style = upgrade_chain.get(style)
-            if next_style:
-                next_cfg = STYLE_CONFIG[next_style]
-                next_max = price * next_cfg["max_sl_pct"]
-                if sl_dist <= next_max:
-                    self.logger.info(
-                        "Style upgraded %s → %s (SL %.4f%% > %s max %.4f%%) for %s",
-                        style, next_style, sl_dist / price * 100,
-                        style, style_cfg["max_sl_pct"] * 100, symbol,
-                    )
-                    style = next_style
-                    style_cfg = next_cfg
-                    upgraded = True
-            if not upgraded:
-                self._pending_signal = None
-                self.logger.debug(
-                    "SL TOO WIDE for %s style: %.4f%% > max %.4f%%",
-                    style, sl_dist / price * 100, style_cfg["max_sl_pct"] * 100,
-                )
-                return
+            self._pending_signal = None
+            self.logger.debug("SL CAPPED %s | sl=%.2f%% > max 5%%", symbol, sl_dist / price * 100)
+            return
 
         if tp_dist <= 0:
             self._pending_signal = None
             self.logger.debug("TP_DIST<=0 %s | style=%s", symbol, style)
             return
 
-        # ── Enforce TP constraints for style ──────────────────────
+        # ── TP clamping (training has no min_tp — RR check handles bad TPs) ──
         tp_pct = tp_dist / price
-        if tp_pct < style_cfg["min_tp_pct"]:
-            self._pending_signal = None
-            self.logger.debug("TP TOO SMALL %s | tp=%.4f%% min=%.4f%% style=%s", symbol, tp_pct * 100, style_cfg["min_tp_pct"] * 100, style)
-            return
         if tp_pct > style_cfg["max_tp_pct"]:
-            # Clamp TP to max for this style
             tp_dist = price * style_cfg["max_tp_pct"]
             tp = (price + tp_dist) if direction == "long" else (price - tp_dist)
 
