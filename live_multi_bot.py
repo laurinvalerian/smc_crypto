@@ -193,19 +193,19 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
         "swing_length": 8, "fvg_threshold": 0.0006,
         "order_block_lookback": 20, "liquidity_range_percent": 0.01,
         "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
-        "min_daily_atr_pct": 0.008, "min_5m_atr_pct": 0.0015,
+        "min_daily_atr_pct": 0.005, "min_5m_atr_pct": 0.0010,
     },
     "forex": {
         "swing_length": 20, "fvg_threshold": 0.001,
         "order_block_lookback": 30, "liquidity_range_percent": 0.008,
         "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
-        "min_daily_atr_pct": 0.004, "min_5m_atr_pct": 0.0005,
+        "min_daily_atr_pct": 0.003, "min_5m_atr_pct": 0.0003,
     },
     "stocks": {
         "swing_length": 10, "fvg_threshold": 0.0003,
         "order_block_lookback": 20, "liquidity_range_percent": 0.005,
         "alignment_threshold": 0.50, "weight_day": 1.25, "bos_choch_filter": "medium",
-        "min_daily_atr_pct": 0.010, "min_5m_atr_pct": 0.0010,
+        "min_daily_atr_pct": 0.007, "min_5m_atr_pct": 0.0007,
     },
     "commodities": {
         "swing_length": 10, "fvg_threshold": 0.0004,
