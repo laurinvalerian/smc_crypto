@@ -928,6 +928,17 @@ class PaperBot:
                     zone_for_quality = self._find_nearest_zone(
                         ind_15m, self.buffer_15m, daily_bias, fvg_thresh, _zone_bars * 3,
                     )
+                    # TEMPORARY DEBUG: log zone search results
+                    fvg_d = ind_15m.get("fvg")
+                    ob_d = ind_15m.get("order_blocks")
+                    n_fvg = 0 if fvg_d is None or fvg_d.empty else int((fvg_d.get("FVG", pd.Series()).fillna(0) != 0).sum())
+                    n_ob = 0 if ob_d is None or ob_d.empty else int((ob_d.get("OB", pd.Series()).fillna(0) != 0).sum())
+                    if n_fvg > 0 or n_ob > 0:
+                        self.logger.info(
+                            "ZONE_PROBE %s | bias=%s fvgs=%d obs=%d zone_found=%s buf15m=%d",
+                            symbol, daily_bias, n_fvg, n_ob,
+                            zone_for_quality is not None, len(self.buffer_15m),
+                        )
 
                 if zone_for_quality is not None:
                     closes_15m = self.buffer_15m["close"].values.astype(np.float64)
