@@ -82,10 +82,10 @@ def compute_adx(
     if len(dx_values) < period:
         return 0.0, 0.0, 0.0
 
-    # ADX = smoothed DX
+    # ADX = Wilder-smoothed DX (proper average, not sum)
     adx = np.mean(dx_values[:period])
     for i in range(period, len(dx_values)):
-        adx = adx - (adx / period) + dx_values[i]
+        adx = (adx * (period - 1) + dx_values[i]) / period
 
     # Final +DI, -DI
     if atr > 0:
