@@ -989,18 +989,22 @@ def api_active_trades():
         for trade in bot.get("active_trades", []):
             if not isinstance(trade, dict):
                 continue
+            # Trade dict uses internal keys: "entry" (not "entry_price"),
+            # "rl_confidence" (not "confidence"), etc.
+            entry_p = trade.get("entry") or trade.get("entry_price") or 0.0
             result.append({
                 "symbol": trade.get("symbol", bot.get("symbol", _tag)),
                 "direction": trade.get("direction", ""),
-                "entry_price": trade.get("entry_price", 0.0),
-                "sl": trade.get("sl", 0.0),
-                "tp": trade.get("tp", 0.0),
+                "entry_price": float(entry_p),
+                "sl": float(trade.get("sl", 0.0)),
+                "tp": float(trade.get("tp", 0.0)),
                 "entry_time": trade.get("entry_time", ""),
                 "style": trade.get("style", ""),
-                "tier": trade.get("tier", ""),
-                "confidence": trade.get("confidence", 0.0),
+                "tier": trade.get("tier") or trade.get("setup_tier", ""),
+                "confidence": float(trade.get("rl_confidence") or trade.get("confidence") or 0.0),
                 "asset_class": bot.get("asset_class", "unknown"),
-                "unrealized_pnl": trade.get("unrealized_pnl", 0.0),
+                "unrealized_pnl": float(trade.get("unrealized_pnl") or trade.get("_prev_unrealized_pnl_pct") or 0.0),
+                "qty": float(trade.get("qty", 0.0)),
             })
     return jsonify(result)
 
