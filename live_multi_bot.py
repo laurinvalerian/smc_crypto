@@ -562,6 +562,27 @@ class PaperBot:
         self.brain = central_brain
         self.rl_suite = rl_suite
 
+        # ── Load pre-computed symbol ranks for XGB features ──────────
+        # Ships from MacBook as models/symbol_ranks.json alongside model pickle.
+        # Falls back to per-asset-class training medians if missing.
+        # Class-level cache avoids 112 bots each re-reading the same JSON.
+        if not hasattr(PaperBot, "_symbol_ranks_cache"):
+            _ranks_path = Path("models/symbol_ranks.json")
+            if _ranks_path.exists():
+                try:
+                    with open(_ranks_path) as f:
+                        PaperBot._symbol_ranks_cache = json.load(f)
+                except Exception:
+                    PaperBot._symbol_ranks_cache = {}
+            else:
+                PaperBot._symbol_ranks_cache = {}
+
+        _fallback = self._AC_FALLBACK_MEDIANS.get(asset_class, self._AC_FALLBACK_MEDIANS["crypto"])
+        _sym_ranks = PaperBot._symbol_ranks_cache.get(asset_class, {}).get(symbol, {})
+        self._symbol_volatility_rank = float(_sym_ranks.get("volatility_rank", _fallback["volatility"]))
+        self._symbol_liquidity_rank = float(_sym_ranks.get("liquidity_rank", _fallback["liquidity"]))
+        self._symbol_spread_rank = float(_sym_ranks.get("spread_rank", _fallback["spread"]))
+
         # DQN exit manager (shadow mode -- logs alongside XGBoost for comparison)
         self._dqn_exit = None
         self._dqn_cfg = config.get("dqn_exit_manager", {})
@@ -1521,6 +1542,16 @@ class PaperBot:
     # XGBoost asset class mapping (must match rl_brain_v2.ASSET_CLASS_MAP)
     _XGB_AC_MAP = {"crypto": 0, "forex": 1, "stocks": 2, "commodities": 3}
 
+    # Per-asset-class fallback medians for symbol_*_rank features.
+    # Used when models/symbol_ranks.json is missing or symbol not in JSON.
+    # Verified from training parquets (2026-04-01).
+    _AC_FALLBACK_MEDIANS: dict[str, dict[str, float]] = {
+        "crypto":      {"volatility": 0.246, "liquidity": 0.709, "spread": 0.246},
+        "forex":       {"volatility": 0.481, "liquidity": 0.519, "spread": 0.481},
+        "stocks":      {"volatility": 0.510, "liquidity": 0.490, "spread": 0.510},
+        "commodities": {"volatility": 0.333, "liquidity": 0.667, "spread": 0.667},
+    }
+
     @staticmethod
     def _find_nearest_zone(
         ind_15m: dict, df_15m: pd.DataFrame, bias: str,
@@ -1576,10 +1607,12 @@ class PaperBot:
         return None
 
     def _build_xgb_features(self, components: dict, score: float) -> dict[str, float]:
-        """Build 37-feature dict matching XGBoost model expectations.
+        """Build 40-feature dict matching XGBoost model expectations.
 
         Mirrors the feature computation in backtest/generate_rl_data.py
-        but only for the current (last) bar.
+        but only for the current (last) bar.  has_entry_zone and
+        alignment_score are kept for TP/BE/sizing models; the entry_quality
+        model excludes them via feat_names reindex.
         """
         feat: dict[str, float] = {}
 
@@ -1766,10 +1799,42 @@ class PaperBot:
                 feat["liq_above_count"] = min(above_c, 1.0)
                 feat["liq_below_count"] = min(below_c, 1.0)
 
+        # ── Symbol ranks (pre-computed, loaded from JSON at init) ────
+        feat["symbol_volatility_rank"] = self._symbol_volatility_rank
+        feat["symbol_liquidity_rank"] = self._symbol_liquidity_rank
+        feat["symbol_spread_rank"] = self._symbol_spread_rank
+
         # ── Asset class ID ──────────────────────────────────────────
         feat["asset_class_id"] = float(self._XGB_AC_MAP.get(self.asset_class, 0))
 
         return feat
+
+    def validate_xgb_features(self, model_feat_names: list[str]) -> bool:
+        """Validate feature alignment at startup. Returns True if no missing features."""
+        dummy = self._build_xgb_features({}, 0.0)
+        live_keys = set(dummy.keys())
+        model_keys = set(model_feat_names)
+        missing = model_keys - live_keys
+        extra = live_keys - model_keys
+
+        if missing:
+            self.logger.error(
+                "XGB FEATURE MISMATCH: %d features MISSING from live: %s — model will fill with 0.0!",
+                len(missing), sorted(missing),
+            )
+        if extra:
+            self.logger.warning(
+                "XGB features in live but NOT in model (will be dropped): %s",
+                sorted(extra),
+            )
+        if not missing and not extra:
+            self.logger.info("XGB features validated: %d/%d exact match", len(model_keys), len(model_keys))
+        elif not missing:
+            self.logger.info(
+                "XGB features validated: %d/%d model features present (%d extra in live)",
+                len(model_keys), len(model_keys), len(extra),
+            )
+        return len(missing) == 0
 
     # ── Signal preparation (called from on_candle) ──────────────────
 
@@ -1842,7 +1907,8 @@ class PaperBot:
         score, direction, components = self._multi_tf_alignment_score(candle)
         score -= _vol_penalty  # apply volatility penalty (training has no vol gate)
         if score < self.alignment_threshold:
-            if score >= 0.50:
+            _near_miss_floor = max(0.40, self.alignment_threshold - 0.15)
+            if score >= _near_miss_floor:
                 self.logger.info(
                     "NEAR-MISS ALIGNMENT %s | class=%s score=%.3f thresh=%.2f dir=%s | flags=%s",
                     symbol, self.asset_class, score, self.alignment_threshold, direction,
@@ -2104,6 +2170,14 @@ class PaperBot:
                     self.logger.warning(
                         "RL ALERT: acceptance rate %.0f%% (%d/%d) — check feature extraction",
                         _rate, self._rl_accepted, _total_rl,
+                    )
+                # Near-miss: close rejections visible on dashboard
+                if rl_confidence >= 0.45:
+                    self.logger.info(
+                        "NEAR-MISS XGB %s conf=%.3f score=%.2f thresh=%.2f | %s %s",
+                        symbol, rl_confidence, score,
+                        self.rl_suite.confidence_threshold if self.rl_suite else 0.6,
+                        self.asset_class, direction,
                     )
                 self._pending_signal = None
                 return
@@ -2399,7 +2473,7 @@ class PaperBot:
             ra = balance * risk_pct
             q = ra / sl_dist
             q = _round_qty(q)
-            return q, q * price if q > 0 else (0.0, 0.0)
+            return (q, q * price) if q > 0 else (0.0, 0.0)
 
         def _too_big(qty_val: float, notional_val: float) -> bool:
             if qty_val <= 0 or notional_val <= 0:
@@ -2449,7 +2523,7 @@ class PaperBot:
                 code == -2019
                 or str(code) == "-2019"
                 or "insufficient" in msg_str
-                or "margin" in msg_str and "not sufficient" in msg_str
+                or ("margin" in msg_str and "not sufficient" in msg_str)
             )
 
         def _is_rate_limit_error(code: int | str | None, msg: str) -> bool:
@@ -3794,7 +3868,7 @@ class LiveMultiBotRunner:
         while not self._shutdown.is_set():
             # Skip polling when market is closed (saves API calls, avoids rate limits)
             try:
-                if not await bot.adapter.is_market_open(bot.symbol):
+                if not bot.adapter.is_market_open(bot.symbol):
                     try:
                         await asyncio.wait_for(self._shutdown.wait(), timeout=300)  # check again in 5 min
                         return
@@ -3850,7 +3924,7 @@ class LiveMultiBotRunner:
         while not self._shutdown.is_set():
             # Skip polling when market is closed
             try:
-                if not await bot.adapter.is_market_open(bot.symbol):
+                if not bot.adapter.is_market_open(bot.symbol):
                     try:
                         await asyncio.wait_for(self._shutdown.wait(), timeout=300)
                         return
@@ -4967,6 +5041,14 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
         bots.append(bot)
 
     console.print(f"[bold green]{len(bots)} bots created.[/bold green]")
+
+    # ── Validate XGB feature alignment (once, using first bot) ────
+    if rl_suite and rl_suite._entry_filter and bots:
+        ef_feat_names = rl_suite._entry_filter.get("feat_names", [])
+        if ef_feat_names:
+            ok = bots[0].validate_xgb_features(ef_feat_names)
+            if not ok:
+                logger.error("XGB feature validation FAILED — model will use 0.0 for missing features!")
 
     # ── Load history (batched, rate-limit-friendly) ───────────────
     logger.info("Loading history (250+ bars per TF) for %d instruments...", len(bots))

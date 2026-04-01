@@ -701,6 +701,23 @@ def run_walk_forward_rolling(
         }, f)
     logger.info("Production model saved: %s", model_path)
 
+    # Export symbol ranks as JSON (ships to server alongside model pickle)
+    try:
+        from backtest.generate_rl_data import compute_symbol_ranks
+        all_ranks: dict[str, dict] = {}
+        for ac in ALL_CLASSES:
+            ac_ranks = compute_symbol_ranks(ac)
+            if ac_ranks:
+                all_ranks[ac] = ac_ranks
+        ranks_path = MODEL_DIR / "symbol_ranks.json"
+        with open(ranks_path, "w") as f:
+            json.dump(all_ranks, f, indent=2)
+        logger.info("Symbol ranks saved: %s (%d classes, %d symbols)",
+                     ranks_path, len(all_ranks),
+                     sum(len(v) for v in all_ranks.values()))
+    except Exception as exc:
+        logger.warning("Could not export symbol_ranks.json: %s", exc)
+
     # Save detailed results
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -100,6 +100,9 @@ class OandaAdapter(ExchangeAdapter):
         self._oanda_to_unified: dict[str, str] = {}
         self._unified_to_oanda: dict[str, str] = {}
 
+        # Concurrency limiter for candle fetches (practice account rate limits)
+        self._candle_semaphore = asyncio.Semaphore(3)
+
     # ── Identity ────────────────────────────────────────────────────
 
     @property
@@ -253,12 +256,13 @@ class OandaAdapter(ExchangeAdapter):
             kwargs.pop("count", None)
 
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._api.instrument.candles, oanda_sym, **kwargs,
-                ),
-                timeout=15.0,  # 15s max per candle request
-            )
+            async with self._candle_semaphore:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._api.instrument.candles, oanda_sym, **kwargs,
+                    ),
+                    timeout=30.0,  # 30s max (practice account slow during London open)
+                )
         except asyncio.TimeoutError:
             logger.debug("OANDA candle request timed out for %s", oanda_sym)
             return []
