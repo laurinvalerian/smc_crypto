@@ -101,6 +101,10 @@ class AlpacaAdapter(ExchangeAdapter):
     def asset_class(self) -> str:
         return "stocks"
 
+    @property
+    def supports_attached_sl_tp(self) -> bool:
+        return True  # Alpaca uses bracket orders (entry + SL + TP in one request)
+
     # ── Lifecycle ───────────────────────────────────────────────────
 
     async def connect(self) -> None:
@@ -330,18 +334,35 @@ class AlpacaAdapter(ExchangeAdapter):
 
         try:
             from alpaca.trading.requests import MarketOrderRequest
-            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
         except ImportError:
             raise ImportError("alpaca-py required")
 
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+        _qty = self.amount_to_precision(symbol, qty)
 
-        request = MarketOrderRequest(
-            symbol=symbol,
-            qty=self.amount_to_precision(symbol, qty),
-            side=order_side,
-            time_in_force=TimeInForce.DAY,
-        )
+        # Bracket order: attach SL/TP to entry (avoids "wash trade" rejection)
+        sl_price = params.get("stopLossPrice") if params else None
+        tp_price = params.get("takeProfitPrice") if params else None
+
+        if sl_price and tp_price:
+            from alpaca.trading.requests import TakeProfitRequest, StopLossRequest
+            request = MarketOrderRequest(
+                symbol=symbol,
+                qty=_qty,
+                side=order_side,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=round(float(tp_price), 2)),
+                stop_loss=StopLossRequest(stop_price=round(float(sl_price), 2)),
+            )
+        else:
+            request = MarketOrderRequest(
+                symbol=symbol,
+                qty=_qty,
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+            )
 
         order = await asyncio.to_thread(
             self._trading_client.submit_order, request,
