@@ -79,6 +79,11 @@ class OandaAdapter(ExchangeAdapter):
     - Separate SL/TP orders (no bracket orders, uses Trade-attached SL/TP)
     """
 
+    # NOTE: All asyncio.to_thread calls are wrapped in asyncio.wait_for(timeout=30s).
+    # asyncio.wait_for does NOT cancel the underlying thread on timeout — the OANDA SDK
+    # call continues in the background. Socket-level timeouts in the v20 SDK handle
+    # eventual thread cleanup. Monitor with threading.active_count() if issues arise.
+
     def __init__(
         self,
         account_id: str = "",
@@ -156,9 +161,16 @@ class OandaAdapter(ExchangeAdapter):
             raise RuntimeError("OandaAdapter not connected. Call connect() first.")
 
         # Fetch instrument list from OANDA
-        response = await asyncio.to_thread(
-            self._api.account.instruments, self._account_id,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.account.instruments, self._account_id,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: load_markets")
+            raise
 
         oanda_instruments = {}
         if hasattr(response, "body") and "instruments" in response.body:
@@ -302,11 +314,18 @@ class OandaAdapter(ExchangeAdapter):
 
         oanda_sym = self._unified_to_oanda.get(symbol, symbol.replace("/", "_"))
 
-        response = await asyncio.to_thread(
-            self._api.pricing.get,
-            self._account_id,
-            instruments=oanda_sym,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.pricing.get,
+                    self._account_id,
+                    instruments=oanda_sym,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: watch_ticker")
+            raise
 
         if hasattr(response, "body") and "prices" in response.body:
             prices = response.body["prices"]
@@ -383,9 +402,16 @@ class OandaAdapter(ExchangeAdapter):
             if params.get("reduceOnly"):
                 order_data["positionFill"] = "REDUCE_ONLY"
 
-        response = await asyncio.to_thread(
-            self._api.order.market, self._account_id, **{"order": order_data},
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.order.market, self._account_id, **{"order": order_data},
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: create_market_order")
+            raise
 
         order_id = None
         fill_price = 0.0
@@ -441,9 +467,16 @@ class OandaAdapter(ExchangeAdapter):
             "timeInForce": "GTC",
         }
 
-        response = await asyncio.to_thread(
-            self._api.order.create, self._account_id, **{"order": order_data},
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.order.create, self._account_id, **{"order": order_data},
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: create_stop_loss")
+            raise
 
         order_id = None
         status = "unknown"
@@ -487,9 +520,16 @@ class OandaAdapter(ExchangeAdapter):
             "timeInForce": "GTC",
         }
 
-        response = await asyncio.to_thread(
-            self._api.order.create, self._account_id, **{"order": order_data},
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.order.create, self._account_id, **{"order": order_data},
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: create_take_profit")
+            raise
 
         order_id = None
         status = "unknown"
@@ -513,8 +553,11 @@ class OandaAdapter(ExchangeAdapter):
         if self._api is None:
             return False
         try:
-            await asyncio.to_thread(
-                self._api.order.cancel, self._account_id, order_id,
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.order.cancel, self._account_id, order_id,
+                ),
+                timeout=30.0,
             )
             return True
         except Exception as exc:
@@ -526,9 +569,16 @@ class OandaAdapter(ExchangeAdapter):
             return []
 
         oanda_sym = self._unified_to_oanda.get(symbol, symbol.replace("/", "_"))
-        response = await asyncio.to_thread(
-            self._api.order.list_pending, self._account_id,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.order.list_pending, self._account_id,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: fetch_open_orders")
+            raise
 
         orders = []
         if hasattr(response, "body") and "orders" in response.body:
@@ -550,9 +600,16 @@ class OandaAdapter(ExchangeAdapter):
         if self._api is None:
             raise RuntimeError("OandaAdapter not connected.")
 
-        response = await asyncio.to_thread(
-            self._api.account.summary, self._account_id,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.account.summary, self._account_id,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: fetch_balance")
+            raise
 
         if hasattr(response, "body") and "account" in response.body:
             acc = response.body["account"]
@@ -570,9 +627,16 @@ class OandaAdapter(ExchangeAdapter):
         if self._api is None:
             return []
 
-        response = await asyncio.to_thread(
-            self._api.position.list_open, self._account_id,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.position.list_open, self._account_id,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: fetch_positions")
+            raise
 
         positions: list[PositionInfo] = []
         if hasattr(response, "body") and "positions" in response.body:
@@ -626,9 +690,16 @@ class OandaAdapter(ExchangeAdapter):
             kwargs["sinceTransactionID"] = None  # Would need transaction ID
             kwargs.pop("sinceTransactionID")
 
-        response = await asyncio.to_thread(
-            self._api.trade.list_open, self._account_id,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.trade.list_open, self._account_id,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA API call timed out after 30s: fetch_my_trades")
+            raise
 
         trades = []
         if hasattr(response, "body") and "trades" in response.body:
