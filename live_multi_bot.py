@@ -42,6 +42,7 @@ import random
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -632,9 +633,36 @@ class PaperBot:
         self.buffer_4h: pd.DataFrame = pd.DataFrame()
         self.buffer_1h: pd.DataFrame = pd.DataFrame()
         self.buffer_15m: pd.DataFrame = pd.DataFrame()
-        self.buffer_5m: pd.DataFrame = pd.DataFrame()
+        self._buffer_5m_deque: deque[dict] = deque(maxlen=1500)
+        self._buffer_5m_cache: pd.DataFrame = pd.DataFrame(
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
+        self._buffer_5m_dirty: bool = False
         # History is loaded async after construction: await bot.load_history()
         self._load_state()
+
+    # ── buffer_5m property (O(1) deque append, dirty-flag DataFrame cache) ──
+
+    @property
+    def buffer_5m(self) -> pd.DataFrame:
+        """Cached DataFrame view of 5m candle buffer. Rebuilt at most once per candle."""
+        if self._buffer_5m_dirty:
+            if self._buffer_5m_deque:
+                self._buffer_5m_cache = pd.DataFrame(list(self._buffer_5m_deque))
+            else:
+                self._buffer_5m_cache = pd.DataFrame(
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+            self._buffer_5m_dirty = False
+        return self._buffer_5m_cache
+
+    @buffer_5m.setter
+    def buffer_5m(self, df: pd.DataFrame) -> None:
+        """Setter for backward compatibility with load_history setattr."""
+        self._buffer_5m_deque = deque(
+            df.to_dict("records"), maxlen=1500
+        )
+        self._buffer_5m_dirty = True
 
     # ── History loading (multi-TF buffers, async via adapter) ────────
 
@@ -1149,19 +1177,16 @@ class PaperBot:
         if len(buf) > 300:
             buf.pop(0)
 
-        # Keep multi-TF 5m buffer up to date
-        if not self.buffer_5m.empty:
-            idx = len(self.buffer_5m)
-            self.buffer_5m.loc[idx] = {
-                "timestamp": candle["timestamp"],
-                "open": candle["open"],
-                "high": candle["high"],
-                "low": candle["low"],
-                "close": candle["close"],
-                "volume": candle["volume"],
-            }
-            if len(self.buffer_5m) > 1500:
-                self.buffer_5m = self.buffer_5m.iloc[-1500:].reset_index(drop=True)
+        # O(1) append to deque, invalidate DataFrame cache
+        self._buffer_5m_deque.append({
+            "timestamp": candle["timestamp"],
+            "open": candle["open"],
+            "high": candle["high"],
+            "low": candle["low"],
+            "close": candle["close"],
+            "volume": candle["volume"],
+        })
+        self._buffer_5m_dirty = True
 
         if len(buf) >= self.swing_length + 5:
             self._prepare_signal(symbol, buf, candle)
@@ -1794,17 +1819,26 @@ class PaperBot:
 
     # ── Signal preparation (called from on_candle) ──────────────────
 
+    # Class-level cache for component toggles (shared across all 112 PaperBot instances)
+    _component_cache: dict[str, bool] = {}
+    _component_cache_ts: float = 0.0
+    _COMPONENT_CACHE_TTL: float = 30.0
+
     def _check_component_enabled(self, component: str) -> bool:
-        """Check if a component is enabled via dashboard toggles."""
-        toggles_path = Path("live_results/component_toggles.json")
-        if not toggles_path.exists():
-            return True  # Default: all enabled
-        try:
-            with open(toggles_path) as f:
-                toggles = json.load(f)
-            return toggles.get(component, True)
-        except Exception:
-            return True
+        """Check if a component is enabled via dashboard toggles (cached 30s)."""
+        now = time.monotonic()
+        if now - PaperBot._component_cache_ts > PaperBot._COMPONENT_CACHE_TTL:
+            toggles_path = Path("live_results/component_toggles.json")
+            if toggles_path.exists():
+                try:
+                    with open(toggles_path) as f:
+                        PaperBot._component_cache = json.load(f)
+                except Exception:
+                    PaperBot._component_cache = {}
+            else:
+                PaperBot._component_cache = {}
+            PaperBot._component_cache_ts = now
+        return PaperBot._component_cache.get(component, True)
 
     def _prepare_signal(
         self,
