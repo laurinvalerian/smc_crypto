@@ -71,7 +71,6 @@ from strategies.smc_multi_style import (
     _structure_confirms_from_running,
     _find_entry_zone_at,
     _precompute_5m_trigger_mask,
-    _compute_alignment_score,
     _find_structure_tp_safe,
     _precompute_htf_arrays,
 )
@@ -1364,49 +1363,6 @@ class PaperBot:
                     except Exception as exc:
                         self.logger.debug("DQN shadow error: %s", exc)
 
-    # ── Simple alignment score ────────────────────────────────────
-
-    @staticmethod
-    def _alignment_score(candles: list[dict[str, Any]], swing_len: int) -> tuple[float, str]:
-        """
-        Compute a simplified alignment score [0..1] and suggested direction.
-
-        Uses:
-          • EMA-20 / EMA-50 trend on close prices
-          • Recent swing-high/low break (momentum)
-          • Normalised to [0, 1]
-        """
-        closes = np.array([c["close"] for c in candles], dtype=float)
-        highs = np.array([c["high"] for c in candles], dtype=float)
-        lows = np.array([c["low"] for c in candles], dtype=float)
-
-        if len(closes) < 50:
-            return 0.0, "neutral"
-
-        ema20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().iloc[-1]
-
-        recent_high = float(np.max(highs[-swing_len:]))
-        recent_low = float(np.min(lows[-swing_len:]))
-        prev_high = float(np.max(highs[-2 * swing_len: -swing_len])) if len(highs) >= 2 * swing_len else recent_high
-        prev_low = float(np.min(lows[-2 * swing_len: -swing_len])) if len(lows) >= 2 * swing_len else recent_low
-
-        price = closes[-1]
-
-        trend_bull = 1.0 if ema20 > ema50 else 0.0
-        bos_bull = 1.0 if recent_high > prev_high else 0.0
-        bos_bear = 1.0 if recent_low < prev_low else 0.0
-        ema_pos = 1.0 if price > ema20 else 0.0
-
-        if trend_bull > 0.5:
-            score = 0.25 * trend_bull + 0.35 * bos_bull + 0.20 * ema_pos + 0.20 * (1.0 - bos_bear)
-            direction = "long"
-        else:
-            score = 0.25 * (1.0 - trend_bull) + 0.35 * bos_bear + 0.20 * (1.0 - ema_pos) + 0.20 * (1.0 - bos_bull)
-            direction = "short"
-
-        return float(np.clip(score, 0.0, 1.0)), direction
-
     # ── SMC-based SL/TP ──────────────────────────────────────────
 
     def _find_smc_sl_tp(
@@ -2176,7 +2132,7 @@ class PaperBot:
                     self.logger.info(
                         "NEAR-MISS XGB %s conf=%.3f score=%.2f thresh=%.2f | %s %s",
                         symbol, rl_confidence, score,
-                        self.rl_suite.confidence_threshold if self.rl_suite else 0.6,
+                        self.rl_suite.confidence_threshold,
                         self.asset_class, direction,
                     )
                 self._pending_signal = None
