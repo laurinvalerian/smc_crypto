@@ -106,8 +106,11 @@ class OandaAdapter(ExchangeAdapter):
         self._oanda_to_unified: dict[str, str] = {}
         self._unified_to_oanda: dict[str, str] = {}
 
-        # Concurrency limiter for candle fetches (practice account rate limits)
-        self._candle_semaphore = asyncio.Semaphore(3)
+        # Concurrency limiters (practice account rate limits ~30 req/s)
+        # 8 concurrent candle fetches (was 3 — caused 6-min queue for 36 instruments)
+        self._candle_semaphore = asyncio.Semaphore(8)
+        # 8 concurrent ticker fetches (was uncontrolled — amplified rate-limit pressure)
+        self._ticker_semaphore = asyncio.Semaphore(8)
 
     # ── Identity ────────────────────────────────────────────────────
 
@@ -320,14 +323,15 @@ class OandaAdapter(ExchangeAdapter):
         oanda_sym = self._unified_to_oanda.get(symbol, symbol.replace("/", "_"))
 
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._api.pricing.get,
-                    self._account_id,
-                    instruments=oanda_sym,
-                ),
-                timeout=30.0,
-            )
+            async with self._ticker_semaphore:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._api.pricing.get,
+                        self._account_id,
+                        instruments=oanda_sym,
+                    ),
+                    timeout=30.0,
+                )
         except asyncio.TimeoutError:
             logger.warning("OANDA API call timed out after 30s: watch_ticker")
             raise
@@ -348,6 +352,59 @@ class OandaAdapter(ExchangeAdapter):
                 }
 
         return {"symbol": symbol, "bid": 0, "ask": 0, "last": 0}
+
+    async def fetch_batch_pricing(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """Fetch pricing for multiple instruments in a single OANDA API call.
+
+        OANDA pricing API accepts comma-separated instruments, allowing
+        36 ticker requests to be batched into 1-2 API calls.
+        """
+        if self._api is None:
+            raise RuntimeError("OandaAdapter not connected.")
+        if not symbols:
+            return {}
+
+        # Convert unified symbols to OANDA format
+        oanda_syms = []
+        sym_map: dict[str, str] = {}  # oanda_sym -> unified_sym
+        for s in symbols:
+            oanda_sym = self._unified_to_oanda.get(s, s.replace("/", "_"))
+            oanda_syms.append(oanda_sym)
+            sym_map[oanda_sym] = s
+
+        instruments_str = ",".join(oanda_syms)
+
+        try:
+            async with self._ticker_semaphore:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._api.pricing.get,
+                        self._account_id,
+                        instruments=instruments_str,
+                    ),
+                    timeout=30.0,
+                )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA batch pricing timed out for %d instruments", len(symbols))
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        if hasattr(response, "body") and "prices" in response.body:
+            for p in response.body["prices"]:
+                oanda_name = p.instrument
+                unified = sym_map.get(oanda_name, oanda_name.replace("_", "/"))
+                bid = float(p.bids[0].price) if p.bids else 0
+                ask = float(p.asks[0].price) if p.asks else 0
+                result[unified] = {
+                    "symbol": unified,
+                    "bid": bid,
+                    "ask": ask,
+                    "last": (bid + ask) / 2,
+                    "spread": ask - bid,
+                    "timestamp": datetime.now(timezone.utc),
+                }
+
+        return result
 
     # ── Instrument Info ─────────────────────────────────────────────
 

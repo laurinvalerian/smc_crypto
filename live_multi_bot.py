@@ -89,6 +89,7 @@ from ranker.universe_scanner import UniverseScanner, ScanResult
 from ranker.opportunity_ranker import OpportunityRanker, RankedOpportunity
 from ranker.capital_allocator import CapitalAllocator
 from paper_grid import PaperGrid
+from live_teacher import analyze_closed_trade as _teacher_analyze, save_feedback as _teacher_save
 
 # ── ccxt imports (only needed for BinanceAdapter backward-compat) ─
 try:
@@ -1808,6 +1809,9 @@ class PaperBot:
         # ── Asset class ID ──────────────────────────────────────────
         feat["asset_class_id"] = float(self._XGB_AC_MAP.get(self.asset_class, 0))
 
+        # ── Trade style ID (set properly at call site from _classify_trade_style) ──
+        feat["style_id"] = 0.5  # default=day; overridden after call
+
         return feat
 
     def validate_xgb_features(self, model_feat_names: list[str]) -> bool:
@@ -2080,6 +2084,9 @@ class PaperBot:
 
         # ── Build feature vectors BEFORE stripping heavy indicator dicts ─
         _xgb_features = self._build_xgb_features(components, score)
+        # Style encoding for XGBoost (matches training: scalp=0.0, day=0.5, swing=1.0)
+        _style_map = {STYLE_SCALP: 0.0, STYLE_DAY: 0.5, STYLE_SWING: 1.0}
+        _xgb_features["style_id"] = _style_map.get(style, 0.5)
         _ppo_obs = extract_features(
             buf, score, direction,
             setup_tier=tier, trade_style=style,
@@ -2999,20 +3006,20 @@ class PaperBot:
         self, price: float, sl: float, tp: float,
     ) -> str:
         """
-        Classify trade as scalp, day, or swing based on TP distance.
+        Classify trade as scalp, day, or swing based on SL distance.
 
-        This determines which SL/TP constraints apply and prevents
-        mixing of tactics (e.g. scalp SL on a swing TP target).
+        SL distance is more stable than TP distance (TP may be adjusted
+        by XGBoost TP model after classification). Matches training data
+        classifier in generate_rl_data.py.
         """
-        tp_dist_pct = abs(tp - price) / price if price > 0 else 0
         sl_dist_pct = abs(price - sl) / price if price > 0 else 0
 
-        if tp_dist_pct < 0.005:  # < 0.5% TP
+        if sl_dist_pct < 0.005:  # < 0.5% SL
             return STYLE_SCALP
-        elif tp_dist_pct < 0.03:  # < 3% TP
-            return STYLE_DAY
-        else:
+        elif sl_dist_pct > 0.02:  # > 2% SL
             return STYLE_SWING
+        else:
+            return STYLE_DAY
 
     def _validate_style_constraints(
         self, style: str, price: float, sl: float, tp: float,
@@ -3732,6 +3739,10 @@ class LiveMultiBotRunner:
         self._rest_fallback_symbols: set[str] = set()  # symbols degraded from WS to REST
         self._last_status_write: float = 0.0  # debounce heartbeat.json writes
 
+        # Teacher analysis (retroactive non-causal SMC after trade close)
+        self._teacher_enabled = True
+        self._teacher_semaphore = asyncio.Semaphore(1)  # max 1 concurrent analysis
+
     # ── WebSocket OHLCV watcher with auto-reconnect ───────────────
 
     async def _watch_symbol(self, symbol: str, stagger_delay: float = 0.0) -> None:
@@ -4003,6 +4014,56 @@ class LiveMultiBotRunner:
             except asyncio.TimeoutError:
                 pass
 
+    # ── Batch ticker polling for OANDA (replaces 36 individual calls with 1-2) ──
+
+    async def _poll_tickers_batch_oanda(self, oanda_bots: list[PaperBot]) -> None:
+        """Batch-fetch tickers for all OANDA bots in 1-2 API calls instead of 36."""
+        if not oanda_bots:
+            return
+        # Group bots by adapter instance
+        adapter_bots: dict[int, list[PaperBot]] = {}
+        for bot in oanda_bots:
+            aid = id(bot.adapter)
+            adapter_bots.setdefault(aid, []).append(bot)
+
+        while not self._shutdown.is_set():
+            for aid, bots in adapter_bots.items():
+                adapter = bots[0].adapter
+                # Collect symbols with open markets
+                symbols = []
+                sym_to_bot: dict[str, PaperBot] = {}
+                for bot in bots:
+                    try:
+                        if not adapter.is_market_open(bot.symbol):
+                            continue
+                    except Exception:
+                        pass
+                    symbols.append(bot.symbol)
+                    sym_to_bot[bot.symbol] = bot
+
+                if not symbols:
+                    continue
+
+                try:
+                    prices = await adapter.fetch_batch_pricing(symbols)
+                    for sym, tick in prices.items():
+                        bot = sym_to_bot.get(sym)
+                        if bot and tick.get("last"):
+                            try:
+                                await bot.on_tick(sym, float(tick["last"]))
+                            except Exception as exc:
+                                bot.logger.error("Batch tick error %s: %s", sym, exc)
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    logger.error("Batch ticker poll error: %s", exc)
+
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=5)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+
     # ── Heartbeat + Watchdog ────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
@@ -4177,6 +4238,93 @@ class LiveMultiBotRunner:
                         self._watch_ticker(sym, stagger_delay=stagger)
                     )
 
+    # ── Teacher analysis (retroactive, non-blocking) ─────────────
+
+    async def _run_teacher_analysis(self, bot, trade: dict, exit_price: float) -> None:
+        """Run retroactive teacher analysis on a closed trade (non-blocking)."""
+        async with self._teacher_semaphore:
+            try:
+                # Memory guard: skip if RSS > 6GB
+                import resource
+                import platform
+                if platform.system() == "Darwin":
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+                else:
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                if rss_mb > 6144:
+                    bot.logger.warning("Teacher skipped: RSS %.0fMB > 6GB", rss_mb)
+                    return
+
+                # Fetch 200 bars of 5m data around the trade
+                candle_data = await bot.adapter.fetch_ohlcv(bot.symbol, "5m", limit=200)
+                if not candle_data or len(candle_data) < 20:
+                    bot.logger.debug("Teacher skipped: insufficient candle data for %s", bot.symbol)
+                    return
+
+                # CPU-bound analysis in thread executor
+                feedback = await asyncio.to_thread(
+                    _teacher_analyze, trade, candle_data, bot.symbol, bot.asset_class
+                )
+                _teacher_save(feedback)
+                bot.logger.info(
+                    "TEACHER: %s grade=%s confluences=%s missed=%d",
+                    bot.symbol,
+                    feedback.get("teacher", {}).get("grade", "N/A"),
+                    feedback.get("teacher", {}).get("confluences_at_entry", []),
+                    feedback.get("teacher", {}).get("missed_setups_in_window", 0),
+                )
+            except Exception as exc:
+                bot.logger.debug("Teacher analysis failed for %s: %s", bot.symbol, exc)
+
+    # ── Candle staleness monitor (faster than watchdog, per-class) ──
+
+    async def _check_candle_staleness(self) -> None:
+        """Check for stale candles every 60s. Catches forex/commodity staleness faster than the 10-min watchdog."""
+        STALE_THRESHOLD = 120  # seconds — 2x the 60s 5m-candle cycle
+        CHECK_INTERVAL = 60
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=CHECK_INTERVAL)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            stale_by_class: dict[str, list[str]] = {}
+
+            for bot in self.bots:
+                sym = bot.symbol
+                last = self._last_candle_ts.get(sym)
+                if last is None:
+                    continue  # hasn't received first candle yet
+                # Only check during market hours
+                try:
+                    if not bot.adapter.is_market_open(sym):
+                        continue
+                except Exception:
+                    pass
+                age = now - last
+                if age > STALE_THRESHOLD:
+                    ac = bot.asset_class
+                    stale_by_class.setdefault(ac, []).append(sym)
+
+            for ac, symbols in stale_by_class.items():
+                total_in_class = sum(1 for b in self.bots if b.asset_class == ac)
+                pct = len(symbols) / total_in_class * 100 if total_in_class > 0 else 0
+
+                if pct > 50:
+                    logger.critical(
+                        "STALE CRITICAL: %s — %d/%d symbols (%.0f%%) have no candle for >%ds: %s",
+                        ac, len(symbols), total_in_class, pct, STALE_THRESHOLD,
+                        ", ".join(symbols[:5]) + ("..." if len(symbols) > 5 else ""),
+                    )
+                else:
+                    logger.warning(
+                        "STALE WARNING: %s — %d/%d symbols have no candle for >%ds: %s",
+                        ac, len(symbols), total_in_class, STALE_THRESHOLD,
+                        ", ".join(symbols[:5]) + ("..." if len(symbols) > 5 else ""),
+                    )
+
     # ── Exchange position polling (replaces candle-based exit check) ─
 
     async def _poll_positions(self) -> None:
@@ -4294,6 +4442,10 @@ class LiveMultiBotRunner:
                         )
                     except Exception as exc:
                         bot.logger.debug("journal.close_trade error: %s", exc)
+
+            # ── Teacher analysis (non-blocking, retroactive) ────────
+            if self._teacher_enabled:
+                asyncio.create_task(self._run_teacher_analysis(bot, trade, exit_price))
 
             # === CLEANUP ===
             _cancel_adapter = bot.adapter if bot.adapter is not None else None
@@ -4937,9 +5089,19 @@ class LiveMultiBotRunner:
                 self._watcher_tasks[bot.symbol] = asyncio.create_task(
                     self._poll_candles(bot, stagger_sec=stagger)
                 )
-                self._ticker_tasks[bot.symbol] = asyncio.create_task(
-                    self._poll_ticker(bot, stagger_sec=stagger)
-                )
+                # OANDA bots use batch ticker (1-2 calls instead of 36)
+                if bot.adapter.exchange_id != "oanda":
+                    self._ticker_tasks[bot.symbol] = asyncio.create_task(
+                        self._poll_ticker(bot, stagger_sec=stagger)
+                    )
+
+        # Start batch ticker polling for OANDA bots (forex + commodities)
+        _oanda_bots = [b for b in self.bots if b.adapter is not None and b.adapter.exchange_id == "oanda"]
+        if _oanda_bots:
+            self._batch_ticker_task = asyncio.create_task(
+                self._poll_tickers_batch_oanda(_oanda_bots)
+            )
+            logger.info("Batch ticker started for %d OANDA instruments", len(_oanda_bots))
 
         logger.info(
             "All watchers started: %d crypto (staggered %.0fs apart), %d REST",
@@ -4958,9 +5120,10 @@ class LiveMultiBotRunner:
         # Rich dashboard
         dashboard_task = asyncio.create_task(self._dashboard_loop())
 
-        # Heartbeat + watchdog
+        # Heartbeat + watchdog + staleness monitor
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         watchdog_task = asyncio.create_task(self._watchdog_loop())
+        staleness_task = asyncio.create_task(self._check_candle_staleness())
 
         # Wait until shutdown
         await self._shutdown.wait()
@@ -4973,6 +5136,9 @@ class LiveMultiBotRunner:
         model_reload_task.cancel()
         heartbeat_task.cancel()
         watchdog_task.cancel()
+        staleness_task.cancel()
+        if hasattr(self, '_batch_ticker_task'):
+            self._batch_ticker_task.cancel()
         for t in self._watcher_tasks.values():
             t.cancel()
         for t in self._ticker_tasks.values():
@@ -4980,7 +5146,8 @@ class LiveMultiBotRunner:
 
         all_tasks = (
             [dashboard_task, poll_task, zombie_task, model_reload_task,
-             heartbeat_task, watchdog_task]
+             heartbeat_task, watchdog_task, staleness_task]
+            + ([self._batch_ticker_task] if hasattr(self, '_batch_ticker_task') else [])
             + list(self._watcher_tasks.values())
             + list(self._ticker_tasks.values())
         )
