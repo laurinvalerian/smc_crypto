@@ -3970,7 +3970,7 @@ class LiveMultiBotRunner:
 
                 # Check market hours — only flag as stuck if market is open
                 try:
-                    if not await bot.adapter.is_market_open(sym):
+                    if not bot.adapter.is_market_open(sym):
                         continue
                 except Exception:
                     pass  # assume open if check fails
