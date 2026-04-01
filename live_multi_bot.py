@@ -2492,6 +2492,9 @@ class PaperBot:
 
         def _round_qty(q: float) -> float:
             """Round qty to exchange precision, and clamp to [min_qty, max_qty]."""
+            # Alpaca: fractional shares cannot be sold short — floor to whole shares
+            if direction == "short" and self.adapter.exchange_id == "alpaca":
+                q = float(int(q))  # floor to integer
             try:
                 q = float(self.adapter.amount_to_precision(symbol, q))
             except Exception:
