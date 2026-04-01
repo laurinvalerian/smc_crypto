@@ -72,6 +72,8 @@ from strategies.smc_multi_style import (
     _find_entry_zone_at,
     _precompute_5m_trigger_mask,
     _compute_alignment_score,
+    _find_structure_tp_safe,
+    _precompute_htf_arrays,
 )
 from filters.trend_strength import compute_adx, check_momentum_confluence, multi_tf_trend_agreement
 from filters.volume_liquidity import compute_volume_score
@@ -1854,40 +1856,44 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # ── Initial SL/TP from 5m SMC (to classify trade style) ──
-        sl_tp = self._find_smc_sl_tp(price, direction)
-        if sl_tp is None:
+        # ── SL: entry zone or swing fallback (matching training pipeline) ──
+        entry_zone = components.get("entry_zone")
+        liq_range = self.liq_range
+        if entry_zone is not None:
+            if direction == "long":
+                sl = entry_zone["bottom"] * (1 - liq_range)
+            else:
+                sl = entry_zone["top"] * (1 + liq_range)
+        else:
+            _lb = 20
+            if direction == "long":
+                recent_lows = self.buffer_5m["low"].iloc[-_lb:]
+                sl = float(recent_lows.min()) * (1 - liq_range)
+            else:
+                recent_highs = self.buffer_5m["high"].iloc[-_lb:]
+                sl = float(recent_highs.max()) * (1 + liq_range)
+
+        sl_dist = abs(price - sl)
+        if sl_dist == 0 or sl_dist / price < 0.001:
             self._pending_signal = None
             return
 
-        initial_sl, initial_tp = sl_tp
+        # ── TP: structure TP from 4H/1H (matching training pipeline) ──
+        _htf_4h = _precompute_htf_arrays(self.buffer_4h, self.swing_length) if not self.buffer_4h.empty else None
+        _htf_1h = _precompute_htf_arrays(self.buffer_1h, self.swing_length) if not self.buffer_1h.empty else None
+        bias = "bullish" if direction == "long" else "bearish"
+        tp, _tp_source = _find_structure_tp_safe(
+            _htf_4h, _htf_1h,
+            vlen_4h=len(self.buffer_4h) if not self.buffer_4h.empty else 0,
+            vlen_1h=len(self.buffer_1h) if not self.buffer_1h.empty else 0,
+            entry_price=price,
+            bias=bias,
+            sl_dist=sl_dist,
+            min_rr=1.0,
+        )
 
-        # ── Classify trade style from natural SL/TP distances ─────
-        style = self._classify_trade_style(price, initial_sl, initial_tp)
-
-        # ── Re-compute SL/TP using style-appropriate timeframes ───
-        # This prevents mixing tactics (e.g. scalp SL with swing TP)
-        styled_sl_tp = self._find_smc_sl_tp_for_style(price, direction, style)
-        if styled_sl_tp is None:
-            self._pending_signal = None
-            return
-        sl, tp = styled_sl_tp
-
-        # ── RE-CLASSIFY after styled SL/TP (the style may have shifted) ─
-        # e.g. initial 5m SL/TP looked like SCALP but styled TP is DAY-range
-        new_style = self._classify_trade_style(price, sl, tp)
-        if new_style != style:
-            self.logger.debug(
-                "Style reclassified %s → %s after styled SL/TP for %s",
-                style, new_style, symbol,
-            )
-            style = new_style
-            # Re-compute SL/TP for the correct style
-            styled_sl_tp = self._find_smc_sl_tp_for_style(price, direction, style)
-            if styled_sl_tp is None:
-                self._pending_signal = None
-                return
-            sl, tp = styled_sl_tp
+        # Classify style from the resulting SL/TP
+        style = self._classify_trade_style(price, sl, tp)
 
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
