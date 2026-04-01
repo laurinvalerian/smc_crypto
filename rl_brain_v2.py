@@ -29,6 +29,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from features.schema import SCHEMA_VERSION as _SCHEMA_VERSION
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -167,6 +169,19 @@ def prepare_features(df: pd.DataFrame, task: str = "entry_quality") -> tuple[np.
         ac_ids = df["asset_class"].map(ASSET_CLASS_MAP).fillna(0).values.astype(np.float32).reshape(-1, 1)
         X = np.hstack([X, ac_ids])
         feat_cols = feat_cols + ["asset_class_id"]
+
+    # Add style_id derived from ATR (SL proxy): <0.5%=scalp(0), >2%=swing(1), else=day(0.5)
+    if "style_id" not in feat_cols:
+        if "atr_5m_norm" in feat_cols:
+            atr_idx = feat_cols.index("atr_5m_norm")
+            atr_vals = X[:, atr_idx]
+        elif "atr_5m_norm" in df.columns:
+            atr_vals = df["atr_5m_norm"].values.astype(np.float32)
+        else:
+            atr_vals = np.full(X.shape[0], 0.01, dtype=np.float32)  # default=day
+        style_vals = np.where(atr_vals < 0.005, 0.0, np.where(atr_vals > 0.02, 1.0, 0.5)).astype(np.float32).reshape(-1, 1)
+        X = np.hstack([X, style_vals])
+        feat_cols = feat_cols + ["style_id"]
 
     return X, feat_cols
 
@@ -686,6 +701,7 @@ def run_walk_forward_rolling(
             "model": final_model,
             "feat_names": feat_names_final,
             "task": task,
+            "schema_version": _SCHEMA_VERSION,
             "dead_features": list(DEAD_FEATURES),
             "clip_ranges": CLIP_RANGES,
             "asset_class_map": ASSET_CLASS_MAP,
@@ -863,6 +879,7 @@ def _regression_walk_forward_skeleton(
             "model": final_model,
             "feat_names": fn,
             "task": task_name,
+            "schema_version": _SCHEMA_VERSION,
             "clip_ranges": CLIP_RANGES,
             "asset_class_map": ASSET_CLASS_MAP,
         }, f)
@@ -1725,7 +1742,15 @@ class RLBrainSuite:
         except (pickle.UnpicklingError, EOFError, OSError) as exc:
             logger.error("Corrupt model file %s: %s -- skipping", path, exc)
             return None
-        logger.info("Loaded model: %s (%d features)", path, len(data.get("feat_names", [])))
+        # Schema version gate: refuse to load if model was trained with different schema
+        model_sv = data.get("schema_version")
+        if model_sv is not None and model_sv != _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Model-schema version mismatch: model has schema_version={model_sv}, "
+                f"code expects schema_version={_SCHEMA_VERSION}. "
+                f"Retrain the model or revert the schema change."
+            )
+        logger.info("Loaded model: %s (%d features, schema_v%s)", path, len(data.get("feat_names", [])), model_sv or "?")
         return data
 
     def check_and_reload_models(self) -> None:

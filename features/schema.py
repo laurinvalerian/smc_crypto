@@ -4,13 +4,16 @@ Shared Feature Schema — Single Source of Truth for XGBoost feature names.
 Both training (backtest/generate_rl_data.py) and live (live_multi_bot.py)
 MUST import feature names from here. Never define feature names inline.
 
-The canonical list was extracted from the trained model's feat_names
-(models/rl_entry_filter.pkl, 40 features, 2026-04-01).
+Schema version is stored in model pickles and checked at startup to prevent
+silent model-schema mismatch. Bump SCHEMA_VERSION on every feature change.
 """
 from __future__ import annotations
 
+# Bump this on every feature list change. Stored in model pickle at train time,
+# checked at startup. Mismatch → hard RuntimeError (no silent degradation).
+SCHEMA_VERSION: int = 2  # v1=40 features, v2=41 features (+style_id)
 
-# The 40 features the entry_quality XGBoost model expects, in order.
+# The 41 features the entry_quality XGBoost model expects, in order.
 ENTRY_QUALITY_FEATURES: list[str] = [
     # Structure direction per TF (causal SMC indicators)
     "struct_1d", "struct_4h", "struct_1h", "struct_15m", "struct_5m",
@@ -39,6 +42,8 @@ ENTRY_QUALITY_FEATURES: list[str] = [
     "symbol_volatility_rank", "symbol_liquidity_rank", "symbol_spread_rank",
     # Asset class encoding
     "asset_class_id",
+    # Trade style encoding: scalp=0.0, day=0.5, swing=1.0 (SL distance classifier)
+    "style_id",
 ]
 
 # Features excluded from entry_quality model (data leaks in training context)
