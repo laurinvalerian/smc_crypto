@@ -80,6 +80,7 @@ from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
 from features.feature_extractor import FeatureExtractor
+from features.schema import ENTRY_QUALITY_FEATURES, validate_against_model
 from rl_dqn.dqn_inference import DQNExitManager
 from exchanges import BinanceAdapter
 from exchanges.base import ExchangeAdapter
@@ -1833,6 +1834,16 @@ class PaperBot:
             self.logger.info(
                 "XGB features validated: %d/%d model features present (%d extra in live)",
                 len(model_keys), len(model_keys), len(extra),
+            )
+        # Cross-check against shared schema
+        schema_missing, schema_extra = validate_against_model(model_feat_names)
+        if schema_missing:
+            self.logger.warning(
+                "Schema drift: model has features not in schema: %s", sorted(schema_missing),
+            )
+        if schema_extra:
+            self.logger.warning(
+                "Schema drift: schema has features not in model: %s", sorted(schema_extra),
             )
         return len(missing) == 0
 

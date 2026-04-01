@@ -33,6 +33,7 @@ from utils.indicators import compute_rsi_wilders, compute_atr_wilders
 # ── Project imports ──────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from features.schema import ENTRY_QUALITY_FEATURES as _SCHEMA_FEATURES, validate_against_model as _validate_schema
 from strategies.smc_multi_style import (
     SMCMultiStyleStrategy,
     compute_smc_indicators,       # LOOKAHEAD (teacher)
@@ -105,8 +106,8 @@ ASSET_SLIPPAGE: dict[str, float] = {
 # Max bars to simulate forward for outcome (48h of 5m bars)
 MAX_FORWARD_BARS = 576
 
-# Feature names
-FEATURE_NAMES: list[str] = []  # Populated at module level below
+# Feature names — sourced from shared schema (features/schema.py)
+FEATURE_NAMES: list[str] = list(_SCHEMA_FEATURES)
 
 # Module-level cache for symbol ranks (computed once per training run)
 _symbol_ranks_cache: dict[str, dict[str, dict[str, float]]] = {}
