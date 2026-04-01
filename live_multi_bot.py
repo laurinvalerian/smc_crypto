@@ -4067,6 +4067,122 @@ class LiveMultiBotRunner:
             except asyncio.TimeoutError:
                 pass
 
+    # ── Startup position reconciliation ─────────────────────────────
+
+    async def _reconcile_exchange_positions(self) -> None:
+        """Poll exchange positions and restore any that bots don't know about.
+
+        After a restart, bots start with active_trades from state files.
+        If the state file had active=0 but the exchange still has open
+        positions, this method restores them so the bot can manage SL/TP
+        and track PnL correctly.
+        """
+        restored = 0
+        seen_adapters: set[int] = set()
+
+        for bot in self.bots:
+            if bot.adapter is None:
+                continue
+            aid = id(bot.adapter)
+
+            # Already have active trades from state file — skip
+            if bot._active_trades:
+                continue
+
+            # Only poll each adapter once, then distribute
+            if aid not in seen_adapters:
+                seen_adapters.add(aid)
+                try:
+                    positions = await bot.adapter.fetch_positions()
+                except Exception as exc:
+                    logger.warning("Position reconciliation failed for %s: %s", bot.adapter.exchange_id, exc)
+                    continue
+
+                # Cache positions by symbol for all bots sharing this adapter
+                self._reconcile_cache = getattr(self, '_reconcile_cache', {})
+                for p in positions:
+                    sym = p.symbol if hasattr(p, 'symbol') else p.get('symbol', '')
+                    qty = abs(float(p.qty if hasattr(p, 'qty') else p.get('qty', 0)))
+                    if sym and qty > 0:
+                        self._reconcile_cache[sym] = p
+
+            # Check if this bot's symbol has an exchange position
+            pos = getattr(self, '_reconcile_cache', {}).get(bot.symbol)
+            if pos is None:
+                continue
+
+            # Restore as active trade
+            entry_price = float(pos.entry_price if hasattr(pos, 'entry_price') else pos.get('entry_price', 0))
+            side = pos.side if hasattr(pos, 'side') else pos.get('side', 'long')
+            qty = abs(float(pos.qty if hasattr(pos, 'qty') else pos.get('qty', 0)))
+            unrealized = float(pos.unrealized_pnl if hasattr(pos, 'unrealized_pnl') else pos.get('unrealized_pnl', 0))
+
+            if entry_price <= 0 or qty <= 0:
+                continue
+
+            # Reconstruct trade dict with reasonable defaults
+            trade = {
+                "direction": side,
+                "entry": entry_price,
+                "qty": qty,
+                "sl": 0.0,  # unknown — position poll doesn't return SL
+                "tp": 0.0,  # unknown
+                "entry_time": datetime.now(timezone.utc),
+                "style": STYLE_DAY,
+                "sl_attached": bot.adapter.supports_attached_sl_tp,
+                "oanda_trade_id": None,
+                "be_triggered": False,
+                "bars_held": 0,
+                "_reconciled": True,  # flag: restored from exchange, not from signal
+            }
+
+            # For OANDA: try to get trade details (SL/TP/trade_id)
+            if bot.adapter.exchange_id == "oanda":
+                try:
+                    trades_resp = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            bot.adapter._api.trade.list_open, bot.adapter._account_id,
+                        ),
+                        timeout=15.0,
+                    )
+                    if hasattr(trades_resp, 'body') and 'trades' in trades_resp.body:
+                        oanda_sym = bot.symbol.replace("/", "_")
+                        for t in trades_resp.body['trades']:
+                            if t.instrument == oanda_sym:
+                                trade["oanda_trade_id"] = t.id
+                                trade["entry"] = float(t.price)
+                                trade["qty"] = abs(float(t.currentUnits))
+                                if hasattr(t, 'stopLossOrder') and t.stopLossOrder:
+                                    trade["sl"] = float(t.stopLossOrder.price)
+                                if hasattr(t, 'takeProfitOrder') and t.takeProfitOrder:
+                                    trade["tp"] = float(t.takeProfitOrder.price)
+                                trade["direction"] = "long" if float(t.currentUnits) > 0 else "short"
+                                trade["entry_time"] = datetime.fromisoformat(
+                                    t.openTime[:19].replace("T", " ")
+                                ).replace(tzinfo=timezone.utc)
+                                break
+                except Exception as exc:
+                    bot.logger.debug("OANDA trade detail fetch failed: %s", exc)
+
+            bot._active_trades.append(trade)
+            bot._save_state()
+            restored += 1
+            logger.info(
+                "RECONCILED %s: %s %s qty=%.4f entry=%.5f sl=%.5f tp=%.5f%s",
+                bot.symbol, trade["direction"].upper(), bot.symbol,
+                trade["qty"], trade["entry"], trade["sl"], trade["tp"],
+                " (OANDA trade_id=" + str(trade.get("oanda_trade_id")) + ")" if trade.get("oanda_trade_id") else "",
+            )
+
+        # Cleanup cache
+        if hasattr(self, '_reconcile_cache'):
+            del self._reconcile_cache
+
+        if restored > 0:
+            logger.info("Position reconciliation: restored %d trades from exchange", restored)
+        else:
+            logger.info("Position reconciliation: no orphaned exchange positions found")
+
     # ── Heartbeat + Watchdog ────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
@@ -5118,6 +5234,11 @@ class LiveMultiBotRunner:
             "All watchers started: %d crypto (staggered %.0fs apart), %d REST",
             _crypto_idx, WS_STAGGER_SEC, _stock_idx + _rest_idx,
         )
+
+        # ── Reconcile exchange positions with bot state ──────────
+        # After restart, bots may have active=0 while real positions exist
+        # on the exchange. Poll once and restore any orphaned positions.
+        await self._reconcile_exchange_positions()
 
         # Position poller (detects TP/SL fills on exchange)
         poll_task = asyncio.create_task(self._poll_positions())
