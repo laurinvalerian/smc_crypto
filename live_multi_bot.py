@@ -4280,8 +4280,12 @@ class LiveMultiBotRunner:
 
     async def _check_candle_staleness(self) -> None:
         """Check for stale candles every 60s. Catches forex/commodity staleness faster than the 10-min watchdog."""
-        STALE_THRESHOLD = 120  # seconds — 2x the 60s 5m-candle cycle
+        # 5m candles arrive once per 5 min (300s). Threshold must be > 300s to avoid
+        # false positives between candle deliveries. 420s = 7 min = missed one full cycle.
+        STALE_THRESHOLD = 420
         CHECK_INTERVAL = 60
+        STARTUP_GRACE = 300  # skip first 5 min (history loading)
+        startup_time = time.time()
         while not self._shutdown.is_set():
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=CHECK_INTERVAL)
@@ -4290,6 +4294,10 @@ class LiveMultiBotRunner:
                 pass
 
             now = time.time()
+            # Skip during startup grace period (history still loading)
+            if now - startup_time < STARTUP_GRACE:
+                continue
+
             stale_by_class: dict[str, list[str]] = {}
 
             for bot in self.bots:
