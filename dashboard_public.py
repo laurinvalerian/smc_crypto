@@ -1012,13 +1012,27 @@ def api_active_trades():
 @app.route("/api/public/candles/<path:symbol>")
 def api_candles(symbol: str):
     """Return OHLCV candles for a symbol in Lightweight-Charts format."""
-    tf = request.args.get("tf", "5m")
     try:
         limit = min(int(request.args.get("limit", 100)), 200)
     except (ValueError, TypeError):
         limit = 100
 
-    # Determine data directory based on symbol
+    # Priority 1: Live candle buffer from bot (live_results/candles/{symbol}.json)
+    # These are written every 60s by the bot from its in-memory 5m buffer.
+    sym_key = symbol.replace("/", "_").replace(":", "_")
+    live_candle_path = RESULTS_DIR / "candles" / f"{sym_key}.json"
+    if live_candle_path.exists():
+        try:
+            import json as _json
+            with open(live_candle_path) as f:
+                candles = _json.load(f)
+            if candles:
+                return jsonify(candles[-limit:])
+        except Exception:
+            pass
+
+    # Priority 2: Historical data files (data/{class}/{symbol}_{tf}.parquet)
+    tf = request.args.get("tf", "5m")
     subdir = _resolve_data_subdir(symbol)
     if subdir is None:
         return jsonify([])
@@ -1033,19 +1047,17 @@ def api_candles(symbol: str):
         df = pd.read_parquet(fpath)
         if df.empty:
             return jsonify([])
-        # Take last `limit` rows
         df = df.tail(limit)
-        candles: list[dict] = []
+        candles_list: list[dict] = []
         for _, row in df.iterrows():
             ts = row.get("timestamp")
             if ts is None:
                 continue
-            # Convert to unix seconds
             if hasattr(ts, "timestamp"):
                 unix_ts = int(ts.timestamp())
             else:
                 unix_ts = int(ts)
-            candles.append({
+            candles_list.append({
                 "time": unix_ts,
                 "open": float(row.get("open", 0)),
                 "high": float(row.get("high", 0)),
@@ -1053,7 +1065,7 @@ def api_candles(symbol: str):
                 "close": float(row.get("close", 0)),
                 "volume": float(row.get("volume", 0)),
             })
-        return jsonify(candles)
+        return jsonify(candles_list)
     except Exception:
         return jsonify([])
 

@@ -5057,9 +5057,40 @@ class LiveMultiBotRunner:
                         logger.debug("Model reload check error: %s", exc)
 
                 # Periodic state persistence (every 60s, crash-safe)
+                # Also export candle buffers for dashboard charts
+                candles_dir = OUTPUT_DIR / "candles"
+                candles_dir.mkdir(exist_ok=True)
                 for bot in self.bots:
                     try:
                         bot._save_state()
+                    except Exception:
+                        pass
+                    # Export last 200 candles for dashboard (lightweight JSON)
+                    try:
+                        buf = bot._buffer_5m_deque
+                        if buf and len(buf) > 0:
+                            sym_key = bot.symbol.replace("/", "_").replace(":", "_")
+                            candles_out = []
+                            for c in list(buf)[-200:]:
+                                ts = c.get("timestamp")
+                                if hasattr(ts, "timestamp"):
+                                    t = int(ts.timestamp())
+                                elif isinstance(ts, (int, float)):
+                                    t = int(ts)
+                                else:
+                                    continue
+                                candles_out.append({
+                                    "time": t,
+                                    "open": float(c.get("open", 0)),
+                                    "high": float(c.get("high", 0)),
+                                    "low": float(c.get("low", 0)),
+                                    "close": float(c.get("close", 0)),
+                                    "volume": float(c.get("volume", 0)),
+                                })
+                            if candles_out:
+                                p = candles_dir / f"{sym_key}.json"
+                                with open(p, "w") as f:
+                                    json.dump(candles_out, f)
                     except Exception:
                         pass
             except asyncio.CancelledError:
