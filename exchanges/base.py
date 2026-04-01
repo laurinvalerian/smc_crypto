@@ -41,6 +41,11 @@ class ExchangeAdapter(abc.ABC):
     def asset_class(self) -> str:
         """Primary asset class: 'crypto', 'forex', 'stocks', 'commodities'."""
 
+    @property
+    def supports_attached_sl_tp(self) -> bool:
+        """True if SL/TP are attached to trades (e.g. OANDA), not standalone orders."""
+        return False
+
     # ── Lifecycle ───────────────────────────────────────────────────
 
     @abc.abstractmethod
@@ -173,11 +178,14 @@ class ExchangeAdapter(abc.ABC):
         side: str,
         qty: float,
         new_stop_price: float,
+        *,
+        trade_id: str | None = None,
     ) -> OrderResult | None:
         """Move stop-loss to a new price (cancel old + place new).
 
         Used by BE management to move SL to breakeven.
-        Default: cancel + replace. Override for exchanges with native modify.
+        Default: cancel + replace. Override for exchanges with native modify
+        (e.g. OANDA uses trade_id to modify trade-attached SL).
         """
         try:
             cancelled = await self.cancel_order(old_order_id, symbol)

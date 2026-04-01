@@ -76,7 +76,8 @@ class OandaAdapter(ExchangeAdapter):
     Supports Forex and Commodities trading with:
     - REST API for orders and account info
     - Polling-based price streaming (v20 streaming endpoint)
-    - Separate SL/TP orders (no bracket orders, uses Trade-attached SL/TP)
+    - Trade-attached SL/TP via stopLossOnFill/takeProfitOnFill
+    - SL modification via Trade endpoint (set_dependent_orders)
     """
 
     # NOTE: All asyncio.to_thread calls are wrapped in asyncio.wait_for(timeout=30s).
@@ -117,6 +118,10 @@ class OandaAdapter(ExchangeAdapter):
     @property
     def asset_class(self) -> str:
         return "forex"  # Primary; also handles commodities
+
+    @property
+    def supports_attached_sl_tp(self) -> bool:
+        return True
 
     # ── Lifecycle ───────────────────────────────────────────────────
 
@@ -416,6 +421,7 @@ class OandaAdapter(ExchangeAdapter):
         order_id = None
         fill_price = 0.0
         status = "unknown"
+        oanda_trade_id = None
 
         if hasattr(response, "body"):
             if "orderFillTransaction" in response.body:
@@ -423,6 +429,15 @@ class OandaAdapter(ExchangeAdapter):
                 order_id = str(getattr(fill, "id", ""))
                 fill_price = float(getattr(fill, "price", 0))
                 status = "filled"
+                # Extract OANDA trade ID for trade-attached SL/TP management
+                trade_opened = getattr(fill, "tradeOpened", None)
+                if trade_opened:
+                    oanda_trade_id = str(getattr(trade_opened, "tradeID", ""))
+                if not oanda_trade_id:
+                    # Fallback: check tradesClosed for reduce-only orders
+                    trades_reduced = getattr(fill, "tradesReduced", None) or []
+                    if trades_reduced:
+                        oanda_trade_id = str(getattr(trades_reduced[0], "tradeID", ""))
             elif "orderCreateTransaction" in response.body:
                 create = response.body["orderCreateTransaction"]
                 order_id = str(getattr(create, "id", ""))
@@ -437,6 +452,7 @@ class OandaAdapter(ExchangeAdapter):
             price=fill_price,
             status=status,
             raw=response.body if hasattr(response, "body") else {},
+            trade_id=oanda_trade_id,
         )
 
     async def create_stop_loss(
@@ -548,6 +564,54 @@ class OandaAdapter(ExchangeAdapter):
             status=status,
             raw=response.body if hasattr(response, "body") else {},
         )
+
+    async def modify_stop_loss(
+        self,
+        old_order_id: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        new_stop_price: float,
+        *,
+        trade_id: str | None = None,
+    ) -> OrderResult | None:
+        """Modify trade-attached SL via OANDA Trade endpoint (set_dependent_orders)."""
+        if self._api is None:
+            return None
+        if not trade_id:
+            # Fallback to base class cancel+replace for standalone SL orders
+            return await super().modify_stop_loss(
+                old_order_id, symbol, side, qty, new_stop_price,
+            )
+        try:
+            price_str = str(self.price_to_precision(symbol, new_stop_price))
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._api.trade.set_dependent_orders,
+                    self._account_id,
+                    trade_id,
+                    **{"stopLoss": {"price": price_str}},
+                ),
+                timeout=30.0,
+            )
+            logger.info("OANDA modify_stop_loss: trade %s SL → %s", trade_id, price_str)
+            return OrderResult(
+                order_id=trade_id,
+                symbol=symbol,
+                side=side,
+                order_type="modify_sl",
+                qty=qty,
+                price=new_stop_price,
+                status="modified",
+                raw=response.body if hasattr(response, "body") else {},
+                trade_id=trade_id,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OANDA modify_stop_loss timed out for trade %s", trade_id)
+            return None
+        except Exception as exc:
+            logger.warning("OANDA modify_stop_loss failed for trade %s: %s", trade_id, exc)
+            return None
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         if self._api is None:

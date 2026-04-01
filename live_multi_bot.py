@@ -774,6 +774,11 @@ class PaperBot:
                         t["entry_time"] = parsed
                     except Exception:
                         t["entry_time"] = datetime.now(timezone.utc)
+                # In-flight migration: legacy trades from before trade-attached SL/TP fix
+                if "sl_attached" not in t:
+                    t["sl_attached"] = False  # Legacy: standalone SL/TP orders
+                if "oanda_trade_id" not in t:
+                    t["oanda_trade_id"] = None
                 active.append(t)
             self._active_trades = active
             self.logger.info(
@@ -2258,7 +2263,7 @@ class PaperBot:
                     sig.get("features", {}), cost_rr,
                 )
 
-        order_id, sl_order_id, tp_order_id, qty, risk_pct, used_leverage = (
+        _bracket_result = (
             await self._execute_bracket_order_with_risk_reduction(
                 symbol=symbol,
                 direction=direction,
@@ -2273,6 +2278,14 @@ class PaperBot:
                 style=style,
             )
         )
+        # Unpack — oanda_trade_id is optional (7th element, None for non-OANDA)
+        order_id = _bracket_result[0]
+        sl_order_id = _bracket_result[1]
+        tp_order_id = _bracket_result[2]
+        qty = _bracket_result[3]
+        risk_pct = _bracket_result[4]
+        used_leverage = _bracket_result[5]
+        oanda_trade_id = _bracket_result[6] if len(_bracket_result) > 6 else None
 
         # Consume the pending signal
         self._pending_signal = None
@@ -2305,6 +2318,8 @@ class PaperBot:
             "order_id": order_id,
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
+            "oanda_trade_id": oanda_trade_id,
+            "sl_attached": self.adapter.supports_attached_sl_tp if self.adapter else False,
             "rl_tracked": rl_tracked,
             "rl_trade_id": rl_trade_id,
             "rl_confidence": rl_confidence,
@@ -2631,7 +2646,7 @@ class PaperBot:
             leverage_retries = 0
             while rate_limit_retries <= 2 and leverage_retries <= 6:
                 try:
-                    order_id, sl_order_id, tp_order_id = await self._place_bracket_order(
+                    order_id, sl_order_id, tp_order_id, oanda_trade_id = await self._place_bracket_order(
                         symbol, direction, price, sl, tp, qty,
                     )
                     self.logger.info(
@@ -2645,6 +2660,7 @@ class PaperBot:
                     return (
                         order_id, sl_order_id, tp_order_id,
                         qty, risk_pct, planned_leverage,
+                        oanda_trade_id,
                     )
                 except Exception as exc:
                     code, msg = _extract_code_msg(exc)
@@ -2725,14 +2741,17 @@ class PaperBot:
         sl: float,
         tp: float,
         qty: float,
-    ) -> tuple[str | None, str | None, str | None]:
+    ) -> tuple[str | None, str | None, str | None, str | None]:
         """
         Place a market entry plus SL/TP orders via the exchange adapter.
 
         Works for all exchanges (Binance, OANDA, Alpaca) through the
         unified ExchangeAdapter interface.
 
-        Returns (entry_id, sl_order_id, tp_order_id).
+        For OANDA: SL/TP attached to entry via stopLossOnFill/takeProfitOnFill.
+        For others: separate SL/TP orders created after entry.
+
+        Returns (entry_id, sl_order_id, tp_order_id, oanda_trade_id).
         """
         if self.adapter is None:
             return None, None, None
@@ -2761,63 +2780,80 @@ class PaperBot:
                     "Failed to flatten position after %s: %s", reason, close_exc,
                 )
 
-        # Entry market order
+        # Entry market order — attach SL/TP for exchanges that support it (OANDA)
+        _attached = self.adapter.supports_attached_sl_tp
+        entry_params: dict[str, Any] = {}
+        if _attached:
+            entry_params["stopLossPrice"] = sl
+            entry_params["takeProfitPrice"] = tp
+
         try:
-            entry = await self.adapter.create_market_order(symbol, side, qty)
+            entry = await self.adapter.create_market_order(
+                symbol, side, qty, entry_params or None,
+            )
             entry_id = entry.order_id
+            oanda_trade_id = entry.trade_id  # None for non-OANDA
             self.logger.info(
-                "ENTRY %s %s qty=%.6f | id=%s",
-                side.upper(), symbol, qty, entry_id,
+                "ENTRY %s %s qty=%.6f | id=%s trade_id=%s",
+                side.upper(), symbol, qty, entry_id, oanda_trade_id or "n/a",
             )
         except Exception as exc:
             self.logger.error("Entry order FAILED %s %s: %s", side.upper(), symbol, exc)
             raise
 
-        # SL order
         sl_order_id: str | None = None
-        try:
-            sl_order = await self.adapter.create_stop_loss(
-                symbol, exit_side, qty, sl,
-            )
-            sl_order_id = sl_order.order_id
-            self.logger.info(
-                "SL %s %s qty=%.6f @ %.6f | id=%s",
-                exit_side.upper(), symbol, qty, sl, sl_order_id,
-            )
-        except Exception as exc:
-            self.logger.error(
-                "SL order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
-            )
-            await _close_position("SL placement failure")
-            raise
-
-        # TP order
         tp_order_id: str | None = None
-        try:
-            tp_order = await self.adapter.create_take_profit(
-                symbol, exit_side, qty, tp,
-            )
-            tp_order_id = tp_order.order_id
-            self.logger.info(
-                "TP %s %s qty=%.6f @ %.6f | id=%s",
-                exit_side.upper(), symbol, qty, tp, tp_order_id,
-            )
-        except Exception as exc:
-            self.logger.error(
-                "TP order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
-            )
-            if sl_order_id:
-                try:
-                    await self.adapter.cancel_order(sl_order_id, symbol)
-                except Exception as cancel_exc:
-                    self.logger.warning(
-                        "Failed to cancel SL %s after TP failure: %s",
-                        sl_order_id, cancel_exc,
-                    )
-            await _close_position("TP placement failure")
-            raise
 
-        return entry_id, sl_order_id, tp_order_id
+        if _attached:
+            # OANDA: SL/TP already attached via stopLossOnFill/takeProfitOnFill
+            # No standalone orders created — they auto-cancel when trade closes
+            self.logger.info(
+                "SL/TP attached to trade %s (stopLossOnFill=%.6f takeProfitOnFill=%.6f)",
+                oanda_trade_id or entry_id, sl, tp,
+            )
+        else:
+            # Binance/Alpaca: create separate SL/TP orders
+            try:
+                sl_order = await self.adapter.create_stop_loss(
+                    symbol, exit_side, qty, sl,
+                )
+                sl_order_id = sl_order.order_id
+                self.logger.info(
+                    "SL %s %s qty=%.6f @ %.6f | id=%s",
+                    exit_side.upper(), symbol, qty, sl, sl_order_id,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "SL order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
+                )
+                await _close_position("SL placement failure")
+                raise
+
+            try:
+                tp_order = await self.adapter.create_take_profit(
+                    symbol, exit_side, qty, tp,
+                )
+                tp_order_id = tp_order.order_id
+                self.logger.info(
+                    "TP %s %s qty=%.6f @ %.6f | id=%s",
+                    exit_side.upper(), symbol, qty, tp, tp_order_id,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "TP order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
+                )
+                if sl_order_id:
+                    try:
+                        await self.adapter.cancel_order(sl_order_id, symbol)
+                    except Exception as cancel_exc:
+                        self.logger.warning(
+                            "Failed to cancel SL %s after TP failure: %s",
+                            sl_order_id, cancel_exc,
+                        )
+                await _close_position("TP placement failure")
+                raise
+
+        return entry_id, sl_order_id, tp_order_id, oanda_trade_id
 
     # ── Fetch real testnet balance ────────────────────────────────
 
@@ -4249,33 +4285,40 @@ class LiveMultiBotRunner:
                         bot.logger.debug("journal.close_trade error: %s", exc)
 
             # === CLEANUP ===
-            sl_order_id = trade.get("sl_order_id")
-            tp_order_id = trade.get("tp_order_id")
-            cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
-
             _cancel_adapter = bot.adapter if bot.adapter is not None else None
-            if cancel_targets and _cancel_adapter is not None:
-                for cancel_id in cancel_targets:
-                    try:
-                        await _cancel_adapter.cancel_order(cancel_id, bot.symbol)
-                        bot.logger.info(
-                            "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
-                        )
-                    except Exception as exc:
-                        # -2011 "Unknown order sent" means order was already
-                        # filled or cancelled on the exchange – expected when
-                        # SL/TP triggered the close.  Log at DEBUG to reduce noise.
-                        exc_str = str(exc)
-                        if "-2011" in exc_str or "Unknown order" in exc_str:
-                            bot.logger.debug(
-                                "Order %s for %s already gone (filled/cancelled): %s",
-                                cancel_id, bot.symbol, exc,
+
+            if trade.get("sl_attached"):
+                # OANDA: SL/TP are trade-attached — they auto-cancel when trade closes.
+                # No cancel_order needed. Standalone order IDs don't exist.
+                bot.logger.debug("Trade-attached SL/TP auto-cancelled with trade close")
+            else:
+                # Binance/Alpaca: cancel standalone SL/TP orders
+                sl_order_id = trade.get("sl_order_id")
+                tp_order_id = trade.get("tp_order_id")
+                cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
+
+                if cancel_targets and _cancel_adapter is not None:
+                    for cancel_id in cancel_targets:
+                        try:
+                            await _cancel_adapter.cancel_order(cancel_id, bot.symbol)
+                            bot.logger.info(
+                                "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
                             )
-                        else:
-                            bot.logger.warning(
-                                "Failed to cancel dangling order %s for %s: %s",
-                                cancel_id, bot.symbol, exc,
-                            )
+                        except Exception as exc:
+                            # -2011 "Unknown order sent" means order was already
+                            # filled or cancelled on the exchange – expected when
+                            # SL/TP triggered the close.  Log at DEBUG to reduce noise.
+                            exc_str = str(exc)
+                            if "-2011" in exc_str or "Unknown order" in exc_str:
+                                bot.logger.debug(
+                                    "Order %s for %s already gone (filled/cancelled): %s",
+                                    cancel_id, bot.symbol, exc,
+                                )
+                            else:
+                                bot.logger.warning(
+                                    "Failed to cancel dangling order %s for %s: %s",
+                                    cancel_id, bot.symbol, exc,
+                                )
 
             # Belt-and-suspenders: fetch open orders and cancel any remaining
             # reduce-only SL/TP orders whose stop price matches this trade.
@@ -4447,11 +4490,13 @@ class LiveMultiBotRunner:
                                     else:
                                         new_sl = entry_p - fee_buffer
                                     old_sl_id = trade.get("sl_order_id")
-                                    if old_sl_id:
+                                    _oanda_tid = trade.get("oanda_trade_id")
+                                    if old_sl_id or _oanda_tid:
                                         exit_side = "sell" if direction == "long" else "buy"
                                         new_sl_order = await bot.adapter.modify_stop_loss(
-                                            old_sl_id, trade["symbol"], exit_side,
+                                            old_sl_id or "", trade["symbol"], exit_side,
                                             trade["qty"], new_sl,
+                                            trade_id=_oanda_tid,
                                         )
                                         if new_sl_order and new_sl_order.order_id:
                                             trade["sl_order_id"] = new_sl_order.order_id
@@ -4467,14 +4512,15 @@ class LiveMultiBotRunner:
                         if trade.get("_ml_exit_requested") and bot.adapter is not None:
                             _ml_exit_side = "sell" if trade["direction"] == "long" else "buy"
                             try:
-                                # Cancel existing SL/TP orders
-                                for _oid_key in ("sl_order_id", "tp_order_id"):
-                                    _oid = trade.get(_oid_key)
-                                    if _oid:
-                                        try:
-                                            await bot.adapter.cancel_order(_oid, bot.symbol)
-                                        except Exception:
-                                            pass
+                                # Cancel existing SL/TP orders (skip for trade-attached)
+                                if not trade.get("sl_attached"):
+                                    for _oid_key in ("sl_order_id", "tp_order_id"):
+                                        _oid = trade.get(_oid_key)
+                                        if _oid:
+                                            try:
+                                                await bot.adapter.cancel_order(_oid, bot.symbol)
+                                            except Exception:
+                                                pass
                                 # Place market close order
                                 _ml_close = await bot.adapter.create_market_order(
                                     bot.symbol, _ml_exit_side, trade["qty"],

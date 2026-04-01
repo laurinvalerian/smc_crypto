@@ -58,6 +58,7 @@ class OrderResult:
     price: float | None = None      # Fill price (market) or trigger price (stop)
     status: str = "unknown"         # "filled" | "open" | "cancelled" | "failed"
     raw: dict[str, Any] = field(default_factory=dict)
+    trade_id: str | None = None     # OANDA trade ID for trade-attached SL/TP management
 
 
 @dataclass
