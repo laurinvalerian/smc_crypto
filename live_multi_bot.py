@@ -64,7 +64,7 @@ from rl_brain_v2 import RLBrainSuite
 from trade_journal import TradeJournal
 from utils.indicators import compute_rsi_wilders, compute_atr_wilders
 from strategies.smc_multi_style import (
-    compute_smc_indicators,
+    compute_smc_indicators_causal as compute_smc_indicators,
     _precompute_running_bias,
     _precompute_running_structure,
     _bias_from_running,
