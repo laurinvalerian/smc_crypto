@@ -834,22 +834,37 @@ class PaperBot:
         daily_bias = "neutral"
         score = 0.0
 
-        # Forex-specific scoring weights (redistribute from entry_zone/trigger to HTF)
+        # Core weights MUST match training (_compute_alignment_score in smc_multi_style.py:1370-1376)
+        # The gate threshold (0.50) was calibrated against these training weights.
         _fx = self.asset_class == "forex"
-        _w_bias      = 0.10               # same for all
-        _w_bias_half = 0.05               # same for all
-        _w_h4        = 0.08               # same for all
-        _w_h4_poi    = 0.08               # same for all
-        _w_h1        = 0.08 if not _fx else 0.10
-        _w_h1_choch  = 0.06               # same for all
-        _w_zone      = 0.12 if not _fx else 0.06   # forex: zone unreliable w/ tick vol
-        _w_trigger   = 0.10 if not _fx else 0.06   # forex: trigger unreliable
-        _w_volume    = 0.08 if not _fx else 0.12   # forex: compensate
-        _w_adx       = 0.08 if not _fx else 0.10   # forex: compensate
-        _w_session   = 0.06               # same for all
-        _w_momentum  = 0.06               # same for all
-        _w_tf_agree  = 0.05               # same for all
-        _w_freshness = 0.05               # same for all
+        if _fx:
+            # Forex: match training forex path (smc_multi_style.py:1372-1373)
+            _w_bias      = 0.12               # any non-neutral bias (additive base)
+            _w_bias_strong = 0.12             # strong bias bonus (additive on top)
+            _w_h4        = 0.12               # more HTF weight for forex
+            _w_h4_poi    = 0.08
+            _w_h1        = 0.10
+            _w_h1_choch  = 0.06
+            _w_zone      = 0.08               # forex: zone unreliable w/ tick vol
+            _w_trigger   = 0.08               # forex: trigger unreliable
+            _w_volume    = 0.14               # forex: compensate
+        else:
+            # Non-forex: match training default path (smc_multi_style.py:1375-1376)
+            _w_bias      = 0.12               # any non-neutral bias (additive base)
+            _w_bias_strong = 0.08             # strong bias bonus (additive on top)
+            _w_h4        = 0.08
+            _w_h4_poi    = 0.08
+            _w_h1        = 0.08
+            _w_h1_choch  = 0.06
+            _w_zone      = 0.15
+            _w_trigger   = 0.15
+            _w_volume    = 0.10
+        # Bonus components (not in training, small weight — never needed for gate)
+        _w_adx       = 0.02
+        _w_session   = 0.02
+        _w_momentum  = 0.02
+        _w_tf_agree  = 0.02
+        _w_freshness = 0.02
 
         # ═══ STEP 1: Daily Bias (1D) – HTF direction (0.10) ═════
         if len(self.buffer_1d) >= swing_len * 2:
@@ -863,14 +878,13 @@ class PaperBot:
 
                 if daily_bias != "neutral":
                     comp["bias"] = True
-                    # Only count if from BOS/CHoCH (strong bias required for AAA++)
+                    score += _w_bias  # Base: 0.12 for any non-neutral bias (matches training)
+                    # Additive bonus for strong bias (BOS/CHoCH confirmed)
                     pure_struct = _precompute_running_structure(ind_1d)
                     pure_bias = _bias_from_running(pure_struct, len(self.buffer_1d))
                     if pure_bias != "neutral" and pure_bias == daily_bias:
-                        score += _w_bias
+                        score += _w_bias_strong  # +0.08/0.12 bonus (matches training)
                         comp["bias_strong"] = True
-                    else:
-                        score += _w_bias_half  # EMA fallback only = half credit
             except Exception as exc:
                 self.logger.debug("1D bias computation failed: %s", exc)
 
