@@ -24,7 +24,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
@@ -973,6 +973,174 @@ def api_trade_detail(trade_id: str):
 
 
 # =====================================================================
+#  New API Endpoints (active trades, candles, trade history)
+# =====================================================================
+
+COMMODITY_SYMBOLS = {"BCO_USD", "WTICO_USD", "XAG_USD", "XAU_USD"}
+DATA_DIR = Path("data")
+
+
+@app.route("/api/public/active-trades")
+def api_active_trades():
+    """Return all currently open positions across all bots."""
+    bots = _discover_bots()
+    result: list[dict] = []
+    for _tag, bot in bots.items():
+        for trade in bot.get("active_trades", []):
+            if not isinstance(trade, dict):
+                continue
+            result.append({
+                "symbol": trade.get("symbol", bot.get("symbol", _tag)),
+                "direction": trade.get("direction", ""),
+                "entry_price": trade.get("entry_price", 0.0),
+                "sl": trade.get("sl", 0.0),
+                "tp": trade.get("tp", 0.0),
+                "entry_time": trade.get("entry_time", ""),
+                "style": trade.get("style", ""),
+                "tier": trade.get("tier", ""),
+                "confidence": trade.get("confidence", 0.0),
+                "asset_class": bot.get("asset_class", "unknown"),
+                "unrealized_pnl": trade.get("unrealized_pnl", 0.0),
+            })
+    return jsonify(result)
+
+
+@app.route("/api/public/candles/<path:symbol>")
+def api_candles(symbol: str):
+    """Return OHLCV candles for a symbol in Lightweight-Charts format."""
+    tf = request.args.get("tf", "5m")
+    try:
+        limit = min(int(request.args.get("limit", 100)), 200)
+    except (ValueError, TypeError):
+        limit = 100
+
+    # Determine data directory based on symbol
+    subdir = _resolve_data_subdir(symbol)
+    if subdir is None:
+        return jsonify([])
+
+    fname = f"{symbol}_{tf}.parquet"
+    fpath = DATA_DIR / subdir / fname
+    if not fpath.exists():
+        return jsonify([])
+
+    try:
+        import pandas as pd
+        df = pd.read_parquet(fpath)
+        if df.empty:
+            return jsonify([])
+        # Take last `limit` rows
+        df = df.tail(limit)
+        candles: list[dict] = []
+        for _, row in df.iterrows():
+            ts = row.get("timestamp")
+            if ts is None:
+                continue
+            # Convert to unix seconds
+            if hasattr(ts, "timestamp"):
+                unix_ts = int(ts.timestamp())
+            else:
+                unix_ts = int(ts)
+            candles.append({
+                "time": unix_ts,
+                "open": float(row.get("open", 0)),
+                "high": float(row.get("high", 0)),
+                "low": float(row.get("low", 0)),
+                "close": float(row.get("close", 0)),
+                "volume": float(row.get("volume", 0)),
+            })
+        return jsonify(candles)
+    except Exception:
+        return jsonify([])
+
+
+def _resolve_data_subdir(symbol: str) -> str | None:
+    """Map a symbol name to its data subdirectory."""
+    # Commodities (known set)
+    if symbol in COMMODITY_SYMBOLS:
+        return "commodities"
+    # Crypto: contains USDT
+    if "USDT" in symbol:
+        return "crypto"
+    # Forex: pattern like XXX_YYY where YYY is a currency code (not USDT)
+    # Check forex dir first, then stocks
+    if (DATA_DIR / "forex").exists():
+        # Quick check: does a file with this symbol exist in forex?
+        sample = DATA_DIR / "forex" / f"{symbol}_5m.parquet"
+        if sample.exists():
+            return "forex"
+    if (DATA_DIR / "stocks").exists():
+        sample = DATA_DIR / "stocks" / f"{symbol}_5m.parquet"
+        if sample.exists():
+            return "stocks"
+    # Fallback: try all dirs
+    for subdir in ("forex", "crypto", "stocks", "commodities"):
+        sample = DATA_DIR / subdir / f"{symbol}_5m.parquet"
+        if sample.exists():
+            return subdir
+    return None
+
+
+@app.route("/api/public/trade-history")
+def api_trade_history():
+    """Return paginated trade history from journal DB."""
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except (ValueError, TypeError):
+        limit = 50
+    try:
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except (ValueError, TypeError):
+        offset = 0
+    asset_class = request.args.get("asset_class")
+
+    if not _journal_has_table("trades"):
+        return jsonify([])
+
+    cols = _journal_columns()
+    # Build SELECT with only columns that exist
+    desired = [
+        "trade_id", "symbol", "direction", "style", "tier",
+        "entry_time", "exit_time", "entry_price", "exit_price",
+        "pnl_pct", "rr_actual", "bars_held", "outcome",
+        "exit_reason", "confidence",
+    ]
+    select_cols = [c for c in desired if c in cols]
+    if not select_cols:
+        return jsonify([])
+
+    select_str = ", ".join(select_cols)
+
+    # Build WHERE clause
+    where_parts: list[str] = []
+    params: list = []
+    # Only closed trades (have exit_time)
+    if "exit_time" in cols:
+        where_parts.append("exit_time IS NOT NULL")
+    if asset_class and "asset_class" in cols:
+        where_parts.append("asset_class = ?")
+        params.append(asset_class)
+
+    where_str = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    # ORDER BY exit_time DESC
+    order_str = " ORDER BY exit_time DESC" if "exit_time" in cols else ""
+
+    sql = f"SELECT {select_str} FROM trades{where_str}{order_str} LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    rows = _query_journal(sql, tuple(params))
+    # Fill in missing keys with defaults so response shape is consistent
+    result: list[dict] = []
+    for row in rows:
+        entry: dict = {}
+        for col in desired:
+            entry[col] = row.get(col)
+        result.append(entry)
+    return jsonify(result)
+
+
+# =====================================================================
 #  CORS
 # =====================================================================
 
@@ -993,6 +1161,7 @@ PUBLIC_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SMC Trading Bot -- Public Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -1091,6 +1260,31 @@ a:hover{text-decoration:underline}
   .chart-wrap{height:200px}
 }
 
+/* Active Trade Cards */
+.trade-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;margin-top:12px}
+.trade-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;animation:fadeIn .3s ease}
+.trade-card-header{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+.trade-card-symbol{font-size:16px;font-weight:700;color:#e6edf3}
+.trade-card-dir{padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;color:#fff}
+.trade-card-dir.long{background:#238636}.trade-card-dir.short{background:#da3633}
+.trade-card-tag{padding:2px 6px;border-radius:3px;font-size:11px;background:#21262d;color:#8b949e}
+.trade-card-chart{width:100%;height:250px;border-radius:4px;overflow:hidden;margin-bottom:8px}
+.trade-card-info{display:flex;gap:16px;font-size:12px;color:#8b949e;flex-wrap:wrap}
+.trade-card-info span{white-space:nowrap}
+.trade-card-info .label{color:#484f58}
+
+/* Trade History Table */
+.trade-history-table{width:100%;border-collapse:collapse;font-size:13px}
+.trade-history-table th{text-align:left;padding:8px 10px;color:#8b949e;font-weight:600;
+        border-bottom:1px solid #21262d;white-space:nowrap}
+.trade-history-table td{padding:6px 10px;border-bottom:1px solid #21262d1a}
+.trade-history-table tr:hover{background:#1c2129}
+.win-row{background:rgba(63,185,80,0.08)}
+.loss-row{background:rgba(248,81,73,0.08)}
+.btn-load-more{display:inline-block;margin-top:12px;padding:8px 20px;border:1px solid #30363d;
+               border-radius:6px;background:#21262d;color:#c9d1d9;cursor:pointer;font-size:13px}
+.btn-load-more:hover{background:#30363d}
+
 /* Fade in */
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @keyframes pulse{0%{opacity:1}50%{opacity:0.3}100%{opacity:1}}
@@ -1137,6 +1331,35 @@ a:hover{text-decoration:underline}
       <div class="card-value" id="c-pnl">--</div>
       <div class="card-sub" id="c-dd">Max DD: --</div>
     </div>
+    <div class="card">
+      <div class="card-label">Unrealized PnL</div>
+      <div class="card-value" id="c-upnl">--</div>
+      <div class="card-sub" id="c-upnl-count">0 open positions</div>
+    </div>
+  </div>
+
+  <!-- Active Trades with Charts -->
+  <div class="section" id="active-trades-section">
+    <div class="section-title">Active Trades <span id="at-count" style="font-size:12px;color:#8b949e;font-weight:400"></span></div>
+    <div id="at-empty" class="empty">No active trades</div>
+    <div class="trade-grid" id="at-grid"></div>
+  </div>
+
+  <!-- Trade History -->
+  <div class="section">
+    <div class="section-title">Trade History</div>
+    <div class="tbl-scroll">
+      <table class="trade-history-table" id="th-table">
+        <thead><tr>
+          <th>Symbol</th><th>Dir</th><th>Style</th><th>Tier</th>
+          <th>Entry</th><th>Exit</th><th>PnL%</th><th>RR</th>
+          <th>Duration</th><th>Outcome</th>
+        </tr></thead>
+        <tbody id="th-body"></tbody>
+      </table>
+    </div>
+    <div id="th-empty" class="empty" style="display:none">No trade history yet</div>
+    <button class="btn-load-more" id="th-more" style="display:none" onclick="loadMoreHistory()">Load More</button>
   </div>
 
   <!-- Equity Chart -->
@@ -1710,6 +1933,198 @@ function updatePaperGrid(d){
 
 fetchJ('/api/public/paper-grid', updatePaperGrid);
 setInterval(function(){ fetchJ('/api/public/paper-grid', updatePaperGrid); }, 15000);
+
+// ── Active Trades with Charts + Unrealized PnL ──────────────────
+var _atCharts = {};
+
+function updateActiveTrades(trades){
+  var grid = $('at-grid');
+  var empty = $('at-empty');
+  var countEl = $('at-count');
+  var upnlEl = $('c-upnl');
+  var upnlCountEl = $('c-upnl-count');
+  if(!grid) return;
+
+  // Compute combined unrealized PnL
+  var totalUpnl = 0;
+  var posCount = trades ? trades.length : 0;
+  if(trades && trades.length > 0){
+    for(var i=0;i<trades.length;i++){
+      totalUpnl += (trades[i].unrealized_pnl || 0);
+    }
+  }
+  if(upnlEl){
+    upnlEl.textContent = (totalUpnl >= 0 ? '+' : '') + fmt(totalUpnl, 4);
+    upnlEl.className = 'card-value ' + pnlColor(totalUpnl);
+  }
+  if(upnlCountEl) upnlCountEl.textContent = posCount + ' open position' + (posCount !== 1 ? 's' : '');
+
+  if(!trades || trades.length === 0){
+    empty.style.display = '';
+    grid.innerHTML = '';
+    if(countEl) countEl.textContent = '';
+    // Clean up old charts
+    for(var k in _atCharts){ try{ _atCharts[k].remove(); }catch(e){} }
+    _atCharts = {};
+    return;
+  }
+  empty.style.display = 'none';
+  if(countEl) countEl.textContent = '(' + trades.length + ')';
+
+  // Build cards
+  var html = '';
+  for(var i=0;i<trades.length;i++){
+    var t = trades[i];
+    var sym = t.symbol || '--';
+    var symId = sym.replace(/[^a-zA-Z0-9]/g, '_');
+    var dir = t.direction || 'long';
+    var dirCls = dir === 'short' ? 'short' : 'long';
+    var pnl = t.unrealized_pnl || 0;
+    html += '<div class="trade-card">';
+    html += '<div class="trade-card-header">';
+    html += '<span class="trade-card-symbol">' + escHtml(sym) + '</span>';
+    html += '<span class="trade-card-dir ' + dirCls + '">' + dir.toUpperCase() + '</span>';
+    if(t.style) html += '<span class="trade-card-tag">' + escHtml(t.style) + '</span>';
+    if(t.tier) html += '<span class="trade-card-tag">' + escHtml(t.tier) + '</span>';
+    if(t.confidence) html += '<span class="trade-card-tag">conf: ' + fmt(t.confidence,3) + '</span>';
+    html += '</div>';
+    html += '<div class="trade-card-chart" id="chart-' + symId + '"></div>';
+    html += '<div class="trade-card-info">';
+    html += '<span><span class="label">Entry:</span> ' + fmt(t.entry_price,5) + '</span>';
+    html += '<span><span class="label">SL:</span> <span class="red">' + fmt(t.sl,5) + '</span></span>';
+    html += '<span><span class="label">TP:</span> <span class="green">' + fmt(t.tp,5) + '</span></span>';
+    html += '<span><span class="label">PnL:</span> <span class="' + pnlColor(pnl) + '">' + (pnl>=0?'+':'') + fmt(pnl,4) + '</span></span>';
+    html += '</div></div>';
+  }
+  grid.innerHTML = html;
+
+  // Create charts for each trade
+  for(var i=0;i<trades.length;i++){
+    (function(trade){
+      var sym = trade.symbol || '';
+      var symId = sym.replace(/[^a-zA-Z0-9]/g, '_');
+      var container = document.getElementById('chart-' + symId);
+      if(!container || !window.LightweightCharts) return;
+
+      // Remove old chart if exists
+      if(_atCharts[symId]){ try{ _atCharts[symId].remove(); }catch(e){} }
+
+      var chart = LightweightCharts.createChart(container, {
+        width: container.clientWidth,
+        height: 250,
+        layout: { background: { color: '#0d1117' }, textColor: '#8b949e' },
+        grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
+        crosshair: { mode: 0 },
+        timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#30363d' },
+        rightPriceScale: { borderColor: '#30363d' },
+      });
+      _atCharts[symId] = chart;
+
+      var series = chart.addCandlestickSeries({
+        upColor: '#3fb950', downColor: '#f85149',
+        borderUpColor: '#3fb950', borderDownColor: '#f85149',
+        wickUpColor: '#3fb950', wickDownColor: '#f85149',
+      });
+
+      // Fetch candles
+      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_') + '?tf=5m&limit=100';
+      fetchJ(candleUrl, function(candles){
+        if(!candles || !candles.length) return;
+        series.setData(candles);
+
+        // Price lines
+        if(trade.entry_price){
+          series.createPriceLine({
+            price: trade.entry_price, color: '#58a6ff',
+            lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: 'Entry'
+          });
+        }
+        if(trade.sl){
+          series.createPriceLine({
+            price: trade.sl, color: '#f85149',
+            lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL'
+          });
+        }
+        if(trade.tp){
+          series.createPriceLine({
+            price: trade.tp, color: '#3fb950',
+            lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP'
+          });
+        }
+        chart.timeScale().fitContent();
+      });
+    })(trades[i]);
+  }
+}
+
+fetchJ('/api/public/active-trades', updateActiveTrades);
+setInterval(function(){ fetchJ('/api/public/active-trades', updateActiveTrades); }, 30000);
+
+// ── Trade History ────────────────────────────────────────────────
+var _thOffset = 0;
+var _thLimit = 50;
+
+function renderTradeHistory(trades, append){
+  var tbody = $('th-body');
+  var empty = $('th-empty');
+  var btn = $('th-more');
+  if(!tbody) return;
+
+  if(!trades || trades.length === 0){
+    if(!append){
+      tbody.innerHTML = '';
+      if(empty) empty.style.display = '';
+      if(btn) btn.style.display = 'none';
+    }
+    if(btn) btn.style.display = 'none';
+    return;
+  }
+  if(empty) empty.style.display = 'none';
+
+  var html = append ? '' : '';
+  for(var i=0;i<trades.length;i++){
+    var t = trades[i];
+    var isWin = t.outcome === 'win';
+    var rowCls = isWin ? 'win-row' : (t.outcome === 'loss' ? 'loss-row' : '');
+    var pnl = t.pnl_pct || 0;
+    var dir = t.direction ? t.direction.charAt(0).toUpperCase() + t.direction.slice(1) : '--';
+    // Duration
+    var dur = '--';
+    if(t.entry_time && t.exit_time){
+      var ms = new Date(t.exit_time) - new Date(t.entry_time);
+      var mins = Math.round(ms/60000);
+      if(mins < 60) dur = mins + 'm';
+      else if(mins < 1440) dur = Math.round(mins/60) + 'h ' + (mins%60) + 'm';
+      else dur = Math.round(mins/1440) + 'd';
+    } else if(t.bars_held){
+      dur = t.bars_held + ' bars';
+    }
+    html += '<tr class="'+rowCls+'">';
+    html += '<td>'+escHtml(t.symbol)+'</td>';
+    html += '<td><span class="'+(t.direction==='long'?'green':'red')+'">'+dir+'</span></td>';
+    html += '<td>'+escHtml(t.style||'--')+'</td>';
+    html += '<td>'+escHtml(t.tier||'--')+'</td>';
+    html += '<td>'+fmt(t.entry_price,5)+'</td>';
+    html += '<td>'+fmt(t.exit_price,5)+'</td>';
+    html += '<td class="'+pnlColor(pnl)+'">'+(pnl>=0?'+':'')+fmt(pnl,2)+'%</td>';
+    html += '<td>'+fmt(t.rr_actual,2)+'</td>';
+    html += '<td>'+dur+'</td>';
+    html += '<td><span class="'+(isWin?'green':'red')+'">'+(t.outcome||'--')+'</span></td>';
+    html += '</tr>';
+  }
+  if(append) tbody.innerHTML += html;
+  else tbody.innerHTML = html;
+
+  if(btn) btn.style.display = trades.length >= _thLimit ? '' : 'none';
+}
+
+function loadMoreHistory(){
+  _thOffset += _thLimit;
+  fetchJ('/api/public/trade-history?limit='+_thLimit+'&offset='+_thOffset, function(d){ renderTradeHistory(d, true); });
+}
+
+fetchJ('/api/public/trade-history?limit='+_thLimit+'&offset=0', function(d){ renderTradeHistory(d, false); });
+setInterval(function(){ _thOffset=0; fetchJ('/api/public/trade-history?limit='+_thLimit+'&offset=0', function(d){ renderTradeHistory(d, false); }); }, 60000);
 </script>
 </body>
 </html>
