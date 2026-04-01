@@ -161,16 +161,88 @@ def _read_log_tail(n: int = 50) -> list[str]:
         return []
 
 
-def _get_near_misses(n: int = 20) -> list[str]:
-    """Extract last n NEAR-MISS lines from log."""
+def _get_near_misses(n: int = 50) -> list[dict]:
+    """Extract last n NEAR-MISS entries as structured objects."""
     if not LOG_PATH.exists():
         return []
-    hits: list[str] = []
+
+    _PAT_ALIGNMENT = re.compile(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS ALIGNMENT (\S+) \| class=(\w+) score=([\d.]+) thresh=([\d.]+) dir=(\w+)"
+    )
+    _PAT_XGB = re.compile(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS XGB (\S+) conf=([\d.]+) score=([\d.]+) thresh=([\d.]+) \| (\w+) (\w+)"
+    )
+    _PAT_NEUTRAL = re.compile(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS NEUTRAL-BIAS (\S+) \| class=(\w+)"
+    )
+
+    hits: list[dict] = []
     try:
         with open(LOG_PATH) as f:
             for line in f:
-                if "NEAR-MISS" in line:
-                    hits.append(line.strip())
+                if "NEAR-MISS" not in line:
+                    continue
+
+                m = _PAT_ALIGNMENT.search(line)
+                if m:
+                    score_val = float(m.group(4))
+                    thresh_val = float(m.group(5))
+                    hits.append({
+                        "time": m.group(1),
+                        "symbol": m.group(2),
+                        "type": "ALIGNMENT",
+                        "score": round(score_val, 3),
+                        "threshold": round(thresh_val, 2),
+                        "gap": round(thresh_val - score_val, 3),
+                        "direction": m.group(6),
+                        "asset_class": m.group(3),
+                    })
+                    continue
+
+                m = _PAT_XGB.search(line)
+                if m:
+                    conf_val = float(m.group(3))
+                    thresh_val = float(m.group(5))
+                    hits.append({
+                        "time": m.group(1),
+                        "symbol": m.group(2),
+                        "type": "XGB",
+                        "score": round(conf_val, 3),
+                        "threshold": round(thresh_val, 2),
+                        "gap": round(thresh_val - conf_val, 3),
+                        "direction": m.group(7),
+                        "asset_class": m.group(6),
+                        "alignment_score": round(float(m.group(4)), 2),
+                    })
+                    continue
+
+                m = _PAT_NEUTRAL.search(line)
+                if m:
+                    hits.append({
+                        "time": m.group(1),
+                        "symbol": m.group(2),
+                        "type": "NEUTRAL_BIAS",
+                        "score": 0.0,
+                        "threshold": 0.0,
+                        "gap": 0.0,
+                        "direction": "none",
+                        "asset_class": m.group(3),
+                    })
+                    continue
+
+                # Fallback for unrecognized near-miss formats
+                ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                hits.append({
+                    "time": ts_match.group(1) if ts_match else "",
+                    "symbol": "",
+                    "type": "OTHER",
+                    "score": 0.0,
+                    "threshold": 0.0,
+                    "gap": 0.0,
+                    "direction": "",
+                    "asset_class": "",
+                    "raw": line.strip(),
+                })
         return hits[-n:]
     except Exception:
         return []
@@ -601,7 +673,7 @@ def api_rl_stats():
 
 @app.route("/api/public/near-misses")
 def api_near_misses():
-    return jsonify(_get_near_misses(20))
+    return jsonify(_get_near_misses(50))
 
 
 @app.route("/api/public/paper-grid")
@@ -983,9 +1055,19 @@ a:hover{text-decoration:underline}
 .log-box .trade{color:#3fb950}
 
 /* Near-miss */
-.nm-list{max-height:250px;overflow-y:auto}
-.nm-item{padding:6px 8px;font-size:12px;font-family:monospace;border-bottom:1px solid #21262d1a;
-         color:#d2a8ff;word-break:break-all}
+.nm-list{max-height:320px;overflow-y:auto}
+.nm-table{width:100%;border-collapse:collapse;font-size:0.82rem}
+.nm-table th{text-align:left;padding:4px 6px;border-bottom:1px solid #444;color:#aaa;font-weight:500}
+.nm-table td{padding:3px 6px;border-bottom:1px solid #333}
+.nm-hot{background:rgba(76,175,80,0.15)}
+.nm-warm{background:rgba(255,193,7,0.10)}
+.nm-cold{}
+.nm-neutral{opacity:0.5}
+.nm-badge{padding:1px 6px;border-radius:3px;font-size:0.75rem;font-weight:600}
+.nm-badge-alignment{background:#1565c0;color:#fff}
+.nm-badge-xgb{background:#6a1b9a;color:#fff}
+.nm-badge-neutral_bias{background:#555;color:#ccc}
+.nm-badge-other{background:#333;color:#999}
 
 /* Chart */
 .chart-wrap{position:relative;height:280px}
@@ -1357,16 +1439,35 @@ function updateTrades(rows){
 
 // ── Near-misses ──────────────────────────────────────────────────
 
-function updateNearMisses(lines){
+function updateNearMisses(data){
   var el = $('nm-list');
-  if(!lines || !lines.length){
+  if(!data || !data.length){
     el.innerHTML = '<div class="empty">No near-misses recorded</div>';
     return;
   }
-  var html = '';
-  for(var i = lines.length-1; i >= 0; i--){
-    html += '<div class="nm-item">'+escHtml(lines[i])+'</div>';
-  }
+  var html = '<table class="nm-table"><thead><tr>' +
+    '<th>Time</th><th>Symbol</th><th>Type</th><th>Score</th><th>Thresh</th><th>Gap</th><th>Dir</th><th>Class</th>' +
+    '</tr></thead><tbody>';
+  data.slice().reverse().forEach(function(nm){
+    var gap = nm.gap || 0;
+    var cls = '';
+    if(nm.type === 'OTHER' || nm.type === 'NEUTRAL_BIAS') cls = 'nm-neutral';
+    else if(gap <= 0.03) cls = 'nm-hot';
+    else if(gap <= 0.08) cls = 'nm-warm';
+    else cls = 'nm-cold';
+    var timeShort = (nm.time || '').substring(11, 19);
+    html += '<tr class="' + cls + '">' +
+      '<td>' + escHtml(timeShort) + '</td>' +
+      '<td>' + escHtml(nm.symbol || '') + '</td>' +
+      '<td><span class="nm-badge nm-badge-' + escHtml((nm.type||'other').toLowerCase()) + '">' + escHtml(nm.type || '?') + '</span></td>' +
+      '<td>' + (nm.score ? nm.score.toFixed(3) : '-') + '</td>' +
+      '<td>' + (nm.threshold ? nm.threshold.toFixed(2) : '-') + '</td>' +
+      '<td>' + (gap ? gap.toFixed(3) : '-') + '</td>' +
+      '<td>' + escHtml(nm.direction || '-') + '</td>' +
+      '<td>' + escHtml(nm.asset_class || '-') + '</td>' +
+      '</tr>';
+  });
+  html += '</tbody></table>';
   el.innerHTML = html;
 }
 
