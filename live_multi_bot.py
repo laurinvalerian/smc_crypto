@@ -4174,6 +4174,88 @@ class LiveMultiBotRunner:
                 except Exception as exc:
                     logger.warning("ATTACH SL/TP %s: ATR computation failed: %s", bot.symbol, exc)
 
+    # ── Trade-aware startup zombie sweep ────────────────────────────
+
+    async def _startup_sweep_zombie_orders(self) -> None:
+        """Cancel orphan orders remaining from a previous session/crash.
+
+        Runs AFTER reconciliation and SL/TP attachment so we know exactly
+        which orders are legitimate.  For each bot:
+          - 0 active trades → cancel ALL exit orders (clean slate)
+          - Has active trades → cancel only orders not matching stored IDs
+        """
+        # Build set of all known legitimate order IDs
+        known_ids: set[str] = set()
+        for bot in self.bots:
+            for trade in bot._active_trades:
+                for k in ("order_id", "sl_order_id", "tp_order_id"):
+                    oid = trade.get(k)
+                    if oid:
+                        known_ids.add(str(oid))
+
+        seen_adapters: set[int] = set()
+        total_cancelled = 0
+
+        for ac, adapter in self.adapters.items():
+            aid = id(adapter)
+            if aid in seen_adapters:
+                continue
+            seen_adapters.add(aid)
+
+            # OANDA: SL/TP are trade-attached, no standalone orders to sweep
+            if adapter.supports_attached_sl_tp:
+                continue
+
+            bot_lists = [self._bots_by_class.get(ac, [])]
+            # OANDA adapter shared by forex + commodities (but skipped above)
+            if ac == "forex":
+                bot_lists.append(self._bots_by_class.get("commodities", []))
+
+            for bot_list in bot_lists:
+                for bot in bot_list:
+                    try:
+                        open_orders = await adapter.fetch_open_orders(bot.symbol)
+                    except Exception:
+                        continue
+
+                    for o in open_orders:
+                        o_id = str(o.get("id", "") if isinstance(o, dict) else getattr(o, "order_id", ""))
+                        if not o_id:
+                            continue
+
+                        o_type = (o.get("type", "") or "").lower()
+                        is_exit = any(k in o_type for k in ("stop", "take_profit", "limit"))
+
+                        if not bot._active_trades:
+                            # No active trades → any order is a zombie
+                            if is_exit:
+                                try:
+                                    await adapter.cancel_order(o_id, bot.symbol)
+                                    total_cancelled += 1
+                                    bot.logger.info(
+                                        "STARTUP SWEEP: cancelled orphan %s type=%s (no active trades)",
+                                        o_id, o.get("type", "?"),
+                                    )
+                                except Exception:
+                                    pass
+                        else:
+                            # Has active trades → only cancel orders not matching known IDs
+                            if o_id not in known_ids and is_exit:
+                                try:
+                                    await adapter.cancel_order(o_id, bot.symbol)
+                                    total_cancelled += 1
+                                    bot.logger.info(
+                                        "STARTUP SWEEP: cancelled unknown %s type=%s (not in active trade IDs)",
+                                        o_id, o.get("type", "?"),
+                                    )
+                                except Exception:
+                                    pass
+
+        if total_cancelled > 0:
+            logger.info("Startup sweep: cancelled %d zombie orders", total_cancelled)
+        else:
+            logger.info("Startup sweep: no zombie orders found")
+
     # ── Startup position reconciliation ─────────────────────────────
 
     async def _reconcile_exchange_positions(self) -> None:
@@ -5053,6 +5135,29 @@ class LiveMultiBotRunner:
 
                     bot._active_trades = remaining
 
+                    # ── Belt-and-suspenders: if all trades closed, cancel ALL exit orders ──
+                    # Catches zombies that _record_close's ID-based + price-match cleanup missed.
+                    if not remaining and bot.adapter and not bot.adapter.supports_attached_sl_tp:
+                        try:
+                            _leftover = await bot.adapter.fetch_open_orders(bot.symbol)
+                            _cancelled = 0
+                            for _lo in _leftover:
+                                _lo_id = str(_lo.get("id", "") if isinstance(_lo, dict) else "")
+                                _lo_type = (_lo.get("type", "") or "").lower()
+                                if _lo_id and any(k in _lo_type for k in ("stop", "take_profit", "limit")):
+                                    try:
+                                        await bot.adapter.cancel_order(_lo_id, bot.symbol)
+                                        _cancelled += 1
+                                    except Exception:
+                                        pass
+                            if _cancelled > 0:
+                                bot.logger.info(
+                                    "POSITION GONE %s: cancelled %d remaining exit orders",
+                                    bot.symbol, _cancelled,
+                                )
+                        except Exception:
+                            pass
+
                 if not positions:
                     logger.debug(
                         "fetch_positions returned empty – skipping poll cycle"
@@ -5344,41 +5449,21 @@ class LiveMultiBotRunner:
             ", ".join(f"{cnt} {ac}" for ac, cnt in class_counts.items()),
         )
 
-        # ── Startup zombie order sweep per adapter ────────────────
-        seen_adapters: set[int] = set()
-        for ac, adapter in self.adapters.items():
-            aid = id(adapter)
-            if aid in seen_adapters:
-                continue
-            seen_adapters.add(aid)
-            try:
-                n_cancelled = 0
-                for bot in self._bots_by_class.get(ac, []):
-                    try:
-                        open_orders = await adapter.fetch_open_orders(bot.symbol)
-                        for o in open_orders:
-                            o_id = str(o.get("id", "") if isinstance(o, dict) else getattr(o, "order_id", ""))
-                            if o_id:
-                                await adapter.cancel_order(o_id, bot.symbol)
-                                n_cancelled += 1
-                    except Exception:
-                        pass
-                # For OANDA: also sweep commodities bots (same adapter)
-                if ac == "forex":
-                    for bot in self._bots_by_class.get("commodities", []):
-                        try:
-                            open_orders = await adapter.fetch_open_orders(bot.symbol)
-                            for o in open_orders:
-                                o_id = str(o.get("id", "") if isinstance(o, dict) else getattr(o, "order_id", ""))
-                                if o_id:
-                                    await adapter.cancel_order(o_id, bot.symbol)
-                                    n_cancelled += 1
-                        except Exception:
-                            pass
-                if n_cancelled > 0:
-                    logger.info("Startup [%s]: cancelled %d zombie orders", ac, n_cancelled)
-            except Exception as exc:
-                logger.warning("Startup zombie sweep [%s] failed: %s", ac, exc)
+        # ── Reconcile exchange positions with bot state ──────────
+        # After restart, bots may have active=0 while real positions exist
+        # on the exchange. Poll once and restore any orphaned positions.
+        # Runs BEFORE watchers so positions are known before live data flows.
+        await self._reconcile_exchange_positions()
+
+        # ── Post-startup: attach SL/TP to any unprotected trades ──
+        # Catches trades loaded from state file with sl=0.0 (e.g. DIS orphan)
+        await self._attach_missing_sl_tp()
+
+        # ── Trade-aware startup zombie sweep ─────────────────────
+        # Now that reconciliation + SL/TP attachment is done, we know
+        # exactly which orders are legitimate. Cancel everything else.
+        # Replaces the old indiscriminate "cancel ALL orders" sweep.
+        await self._startup_sweep_zombie_orders()
 
         # Start watchers: WebSocket for crypto, REST polling for others
         # Crypto: stagger WS subscriptions (1s apart) to avoid thundering herd on ccxt.pro
@@ -5426,15 +5511,6 @@ class LiveMultiBotRunner:
             "All watchers started: %d crypto (staggered %.0fs apart), %d REST",
             _crypto_idx, WS_STAGGER_SEC, _stock_idx + _rest_idx,
         )
-
-        # ── Reconcile exchange positions with bot state ──────────
-        # After restart, bots may have active=0 while real positions exist
-        # on the exchange. Poll once and restore any orphaned positions.
-        await self._reconcile_exchange_positions()
-
-        # ── Post-startup: attach SL/TP to any unprotected trades ──
-        # Catches trades loaded from state file with sl=0.0 (e.g. DIS orphan)
-        await self._attach_missing_sl_tp()
 
         # Position poller (detects TP/SL fills on exchange)
         poll_task = asyncio.create_task(self._poll_positions())

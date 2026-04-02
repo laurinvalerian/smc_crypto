@@ -272,7 +272,11 @@ class BinanceAdapter(ExchangeAdapter):
         stop_price: float,
         params: dict[str, Any] | None = None,
     ) -> OrderResult:
-        merged = {"stopPrice": stop_price, "reduceOnly": True}
+        # closePosition: Binance closes the entire position when triggered,
+        # ignoring qty. Eliminates qty-mismatch bugs from partial fills.
+        # NOTE: if multiple trades share one Binance position (multi-style),
+        # closePosition closes the aggregate — acceptable since per-bot limit is 1.
+        merged = {"stopPrice": stop_price, "reduceOnly": True, "closePosition": True}
         if params:
             merged.update(params)
         result = await self._exchange.create_order(
@@ -297,7 +301,8 @@ class BinanceAdapter(ExchangeAdapter):
         stop_price: float,
         params: dict[str, Any] | None = None,
     ) -> OrderResult:
-        merged = {"stopPrice": stop_price, "reduceOnly": True}
+        # closePosition: see create_stop_loss comment
+        merged = {"stopPrice": stop_price, "reduceOnly": True, "closePosition": True}
         if params:
             merged.update(params)
         result = await self._exchange.create_order(
