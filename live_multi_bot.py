@@ -4098,6 +4098,82 @@ class LiveMultiBotRunner:
                 counts[style] = counts.get(style, 0) + 1
         return counts
 
+    # ── Post-startup: attach SL/TP to unprotected trades ───────────
+
+    async def _attach_missing_sl_tp(self) -> None:
+        """Scan all bots for active trades with sl=0.0 and attach ATR-based SL/TP.
+
+        This catches trades loaded from state files that were never given
+        protective orders (e.g. orphaned positions from pre-fix reconciliation).
+        """
+        for bot in self.bots:
+            for trade in bot._active_trades:
+                if trade["sl"] != 0.0:
+                    continue  # already has SL
+                entry_price = float(trade.get("entry", 0))
+                if entry_price <= 0:
+                    continue
+
+                # Compute ATR from bot's 5m buffer
+                if not (hasattr(bot, '_buffer_5m_deque') and bot._buffer_5m_deque and len(bot._buffer_5m_deque) >= 14):
+                    logger.warning("UNPROTECTED %s: no candle data for ATR SL/TP — needs manual SL", bot.symbol)
+                    continue
+
+                try:
+                    _buf = list(bot._buffer_5m_deque)[-14:]
+                    _highs = [float(c["high"]) for c in _buf]
+                    _lows = [float(c["low"]) for c in _buf]
+                    _closes = [float(c["close"]) for c in _buf]
+                    _tr = [max(_highs[i] - _lows[i], abs(_highs[i] - _closes[i - 1]), abs(_lows[i] - _closes[i - 1])) for i in range(1, len(_highs))]
+                    _atr = sum(_tr) / len(_tr) if _tr else 0
+                    if _atr <= 0:
+                        continue
+
+                    _closing_side = "buy" if trade["direction"] == "short" else "sell"
+                    if trade["direction"] == "long":
+                        trade["sl"] = entry_price - 3.0 * _atr
+                        trade["tp"] = entry_price + 4.5 * _atr
+                    else:
+                        trade["sl"] = entry_price + 3.0 * _atr
+                        trade["tp"] = entry_price - 4.5 * _atr
+                    logger.info(
+                        "ATTACH SL/TP %s: SL=%.5f TP=%.5f (ATR=%.5f, 3x/4.5x)",
+                        bot.symbol, trade["sl"], trade["tp"], _atr,
+                    )
+
+                    # Alpaca: submit standalone stop + limit orders
+                    if bot.adapter and bot.adapter.exchange_id == "alpaca":
+                        try:
+                            _open_orders = await bot.adapter.fetch_open_orders(bot.symbol)
+                            _has_stop = any("stop" in (o.get("type", "") or "").lower() for o in _open_orders)
+                            if not _has_stop:
+                                _sl_result = await bot.adapter.create_stop_loss(
+                                    symbol=bot.symbol, side=_closing_side,
+                                    qty=trade["qty"], stop_price=trade["sl"],
+                                )
+                                trade["sl_order_id"] = _sl_result.order_id
+                                _tp_result = await bot.adapter.create_take_profit(
+                                    symbol=bot.symbol, side=_closing_side,
+                                    qty=trade["qty"], stop_price=trade["tp"],
+                                )
+                                trade["tp_order_id"] = _tp_result.order_id
+                                logger.info(
+                                    "ATTACH SL/TP %s: exchange orders submitted (sl_id=%s tp_id=%s)",
+                                    bot.symbol, _sl_result.order_id, _tp_result.order_id,
+                                )
+                            else:
+                                logger.info("ATTACH SL/TP %s: existing stop order found, skipping", bot.symbol)
+                        except Exception as exc:
+                            logger.warning(
+                                "ATTACH SL/TP %s: exchange orders FAILED: %s — local only, needs manual attention",
+                                bot.symbol, exc,
+                            )
+                            trade["_needs_manual_sl_tp"] = True
+
+                    bot._save_state()
+                except Exception as exc:
+                    logger.warning("ATTACH SL/TP %s: ATR computation failed: %s", bot.symbol, exc)
+
     # ── Startup position reconciliation ─────────────────────────────
 
     async def _reconcile_exchange_positions(self) -> None:
@@ -5355,6 +5431,10 @@ class LiveMultiBotRunner:
         # After restart, bots may have active=0 while real positions exist
         # on the exchange. Poll once and restore any orphaned positions.
         await self._reconcile_exchange_positions()
+
+        # ── Post-startup: attach SL/TP to any unprotected trades ──
+        # Catches trades loaded from state file with sl=0.0 (e.g. DIS orphan)
+        await self._attach_missing_sl_tp()
 
         # Position poller (detects TP/SL fills on exchange)
         poll_task = asyncio.create_task(self._poll_positions())
