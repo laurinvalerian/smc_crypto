@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── Portfolio Limits ────────────────────────────────────────────────
 
-MAX_TOTAL_POSITIONS = 5
+MAX_TOTAL_POSITIONS = 9  # raised from 5 to match per-style limit (3×3=9); allocator not wired yet
 MAX_PER_ASSET_CLASS = 3
 MAX_PORTFOLIO_HEAT_PCT = 0.06     # 6% total risk
 MAX_CORRELATION = 0.70             # No two positions with r > 0.7
