@@ -1003,7 +1003,7 @@ def api_active_trades():
                 "tier": trade.get("tier") or trade.get("setup_tier", ""),
                 "confidence": float(trade.get("rl_confidence") or trade.get("confidence") or 0.0),
                 "asset_class": bot.get("asset_class", "unknown"),
-                "unrealized_pnl": float(trade.get("unrealized_pnl") or trade.get("_prev_unrealized_pnl_pct") or 0.0),
+                "unrealized_pnl": float(trade.get("unrealized_pnl_usd") or 0.0),
                 "qty": float(trade.get("qty", 0.0)),
             })
     return jsonify(result)
@@ -1351,6 +1351,7 @@ a:hover{text-decoration:underline}
       <div class="card-label">Unrealized PnL</div>
       <div class="card-value" id="c-upnl">--</div>
       <div class="card-sub" id="c-upnl-count">0 open positions</div>
+      <div class="card-sub" id="c-upnl-breakdown" style="font-size:11px;margin-top:2px"></div>
     </div>
   </div>
 
@@ -1549,7 +1550,7 @@ function updateOverview(d){
   $('c-sharpe').textContent = 'Sharpe: ' + fmt(d.sharpe,2);
 
   var pnl = d.total_pnl || 0;
-  $('c-pnl').textContent = (pnl >= 0 ? '+' : '') + fmt(pnl,4);
+  $('c-pnl').textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl),2);
   $('c-pnl').className = 'card-value ' + pnlColor(pnl);
   $('c-dd').textContent = 'Max DD: ' + fmt(d.max_dd_pct,2) + '%';
 
@@ -1787,8 +1788,15 @@ function updateSystem(d){
 
 // ── Fetch helpers ────────────────────────────────────────────────
 
-function fetchJ(url, cb){
-  fetch(url).then(function(r){ return r.json(); }).then(cb).catch(function(){});
+function fetchJ(url, cb, retries){
+  retries = retries || 0;
+  fetch(url).then(function(r){
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(cb).catch(function(e){
+    console.warn('fetchJ fail: ' + url + ' (' + e.message + ')');
+    if(retries < 2) setTimeout(function(){ fetchJ(url, cb, retries+1); }, 2000);
+  });
 }
 
 // ── Initial load + polling ───────────────────────────────────────
@@ -1952,6 +1960,26 @@ setInterval(function(){ fetchJ('/api/public/paper-grid', updatePaperGrid); }, 15
 
 // ── Active Trades with Charts + Unrealized PnL ──────────────────
 var _atCharts = {};
+var _atSeries = {};  // reserved for future incremental candle updates
+var _atSymSet = '';  // serialised symbol+direction key for change detection
+
+function _autoPriceFormat(price){
+  if(price < 0.001) return { type:'price', precision:8, minMove:0.00000001 };
+  if(price < 0.1)   return { type:'price', precision:6, minMove:0.000001 };
+  if(price < 1)     return { type:'price', precision:5, minMove:0.00001 };
+  if(price < 100)   return { type:'price', precision:4, minMove:0.0001 };
+  if(price < 10000) return { type:'price', precision:2, minMove:0.01 };
+  return { type:'price', precision:0, minMove:1 };
+}
+
+function _buildSymKey(trades){
+  if(!trades || !trades.length) return '';
+  var parts = [];
+  for(var i=0;i<trades.length;i++){
+    parts.push((trades[i].symbol||'')+'|'+(trades[i].direction||''));
+  }
+  return parts.sort().join(',');
+}
 
 function updateActiveTrades(trades){
   var grid = $('at-grid');
@@ -1959,33 +1987,72 @@ function updateActiveTrades(trades){
   var countEl = $('at-count');
   var upnlEl = $('c-upnl');
   var upnlCountEl = $('c-upnl-count');
+  var upnlBreakdown = $('c-upnl-breakdown');
   if(!grid) return;
 
-  // Compute combined unrealized PnL
+  // Compute combined unrealized PnL + per-class breakdown
   var totalUpnl = 0;
   var posCount = trades ? trades.length : 0;
+  var classPnl = {};
   if(trades && trades.length > 0){
     for(var i=0;i<trades.length;i++){
-      totalUpnl += (trades[i].unrealized_pnl || 0);
+      var upnl = trades[i].unrealized_pnl || 0;
+      totalUpnl += upnl;
+      var ac = trades[i].asset_class || 'unknown';
+      classPnl[ac] = (classPnl[ac] || 0) + upnl;
     }
   }
   if(upnlEl){
-    upnlEl.textContent = (totalUpnl >= 0 ? '+' : '') + fmt(totalUpnl, 4);
+    upnlEl.textContent = (totalUpnl >= 0 ? '+$' : '-$') + fmt(Math.abs(totalUpnl), 2);
     upnlEl.className = 'card-value ' + pnlColor(totalUpnl);
   }
   if(upnlCountEl) upnlCountEl.textContent = posCount + ' open position' + (posCount !== 1 ? 's' : '');
+  // Per-class breakdown
+  if(upnlBreakdown){
+    var bk = [];
+    for(var cls in classPnl){
+      var v = classPnl[cls];
+      var prefix = cls.charAt(0).toUpperCase()+cls.slice(1)+': ';
+      bk.push(prefix + (v >= 0 ? '+$' : '-$') + fmt(Math.abs(v), 2));
+    }
+    upnlBreakdown.innerHTML = bk.length > 0 ? bk.join(' &nbsp;|&nbsp; ') : '';
+  }
 
   if(!trades || trades.length === 0){
     empty.style.display = '';
     grid.innerHTML = '';
     if(countEl) countEl.textContent = '';
-    // Clean up old charts
     for(var k in _atCharts){ try{ _atCharts[k].remove(); }catch(e){} }
     _atCharts = {};
+    _atSeries = {};
+    _atSymSet = '';
     return;
   }
   empty.style.display = 'none';
   if(countEl) countEl.textContent = '(' + trades.length + ')';
+
+  // Check if trade set changed — if not, just update PnL values in-place
+  var newSymSet = _buildSymKey(trades);
+  if(newSymSet === _atSymSet && _atSymSet !== ''){
+    // Update PnL values in existing cards without rebuilding
+    for(var i=0;i<trades.length;i++){
+      var t = trades[i];
+      var symId = (t.symbol||'').replace(/[^a-zA-Z0-9]/g, '_');
+      var pnlSpan = document.getElementById('pnl-' + symId);
+      if(pnlSpan){
+        var pnl = t.unrealized_pnl || 0;
+        pnlSpan.className = pnlColor(pnl);
+        pnlSpan.textContent = (pnl>=0?'+$':'-$') + fmt(Math.abs(pnl),2);
+      }
+    }
+    return;
+  }
+  _atSymSet = newSymSet;
+
+  // Destroy old charts before full rebuild
+  for(var k in _atCharts){ try{ _atCharts[k].remove(); }catch(e){} }
+  _atCharts = {};
+  _atSeries = {};
 
   // Build cards
   var html = '';
@@ -2009,7 +2076,7 @@ function updateActiveTrades(trades){
     html += '<span><span class="label">Entry:</span> ' + fmt(t.entry_price,5) + '</span>';
     html += '<span><span class="label">SL:</span> <span class="red">' + fmt(t.sl,5) + '</span></span>';
     html += '<span><span class="label">TP:</span> <span class="green">' + fmt(t.tp,5) + '</span></span>';
-    html += '<span><span class="label">PnL:</span> <span class="' + pnlColor(pnl) + '">' + (pnl>=0?'+':'') + fmt(pnl,4) + '</span></span>';
+    html += '<span><span class="label">PnL:</span> <span id="pnl-' + symId + '" class="' + pnlColor(pnl) + '">' + (pnl>=0?'+$':'-$') + fmt(Math.abs(pnl),2) + '</span></span>';
     html += '</div></div>';
   }
   grid.innerHTML = html;
@@ -2021,9 +2088,6 @@ function updateActiveTrades(trades){
       var symId = sym.replace(/[^a-zA-Z0-9]/g, '_');
       var container = document.getElementById('chart-' + symId);
       if(!container || !window.LightweightCharts) return;
-
-      // Remove old chart if exists
-      if(_atCharts[symId]){ try{ _atCharts[symId].remove(); }catch(e){} }
 
       var chart = LightweightCharts.createChart(container, {
         width: container.clientWidth,
@@ -2041,11 +2105,20 @@ function updateActiveTrades(trades){
         borderUpColor: '#3fb950', borderDownColor: '#f85149',
         wickUpColor: '#3fb950', wickDownColor: '#f85149',
       });
+      _atSeries[symId] = series;
 
-      // Fetch candles
-      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_') + '?tf=5m&limit=100';
+      // Fetch candles — sanitize URL to match bot export (replace / and : with _)
+      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_').replace(/:/g, '_') + '?tf=5m&limit=100';
       fetchJ(candleUrl, function(candles){
-        if(!candles || !candles.length) return;
+        if(!candles || !candles.length){
+          console.warn('No candle data for ' + sym);
+          return;
+        }
+
+        // Auto-detect price format from first candle
+        var priceFmt = _autoPriceFormat(candles[0].close || candles[0].open || 1);
+        series.applyOptions({ priceFormat: priceFmt });
+
         series.setData(candles);
 
         // Price lines
