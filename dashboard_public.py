@@ -668,7 +668,10 @@ def api_per_class():
 
 @app.route("/api/public/rl-stats")
 def api_rl_stats():
-    return jsonify(_get_rl_stats())
+    stats = _get_rl_stats()
+    stats["xgb_accepted"] = stats["entry_filter"]["accepted"]
+    stats["xgb_rejected"] = stats["entry_filter"]["rejected"]
+    return jsonify(stats)
 
 
 @app.route("/api/public/near-misses")
@@ -751,6 +754,60 @@ def api_paper_grid():
 @app.route("/api/public/risk")
 def api_risk():
     return jsonify(_get_risk_status())
+
+
+@app.route("/api/public/circuit-breaker")
+def api_circuit_breaker():
+    """Return simplified circuit breaker status derived from bot state files."""
+    bots = _discover_bots()
+
+    # Sum total PnL and portfolio heat across all bots
+    total_pnl = 0.0
+    total_equity = 0.0
+    portfolio_heat_pct = 0.0
+    for _tag, bot in bots.items():
+        total_pnl += float(bot.get("total_pnl", 0.0))
+        total_equity += float(bot.get("equity", 0.0))
+        for trade in bot.get("active_trades", []):
+            if not isinstance(trade, dict):
+                continue
+            # BE-triggered trades contribute 0 heat
+            if not trade.get("be_triggered", False):
+                portfolio_heat_pct += float(trade.get("risk_pct", 0.0))
+
+    # Approximate daily/weekly PnL % from log patterns if available
+    risk = _get_risk_status()
+    daily_pnl_pct = risk.get("daily_pnl_pct", 0.0)
+    weekly_pnl_pct = risk.get("weekly_pnl_pct", 0.0)
+
+    # Fallback: derive from total_equity if log values are 0
+    if daily_pnl_pct == 0.0 and total_equity > 0:
+        daily_pnl_pct = round(total_pnl / total_equity * 100, 2) if total_equity > 0 else 0.0
+
+    any_breaker = (
+        risk.get("daily_breaker", False)
+        or risk.get("weekly_breaker", False)
+        or risk.get("alltime_breaker", False)
+        or risk.get("heat_breaker", False)
+    )
+    if risk.get("alltime_breaker", False):
+        status = "ALLTIME_STOP"
+    elif risk.get("weekly_breaker", False):
+        status = "WEEKLY_PAUSE"
+    elif risk.get("daily_breaker", False):
+        status = "DAILY_PAUSE"
+    elif risk.get("heat_breaker", False):
+        status = "HEAT_PAUSE"
+    else:
+        status = "CLEAR"
+
+    return jsonify({
+        "daily_pnl_pct": round(daily_pnl_pct, 2),
+        "weekly_pnl_pct": round(weekly_pnl_pct, 2),
+        "portfolio_heat_pct": round(portfolio_heat_pct, 2),
+        "paused": any_breaker,
+        "status": status,
+    })
 
 
 @app.route("/api/public/logs")
@@ -984,6 +1041,7 @@ DATA_DIR = Path("data")
 def api_active_trades():
     """Return all currently open positions across all bots."""
     bots = _discover_bots()
+    now = datetime.now(timezone.utc)
     result: list[dict] = []
     for _tag, bot in bots.items():
         for trade in bot.get("active_trades", []):
@@ -992,19 +1050,36 @@ def api_active_trades():
             # Trade dict uses internal keys: "entry" (not "entry_price"),
             # "rl_confidence" (not "confidence"), etc.
             entry_p = trade.get("entry") or trade.get("entry_price") or 0.0
+
+            # Calculate hold time in hours from entry_time to now
+            hold_time_hours = 0.0
+            entry_time_str = trade.get("entry_time", "")
+            if entry_time_str:
+                try:
+                    et = datetime.fromisoformat(entry_time_str)
+                    if et.tzinfo is None:
+                        et = et.replace(tzinfo=timezone.utc)
+                    hold_time_hours = round((now - et).total_seconds() / 3600, 1)
+                except Exception:
+                    pass
+
             result.append({
                 "symbol": trade.get("symbol", bot.get("symbol", _tag)),
                 "direction": trade.get("direction", ""),
                 "entry_price": float(entry_p),
                 "sl": float(trade.get("sl", 0.0)),
                 "tp": float(trade.get("tp", 0.0)),
-                "entry_time": trade.get("entry_time", ""),
+                "entry_time": entry_time_str,
                 "style": trade.get("style", ""),
                 "tier": trade.get("tier") or trade.get("setup_tier", ""),
                 "confidence": float(trade.get("rl_confidence") or trade.get("confidence") or 0.0),
                 "asset_class": bot.get("asset_class", "unknown"),
                 "unrealized_pnl": float(trade.get("unrealized_pnl_usd") or 0.0),
                 "qty": float(trade.get("qty", 0.0)),
+                "hold_time_hours": hold_time_hours,
+                "candles_seen": int(trade.get("_candles_seen", 0)),
+                "be_triggered": bool(trade.get("be_triggered", False)),
+                "risk_pct": float(trade.get("risk_pct", 0.0)),
             })
     return jsonify(result)
 

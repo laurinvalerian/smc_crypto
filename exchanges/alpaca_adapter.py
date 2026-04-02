@@ -347,11 +347,14 @@ class AlpacaAdapter(ExchangeAdapter):
 
         if sl_price and tp_price:
             from alpaca.trading.requests import TakeProfitRequest, StopLossRequest
+            # Alpaca requires DAY time_in_force for fractional share orders
+            _is_fractional = float(_qty) != int(float(_qty))
+            _tif = TimeInForce.DAY if _is_fractional else TimeInForce.GTC
             request = MarketOrderRequest(
                 symbol=symbol,
                 qty=_qty,
                 side=order_side,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=_tif,
                 order_class=OrderClass.BRACKET,
                 take_profit=TakeProfitRequest(limit_price=round(float(tp_price), 2)),
                 stop_loss=StopLossRequest(stop_price=round(float(sl_price), 2)),

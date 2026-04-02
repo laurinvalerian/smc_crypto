@@ -86,9 +86,6 @@ from rl_dqn.dqn_inference import DQNExitManager
 from exchanges import BinanceAdapter
 from exchanges.base import ExchangeAdapter
 from risk.circuit_breaker import CircuitBreaker
-from ranker.universe_scanner import UniverseScanner, ScanResult
-from ranker.opportunity_ranker import OpportunityRanker, RankedOpportunity
-from ranker.capital_allocator import CapitalAllocator
 from paper_grid import PaperGrid
 from live_teacher import analyze_closed_trade as _teacher_analyze, save_feedback as _teacher_save
 
@@ -356,7 +353,7 @@ MIN_SL_TICKS = 5
 STYLE_SCALP = "scalp"
 STYLE_DAY = "day"
 STYLE_SWING = "swing"
-MAX_PER_STYLE_GLOBAL = 3  # max 3 swing + 3 day + 3 scalp = 9 total across all bots
+MAX_PER_STYLE_GLOBAL = 5  # max 5 swing + 5 day + 5 scalp = 15 total across all bots
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
@@ -366,6 +363,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_tp_pct": 0.015,    # 1.5% max TP
         "min_rr": 1.5,          # lowered from 2.0 — brain filters bad RR
         "cooldown_minutes": 20,
+        "max_hold_candles": 72,  # 6h × 12 candles/h (5m bars, market-hours only)
     },
     STYLE_DAY: {
         "min_sl_pct": 0.002,    # 0.2% min SL (lowered — brain validates)
@@ -374,6 +372,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_tp_pct": 0.06,     # 6% max TP
         "min_rr": 1.5,          # lowered from 2.5 — brain filters bad RR
         "cooldown_minutes": 60,
+        "max_hold_candles": 288, # 24h × 12 candles/h (5m bars, market-hours only)
     },
     STYLE_SWING: {
         "min_sl_pct": 0.008,    # 0.8% min SL
@@ -382,6 +381,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_tp_pct": 0.15,     # 15% max TP
         "min_rr": 2.0,          # lowered from 3.0 — brain filters bad RR
         "cooldown_minutes": 240,
+        "max_hold_candles": 1440, # 10d × 12 candles/h × ~12h avg market day (5m bars, market-hours only)
     },
 }
 
@@ -1247,6 +1247,9 @@ class PaperBot:
                 trade_id = trade.get("rl_trade_id") or trade.get("order_id", "")
                 if not trade_id:
                     continue
+                # Count market-open candles (only increments when a real candle
+                # arrives — respects market hours automatically).
+                trade["_candles_seen"] = trade.get("_candles_seen", 0) + 1
                 entry_price = float(trade.get("entry", bar_close))
                 entry_time = trade.get("entry_time")
                 if entry_time is None:
@@ -3734,10 +3737,6 @@ class LiveMultiBotRunner:
         for bot in self.bots:
             bot.circuit_breaker = self.circuit_breaker
 
-        # ── Opportunity Ranker + Capital Allocator (Phase B) ───────
-        self.ranker = OpportunityRanker(max_opportunities=10)
-        self.allocator = CapitalAllocator()
-
         # ── Paper Grid (Multi-Variant A/B Testing) ───────────────
         self.paper_grid = PaperGrid()
         self.paper_grid.load_state()  # resume from crash
@@ -3767,7 +3766,6 @@ class LiveMultiBotRunner:
         self._last_candle_ts: dict[str, float] = {}  # symbol -> time.time()
         self._candles_by_class: dict[str, int] = {ac: 0 for ac in ["crypto", "forex", "stocks", "commodities"]}
         self._candles_since_heartbeat: dict[str, int] = {ac: 0 for ac in ["crypto", "forex", "stocks", "commodities"]}
-        self._near_misses_total: int = 0
         self._symbol_restart_times: dict[str, list[float]] = {}  # symbol -> timestamps of watchdog restarts
         self._rest_fallback_symbols: set[str] = set()  # symbols degraded from WS to REST
         self._last_status_write: float = 0.0  # debounce heartbeat.json writes
@@ -5069,6 +5067,39 @@ class LiveMultiBotRunner:
                                                 current_rr,
                                             )
 
+                        # ── Max hold time: force close when market-hours candle limit reached ──
+                        _candles_seen = trade.get("_candles_seen", 0)
+                        _trade_style = trade.get("style", STYLE_DAY)
+                        _max_candles = STYLE_CONFIG.get(_trade_style, STYLE_CONFIG[STYLE_DAY]).get("max_hold_candles", 0)
+                        if _max_candles > 0 and _candles_seen >= _max_candles and bot.adapter is not None:
+                            _timeout_side = "sell" if trade["direction"] == "long" else "buy"
+                            try:
+                                if not trade.get("sl_attached"):
+                                    for _oid_key in ("sl_order_id", "tp_order_id"):
+                                        _oid = trade.get(_oid_key)
+                                        if _oid:
+                                            try:
+                                                await bot.adapter.cancel_order(_oid, bot.symbol)
+                                            except Exception:
+                                                pass
+                                _timeout_close = await bot.adapter.create_market_order(
+                                    bot.symbol, _timeout_side, trade["qty"],
+                                    {"reduceOnly": True},
+                                )
+                                _timeout_price = float(
+                                    _timeout_close.avg_price or _timeout_close.price or trade["entry"]
+                                )
+                                bot.logger.warning(
+                                    "TIMEOUT EXIT %s %s after %d candles (max %d for %s style) @ %.6f",
+                                    bot.symbol, _timeout_side.upper(),
+                                    _candles_seen, _max_candles, _trade_style, _timeout_price,
+                                )
+                                trade["_exit_reason_override"] = "timeout"
+                                await _record_close(bot, trade, _timeout_price)
+                                continue
+                            except Exception as _to_exc:
+                                bot.logger.error("Timeout exit failed %s: %s", bot.symbol, _to_exc)
+
                         # ── ML exit: close via market when flag is set ────
                         if trade.get("_ml_exit_requested") and bot.adapter is not None:
                             _ml_exit_side = "sell" if trade["direction"] == "long" else "buy"
@@ -5456,8 +5487,9 @@ class LiveMultiBotRunner:
                         b._account_equity = total_equity
 
                     # Update circuit breaker portfolio heat
+                    # BE-triggered trades have SL at breakeven → effective risk is 0
                     total_risk = sum(
-                        t.get("risk_pct", 0.0)
+                        0.0 if t.get("be_triggered") else t.get("risk_pct", 0.0)
                         for b in self.bots
                         for t in b._active_trades
                     )
