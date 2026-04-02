@@ -42,6 +42,7 @@ import random
 import signal
 import sys
 import time
+import weakref
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -355,6 +356,7 @@ MIN_SL_TICKS = 5
 STYLE_SCALP = "scalp"
 STYLE_DAY = "day"
 STYLE_SWING = "swing"
+MAX_PER_STYLE_GLOBAL = 3  # max 3 swing + 3 day + 3 scalp = 9 total across all bots
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
@@ -1273,6 +1275,8 @@ class PaperBot:
                 if unrealized_pnl_pct > 0:
                     trade["_bars_in_profit"] = trade.get("_bars_in_profit", 0) + 1
                 trade["_prev_unrealized_pnl_pct"] = unrealized_pnl_pct
+                # Dollar-denominated unrealized PnL for dashboard display
+                trade["unrealized_pnl_usd"] = unrealized_pnl_pct * entry_price * float(trade.get("qty", 0))
 
                 # Compute ADX for journal recording (matching generate_rl_data logic)
                 _adx_1h_val = 0.0
@@ -2152,13 +2156,24 @@ class PaperBot:
             return
         if sig["symbol"] != symbol:
             return
-        # ── Duplicate style check ─────────────────────────────────
-        # Allow one trade per style (scalp / day / swing) simultaneously,
-        # but never two trades of the same style on the same coin.
+        # ── Duplicate style check (per-bot) ──────────────────────
+        # Never two trades of the same style on the same coin.
         pending_style = sig.get("style", STYLE_DAY)
         if any(t["style"] == pending_style for t in self._active_trades):
             self._pending_signal = None
             return
+        # ── Global per-style limit ───────────────────────────────
+        # Max 3 per style across all 112 bots (= max 9 total)
+        _runner = self._runner_ref() if hasattr(self, '_runner_ref') and self._runner_ref else None
+        if _runner:
+            _style_counts = _runner.get_global_style_counts()
+            if _style_counts.get(pending_style, 0) >= MAX_PER_STYLE_GLOBAL:
+                self.logger.info(
+                    "GLOBAL STYLE LIMIT: %s has %d/%d — skipping %s",
+                    pending_style, _style_counts[pending_style], MAX_PER_STYLE_GLOBAL, symbol,
+                )
+                self._pending_signal = None
+                return
 
         # Check if price is inside the entry zone
         if not (sig["zone_low"] <= price <= sig["zone_high"]):
@@ -3724,6 +3739,11 @@ class LiveMultiBotRunner:
         for bot in self.bots:
             bot.journal = self.journal
 
+        # ── Runner back-reference for global style limits ─────────
+        _runner_ref = weakref.ref(self)
+        for bot in self.bots:
+            bot._runner_ref = _runner_ref
+
         # Feed status per symbol: connected | reconnecting_N | disconnected | polling
         self.ws_status: dict[str, str] = {}
         for bot in bots:
@@ -4067,6 +4087,17 @@ class LiveMultiBotRunner:
             except asyncio.TimeoutError:
                 pass
 
+    # ── Global style counting (for per-style trade limits) ─────────
+
+    def get_global_style_counts(self) -> dict[str, int]:
+        """Count active trades by style across ALL bots."""
+        counts: dict[str, int] = {"scalp": 0, "day": 0, "swing": 0}
+        for bot in self.bots:
+            for trade in bot._active_trades:
+                style = trade.get("style", "day")
+                counts[style] = counts.get(style, 0) + 1
+        return counts
+
     # ── Startup position reconciliation ─────────────────────────────
 
     async def _reconcile_exchange_positions(self) -> None:
@@ -4163,6 +4194,60 @@ class LiveMultiBotRunner:
                                 break
                 except Exception as exc:
                     bot.logger.debug("OANDA trade detail fetch failed: %s", exc)
+
+            # ── ATR-based SL/TP for orphaned/reconciled trades with no protection ──
+            if trade["sl"] == 0.0 and hasattr(bot, '_buffer_5m_deque') and bot._buffer_5m_deque and len(bot._buffer_5m_deque) >= 14:
+                try:
+                    _buf = list(bot._buffer_5m_deque)[-14:]
+                    _highs = [float(c["high"]) for c in _buf]
+                    _lows = [float(c["low"]) for c in _buf]
+                    _closes = [float(c["close"]) for c in _buf]
+                    _tr = [max(_highs[i] - _lows[i], abs(_highs[i] - _closes[i - 1]), abs(_lows[i] - _closes[i - 1])) for i in range(1, len(_highs))]
+                    _atr = sum(_tr) / len(_tr) if _tr else 0
+                    if _atr > 0:
+                        _closing_side = "buy" if trade["direction"] == "short" else "sell"
+                        if trade["direction"] == "long":
+                            trade["sl"] = entry_price - 3.0 * _atr
+                            trade["tp"] = entry_price + 4.5 * _atr
+                        else:
+                            trade["sl"] = entry_price + 3.0 * _atr
+                            trade["tp"] = entry_price - 4.5 * _atr
+                        logger.info(
+                            "RECONCILED %s: attached conservative SL=%.5f TP=%.5f (ATR=%.5f, 3x/4.5x)",
+                            bot.symbol, trade["sl"], trade["tp"], _atr,
+                        )
+                        # Alpaca: submit standalone stop + limit orders for the existing position
+                        if bot.adapter.exchange_id == "alpaca":
+                            try:
+                                _open_orders = await bot.adapter.fetch_open_orders(bot.symbol)
+                                _has_stop = any("stop" in (o.get("type", "") or "").lower() for o in _open_orders)
+                                if not _has_stop:
+                                    _sl_result = await bot.adapter.create_stop_loss(
+                                        symbol=bot.symbol, side=_closing_side,
+                                        qty=trade["qty"], stop_price=trade["sl"],
+                                    )
+                                    trade["sl_order_id"] = _sl_result.order_id
+                                    _tp_result = await bot.adapter.create_take_profit(
+                                        symbol=bot.symbol, side=_closing_side,
+                                        qty=trade["qty"], stop_price=trade["tp"],
+                                    )
+                                    trade["tp_order_id"] = _tp_result.order_id
+                                    logger.info(
+                                        "RECONCILED %s: exchange SL/TP submitted (sl_id=%s tp_id=%s)",
+                                        bot.symbol, _sl_result.order_id, _tp_result.order_id,
+                                    )
+                                else:
+                                    logger.info("RECONCILED %s: existing stop order found, skipping SL/TP submit", bot.symbol)
+                            except Exception as exc:
+                                logger.warning(
+                                    "RECONCILED %s: exchange SL/TP FAILED: %s — local only, needs manual attention",
+                                    bot.symbol, exc,
+                                )
+                                trade["_needs_manual_sl_tp"] = True
+                except Exception as exc:
+                    logger.warning("RECONCILED %s: ATR SL/TP computation failed: %s", bot.symbol, exc)
+            elif trade["sl"] == 0.0:
+                logger.warning("RECONCILED %s: no candle data for ATR SL/TP — trade UNPROTECTED, needs manual SL", bot.symbol)
 
             bot._active_trades.append(trade)
             bot._save_state()
