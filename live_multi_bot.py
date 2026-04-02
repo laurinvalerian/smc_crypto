@@ -2894,12 +2894,22 @@ class PaperBot:
     # ── Fetch real testnet balance ────────────────────────────────
 
     async def _fetch_balance(self) -> float | None:
-        """Return the free balance from the exchange adapter."""
+        """Return total account equity from the exchange adapter.
+
+        Uses bal.total (account equity) instead of bal.free (buying power)
+        so that position sizing is based on full account value, not remaining
+        margin.  Note: bal.total includes unrealized PnL on Binance (futures
+        totalMarginBalance) and Alpaca (equity); OANDA total is deposited
+        balance only.  Acceptable for paper trading — position sizing drift
+        from unrealized PnL is negligible at current scale.
+        TODO: add sizing_equity() to adapter base class for funded accounts
+        that returns deposited capital without unrealized PnL.
+        """
         if self.adapter is None:
             return None
         try:
             bal = await self.adapter.fetch_balance()
-            return float(bal.free)
+            return float(bal.total)
         except Exception as exc:
             self.logger.warning("fetch_balance failed: %s", exc)
             return None
@@ -4820,6 +4830,9 @@ class LiveMultiBotRunner:
             # === CLEANUP ===
             _cancel_adapter = bot.adapter if bot.adapter is not None else None
 
+            # Track which ID-based cancels actually succeeded (or order was already gone)
+            cancelled_ids: set[str] = set()
+
             if trade.get("sl_attached"):
                 # OANDA: SL/TP are trade-attached — they auto-cancel when trade closes.
                 # No cancel_order needed. Standalone order IDs don't exist.
@@ -4834,6 +4847,7 @@ class LiveMultiBotRunner:
                     for cancel_id in cancel_targets:
                         try:
                             await _cancel_adapter.cancel_order(cancel_id, bot.symbol)
+                            cancelled_ids.add(str(cancel_id))
                             bot.logger.info(
                                 "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
                             )
@@ -4843,6 +4857,7 @@ class LiveMultiBotRunner:
                             # SL/TP triggered the close.  Log at DEBUG to reduce noise.
                             exc_str = str(exc)
                             if "-2011" in exc_str or "Unknown order" in exc_str:
+                                cancelled_ids.add(str(cancel_id))  # already gone = effectively cancelled
                                 bot.logger.debug(
                                     "Order %s for %s already gone (filled/cancelled): %s",
                                     cancel_id, bot.symbol, exc,
@@ -4875,6 +4890,19 @@ class LiveMultiBotRunner:
                     open_orders = await _cancel_adapter.fetch_open_orders(bot.symbol)
                     trade_sl = trade.get("sl")
                     trade_tp = trade.get("tp")
+
+                    # Warn if stored order IDs not found on exchange at all
+                    # (surfaces Binance order ID replacement/amendment issues)
+                    open_order_ids = {str(o.get("id") or "") for o in open_orders}
+                    for label, stored_id in [("sl_order_id", trade.get("sl_order_id")),
+                                             ("tp_order_id", trade.get("tp_order_id"))]:
+                        if stored_id and str(stored_id) not in cancelled_ids and str(stored_id) not in open_order_ids:
+                            bot.logger.warning(
+                                "ORDER ID MISMATCH: %s=%s for %s not found on exchange "
+                                "(possible order replacement/amendment)",
+                                label, stored_id, bot.symbol,
+                            )
+
                     for o in open_orders:
                         o_id = str(o.get("id") or "")
                         if not o_id:
@@ -4883,7 +4911,7 @@ class LiveMultiBotRunner:
                         if o_id in protected_ids:
                             continue
                         # Skip orders we already successfully cancelled above
-                        if o_id in cancel_targets:
+                        if o_id in cancelled_ids:
                             continue
                         o_stop = float(
                             o.get("stopPrice")
@@ -5135,6 +5163,27 @@ class LiveMultiBotRunner:
 
                     bot._active_trades = remaining
 
+                    # ── Refresh unrealized PnL from exchange position (real-time) ──
+                    # _prepare_signal only updates every 5m candle; this keeps
+                    # dashboard PnL current between candles (~30s refresh).
+                    # Only apply when this bot is the sole holder of the symbol
+                    # to avoid double-counting when multiple style-bots share it.
+                    pos = pos_map.get(bot.symbol)
+                    if pos and remaining:
+                        _other_bots_same_sym = sum(
+                            1 for b2 in self.bots
+                            if b2.symbol == bot.symbol and b2._active_trades and b2 is not bot
+                        )
+                        if _other_bots_same_sym == 0:
+                            _pos_pnl = float(
+                                pos.unrealized_pnl if hasattr(pos, "unrealized_pnl")
+                                else pos.get("unrealized_pnl", 0)
+                            )
+                            _total_qty = sum(t["qty"] for t in remaining)
+                            if _total_qty > 0:
+                                for _rt in remaining:
+                                    _rt["unrealized_pnl_usd"] = _pos_pnl * (_rt["qty"] / _total_qty)
+
                     # ── Belt-and-suspenders: if all trades closed, cancel ALL exit orders ──
                     # Catches zombies that _record_close's ID-based + price-match cleanup missed.
                     if not remaining and bot.adapter and not bot.adapter.supports_attached_sl_tp:
@@ -5377,7 +5426,10 @@ class LiveMultiBotRunner:
     # ── Rich Dashboard loop ───────────────────────────────────────
 
     async def _fetch_real_total_equity(self) -> float:
-        """Fetch combined free balance across all adapters."""
+        """Fetch combined total equity across all adapters.
+
+        Uses bal.total (account equity) instead of bal.free (buying power).
+        """
         total = 0.0
         seen: set[int] = set()
         for ac, adapter in self.adapters.items():
@@ -5387,7 +5439,7 @@ class LiveMultiBotRunner:
             seen.add(aid)
             try:
                 bal = await adapter.fetch_balance()
-                total += bal.free
+                total += bal.total
             except Exception as exc:
                 logger.debug("fetch_balance [%s] failed: %s", ac, exc)
         return total
@@ -5703,7 +5755,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             continue
         try:
             bal = await adapter.fetch_balance()
-            real_equity = bal.free if bal else 0.0
+            real_equity = bal.total if bal else 0.0
             seen_adapters[aid] = real_equity
             logger.info("Initial equity [%s]: %.2f", ac, real_equity)
         except Exception as exc:

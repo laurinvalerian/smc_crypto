@@ -287,8 +287,14 @@ class PaperGrid:
                 results[name] = None
                 continue
 
-            # Filter 3: tier classification (with variant's thresholds)
-            tier = _classify_tier(score, rr, components)
+            # Filter 3: tier classification
+            # Use pre-computed tier from the live bot's signal dict when
+            # available.  The live bot's tier classification respects
+            # per-asset-class skip flags (e.g. volume_ok skipped for
+            # crypto testnet / forex / commodities).  Re-classifying here
+            # without those skip flags would reject every signal from
+            # those classes.
+            tier = signal.get("tier") or _classify_tier(score, rr, components)
             if tier is None:
                 results[name] = None
                 continue
