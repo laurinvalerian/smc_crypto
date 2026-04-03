@@ -226,7 +226,7 @@ rl_brain:
     min_multiplier: 0.33     # Minimum risk multiplier
     max_multiplier: 1.5      # Maximum risk multiplier
   tp_optimizer:
-    enabled: true             # Enabled for paper trading (marginal Sharpe improvement)
+    enabled: false            # Disabled: v2 retrain FAILED gate (PF 1.74→1.44, actively harmful)
     model_path: "models/rl_tp_optimizer.pkl"
     max_tp_reduction: 0.3    # Max 30% TP reduction from planned
     max_tp_extension: 0.5    # Max 50% TP extension from planned
