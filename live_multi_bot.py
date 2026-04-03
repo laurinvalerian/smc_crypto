@@ -5140,7 +5140,7 @@ class LiveMultiBotRunner:
                                     {"reduceOnly": True},
                                 )
                                 _timeout_price = float(
-                                    _timeout_close.avg_price or _timeout_close.price or trade["entry"]
+                                    _timeout_close.price or trade["entry"]
                                 )
                                 bot.logger.warning(
                                     "TIMEOUT EXIT %s %s after %d candles (max %d for %s style) @ %.6f",
@@ -5172,7 +5172,7 @@ class LiveMultiBotRunner:
                                     {"reduceOnly": True},
                                 )
                                 _ml_exit_price = float(
-                                    _ml_close.avg_price or _ml_close.price or trade["entry"]
+                                    _ml_close.price or trade["entry"]
                                 )
                                 bot.logger.info(
                                     "ML_EXIT CLOSED %s %s @ %.6f | order=%s",
