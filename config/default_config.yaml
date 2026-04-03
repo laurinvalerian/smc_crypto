@@ -279,6 +279,17 @@ continuous_learner:
   rollback_min_trades: 20           # Min trades before evaluating rollback
   rollback_cumulative_pnl: -0.03    # Rollback if cumPnL < -3% after min_trades
   rollback_min_winrate: 0.20        # Rollback if WR < 20% after min_trades
+  min_validation_trades: 15          # Minimum trades in validation split (30% of live)
+  validation_split: 0.30             # Fraction of live trades for walk-forward validation
+  backtest_subsample_per_class: 50000  # Subsample backtest data per asset class (200K total)
+  grade_weights:
+    A+: 1.5
+    A: 1.5
+    B+: 1.0
+    B: 1.0
+    C: 1.0
+    D: 1.5
+  timeout_weight: 0.5                # Weight multiplier for timeout exits (noisy signal)
 
 # ═══════════════════════════════════════════════════════
 # Trade Journal Configuration

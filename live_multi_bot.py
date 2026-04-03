@@ -89,6 +89,13 @@ from risk.circuit_breaker import CircuitBreaker
 from paper_grid import PaperGrid
 from live_teacher import analyze_closed_trade as _teacher_analyze, save_feedback as _teacher_save
 
+# ── Continuous learner (optional — may not be deployed yet) ─────
+try:
+    from continuous_learner import run_continuous_learner
+except ImportError:
+    run_continuous_learner = None  # type: ignore[assignment,misc]
+    logging.getLogger(__name__).warning("continuous_learner not found — auto-retrain disabled")
+
 # ── ccxt imports (only needed for BinanceAdapter backward-compat) ─
 try:
     import ccxt as ccxt_sync
@@ -4632,8 +4639,9 @@ class LiveMultiBotRunner:
                     return
 
                 # CPU-bound analysis in thread executor
+                exit_reason = trade.get("_exit_reason", "unknown")
                 feedback = await asyncio.to_thread(
-                    _teacher_analyze, trade, candle_data, bot.symbol, bot.asset_class
+                    _teacher_analyze, trade, candle_data, bot.symbol, bot.asset_class, exit_reason
                 )
                 _teacher_save(feedback)
                 bot.logger.info(
@@ -4823,6 +4831,7 @@ class LiveMultiBotRunner:
 
             # ── Teacher analysis (non-blocking, retroactive) ────────
             if self._teacher_enabled:
+                trade["_exit_reason"] = exit_reason
                 asyncio.create_task(self._run_teacher_analysis(bot, trade, exit_price))
 
             # === CLEANUP ===
@@ -5613,6 +5622,11 @@ class LiveMultiBotRunner:
         watchdog_task = asyncio.create_task(self._watchdog_loop())
         staleness_task = asyncio.create_task(self._check_candle_staleness())
 
+        # Continuous learner (auto-retrain loop)
+        learner_task = None
+        if run_continuous_learner is not None:
+            learner_task = asyncio.create_task(run_continuous_learner(self.config, self._shutdown))
+
         # Wait until shutdown
         await self._shutdown.wait()
         logger.info("Shutdown signal received – stopping …")
@@ -5625,6 +5639,8 @@ class LiveMultiBotRunner:
         heartbeat_task.cancel()
         watchdog_task.cancel()
         staleness_task.cancel()
+        if learner_task is not None:
+            learner_task.cancel()
         if hasattr(self, '_batch_ticker_task'):
             self._batch_ticker_task.cancel()
         for t in self._watcher_tasks.values():
@@ -5635,6 +5651,7 @@ class LiveMultiBotRunner:
         all_tasks = (
             [dashboard_task, poll_task, zombie_task, model_reload_task,
              heartbeat_task, watchdog_task, staleness_task]
+            + ([learner_task] if learner_task is not None else [])
             + ([self._batch_ticker_task] if hasattr(self, '_batch_ticker_task') else [])
             + list(self._watcher_tasks.values())
             + list(self._ticker_tasks.values())

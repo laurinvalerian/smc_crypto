@@ -1872,9 +1872,27 @@ class RLBrainSuite:
 
         # Execute rollback for all model slots
         try:
-            from continuous_learner import manual_rollback
             for slot_name in ("entry_filter", "exit_classifier"):
-                manual_rollback(slot_name)
+                model_path = self._model_paths.get(slot_name)
+                if not model_path:
+                    continue
+                mp = Path(model_path)
+                # Try _prev.pkl first (backed up by continuous_learner before each retrain)
+                prev_path = mp.with_name(mp.stem + "_prev" + mp.suffix)
+                # Fallback: _v1.pkl (original known-good baseline)
+                v1_path = mp.with_name(mp.stem + "_v1" + mp.suffix)
+                source = None
+                if prev_path.exists():
+                    source = prev_path
+                elif v1_path.exists():
+                    source = v1_path
+                if source is not None:
+                    import shutil
+                    shutil.copy2(source, mp)
+                    logger.info("[ML] Rolled back %s from %s", mp.name, source.name)
+                else:
+                    logger.warning("[ML] No rollback source for %s (tried %s, %s)",
+                                   mp.name, prev_path.name, v1_path.name)
 
             # Remove rollback marker
             rollback_marker.unlink(missing_ok=True)

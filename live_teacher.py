@@ -34,6 +34,7 @@ def analyze_closed_trade(
     candle_data: list[list[float]],
     symbol: str,
     asset_class: str,
+    exit_reason: str = "unknown",
 ) -> dict[str, Any]:
     """Retroactive SMC analysis on a closed trade (synchronous).
 
@@ -75,6 +76,7 @@ def analyze_closed_trade(
             "style": trade.get("style", "day"),
             "outcome": trade.get("outcome", "unknown"),
             "pnl_pct": trade.get("pnl_pct", 0.0),
+            "exit_reason": exit_reason,
         },
         "teacher": {
             "optimal_entry": None,
@@ -270,6 +272,7 @@ def analyze_closed_trade(
             tp_realistic=tp_realistic,
             offset_pips=offset_pips,
             pnl_pct=trade.get("pnl_pct", 0.0),
+            exit_reason=exit_reason,
         )
 
         return {
@@ -285,6 +288,7 @@ def analyze_closed_trade(
                 "style": trade.get("style", "day"),
                 "outcome": trade.get("outcome", "unknown"),
                 "pnl_pct": trade.get("pnl_pct", 0.0),
+                "exit_reason": exit_reason,
             },
             "teacher": {
                 "optimal_entry": optimal_entry,
@@ -346,6 +350,7 @@ def _compute_grade(
     tp_realistic: bool,
     offset_pips: float,
     pnl_pct: float,
+    exit_reason: str = "unknown",
 ) -> str:
     """Assign a letter grade based on teacher analysis."""
     score = 0
@@ -372,7 +377,13 @@ def _compute_grade(
     if pnl_pct > 0:
         score += 1
 
-    # Map score to grade (max 7)
+    # Exit-reason adjustments
+    if exit_reason == "timeout":
+        score -= 1  # Timeout exits are noisy / suboptimal
+    if exit_reason == "tp_hit" and pnl_pct > 0:
+        score += 1  # Clean TP exit bonus
+
+    # Map score to grade (max 8)
     if score >= 7:
         return "A+"
     if score >= 6:
