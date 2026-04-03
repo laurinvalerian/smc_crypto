@@ -8,11 +8,11 @@ account:
   size: 100_000            # USDT starting balance (fixed)
   currency: "USDT"
 
-equity_overrides:              # Virtual equity for sizing (overrides real balance)
-  crypto: 100_000             # Binance testnet has ~5K; normalize to 100K for consistent sizing
-  # forex: 100_000            # OANDA practice: already 100K
-  # stocks: 100_000           # Alpaca paper: already 100K
-  # commodities: 100_000      # OANDA: already 100K
+equity_overrides:              # Fixed equity for sizing (prevents margin lock reducing position sizes)
+  crypto: 100_000             # Binance testnet has ~5K; normalize to 100K
+  stocks: 100_000             # Alpaca: prevent open positions from reducing sizing equity
+  # forex: 100_000            # OANDA practice: already 100K, margin doesn't reduce equity
+  # commodities: 100_000      # OANDA: already 100K, margin doesn't reduce equity
 
 leverage:
   min: 5

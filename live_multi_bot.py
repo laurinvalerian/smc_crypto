@@ -2174,7 +2174,7 @@ class PaperBot:
             self._pending_signal = None
             return
         # ── Global per-style limit ───────────────────────────────
-        # Max 3 per style across all 112 bots (= max 9 total)
+        # Max 5 per style across all 112 bots (= max 15 total)
         _runner = self._runner_ref() if hasattr(self, '_runner_ref') and self._runner_ref else None
         if _runner:
             _style_counts = _runner.get_global_style_counts()
