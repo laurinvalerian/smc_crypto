@@ -31,6 +31,8 @@ app = Flask(__name__)
 RESULTS_DIR = Path("live_results")
 DB_PATH = Path("trade_journal/journal.db")
 LOG_PATH = Path("paper_trading.log")
+LIVE_LOG_PATH = Path("live_results/live_multi.log")
+MODEL_DIR = Path("models")
 
 # =====================================================================
 #  Helpers
@@ -339,37 +341,48 @@ def _aggregate_stats() -> dict:
 
 
 def _get_rl_stats() -> dict:
-    """Parse paper_trading.log for RL/XGB filter stats."""
-    stats = {
+    """Check model files on disk and parse logs for RL/XGB filter stats."""
+    stats: dict = {
         "entry_filter": {"accepted": 0, "rejected": 0, "rate": 0.0},
         "tp_adjusted": 0,
         "be_triggered": 0,
         "models_loaded": [],
     }
-    if not LOG_PATH.exists():
-        return stats
-    try:
-        with open(LOG_PATH) as f:
-            for line in f:
-                if "XGB ACCEPT" in line:
-                    stats["entry_filter"]["accepted"] += 1
-                elif "XGB REJECT" in line:
-                    stats["entry_filter"]["rejected"] += 1
-                elif "RL TP adjusted" in line:
-                    stats["tp_adjusted"] += 1
-                elif "BE TRIGGERED" in line:
-                    stats["be_triggered"] += 1
-                elif "Loaded model:" in line:
-                    m = re.search(r"Loaded model: (\S+)", line)
-                    if m:
-                        stats["models_loaded"].append(m.group(1))
-        total = stats["entry_filter"]["accepted"] + stats["entry_filter"]["rejected"]
-        if total > 0:
-            stats["entry_filter"]["rate"] = round(
-                stats["entry_filter"]["accepted"] / total * 100, 1
-            )
-    except Exception:
-        pass
+
+    # Count loaded models by checking which .pkl files exist
+    if MODEL_DIR.is_dir():
+        for pkl in sorted(MODEL_DIR.glob("rl_*.pkl")):
+            try:
+                stats["models_loaded"].append(pkl.name)
+            except Exception:
+                pass
+        # Also check DQN
+        if (MODEL_DIR / "dqn_exit_manager.zip").exists():
+            stats["models_loaded"].append("dqn_exit_manager.zip")
+
+    # Parse BOTH log files for XGB ACCEPT/REJECT, TP adjusted, BE TRIGGERED
+    for log_path in (LOG_PATH, LIVE_LOG_PATH):
+        if not log_path.exists():
+            continue
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    if "XGB ACCEPT" in line:
+                        stats["entry_filter"]["accepted"] += 1
+                    elif "XGB REJECT" in line:
+                        stats["entry_filter"]["rejected"] += 1
+                    elif "RL TP adjusted" in line:
+                        stats["tp_adjusted"] += 1
+                    elif "BE TRIGGERED" in line:
+                        stats["be_triggered"] += 1
+        except Exception:
+            pass
+
+    total = stats["entry_filter"]["accepted"] + stats["entry_filter"]["rejected"]
+    if total > 0:
+        stats["entry_filter"]["rate"] = round(
+            stats["entry_filter"]["accepted"] / total * 100, 1
+        )
     return stats
 
 
@@ -677,78 +690,6 @@ def api_rl_stats():
 @app.route("/api/public/near-misses")
 def api_near_misses():
     return jsonify(_get_near_misses(50))
-
-
-@app.route("/api/public/paper-grid")
-def api_paper_grid():
-    """Return Paper Grid variant performance and recent trades."""
-    state_path = Path("paper_grid_results/paper_grid_state.json")
-    if not state_path.exists():
-        return jsonify({"variants": [], "recent_trades": []})
-    try:
-        with open(state_path) as f:
-            state = json.load(f)
-    except Exception:
-        return jsonify({"variants": [], "recent_trades": []})
-
-    variants = []
-    all_trades: list[dict] = []
-
-    for name, data in state.items():
-        equity = data.get("equity", 0.0)
-        peak = data.get("peak_equity", equity)
-        total_pnl = data.get("total_pnl", 0.0)
-        n_wins = data.get("n_wins", 0)
-        n_losses = data.get("n_losses", 0)
-        n_be = data.get("n_breakeven", 0)
-        trades_list = data.get("trades", [])
-        n_trades = n_wins + n_losses + n_be
-
-        win_rate = round(n_wins / n_trades * 100, 1) if n_trades > 0 else 0.0
-        drawdown_pct = round((peak - equity) / peak * 100, 2) if peak > 0 else 0.0
-
-        # Profit factor from closed trades
-        gross_win = sum(t.get("pnl", 0) for t in trades_list if t.get("pnl", 0) > 0)
-        gross_loss = abs(sum(t.get("pnl", 0) for t in trades_list if t.get("pnl", 0) < 0))
-        if gross_loss > 0:
-            pf = round(gross_win / gross_loss, 2)
-        elif gross_win > 0:
-            pf = 999.0
-        else:
-            pf = 0.0
-
-        variants.append({
-            "name": name,
-            "equity": round(equity, 2),
-            "total_pnl": round(total_pnl, 2),
-            "trades": n_trades,
-            "wins": n_wins,
-            "losses": n_losses,
-            "win_rate": win_rate,
-            "drawdown_pct": -drawdown_pct,
-            "profit_factor": pf,
-        })
-
-        for t in trades_list:
-            all_trades.append({
-                "variant": name,
-                "symbol": t.get("symbol", ""),
-                "direction": t.get("direction", ""),
-                "entry_price": t.get("entry_price"),
-                "exit_price": t.get("exit_price"),
-                "pnl": round(t.get("pnl", 0), 2),
-                "outcome": t.get("outcome", ""),
-                "entry_time": t.get("entry_time", ""),
-                "exit_time": t.get("exit_time", ""),
-            })
-
-    variants.sort(key=lambda v: v["total_pnl"], reverse=True)
-
-    # Last 20 trades across all variants, sorted by exit_time descending
-    all_trades.sort(key=lambda t: t.get("exit_time") or "", reverse=True)
-    recent_trades = all_trades[:20]
-
-    return jsonify({"variants": variants, "recent_trades": recent_trades})
 
 
 @app.route("/api/public/risk")
@@ -1503,29 +1444,6 @@ a:hover{text-decoration:underline}
     <div></div>
   </div>
 
-  <!-- Paper Grid -->
-  <div class="section">
-    <div class="section-title">Paper Grid — Variant Performance</div>
-    <div class="tbl-scroll">
-      <table class="tbl" id="pg-variants-table">
-        <thead><tr>
-          <th>Variant</th><th>Equity ($)</th><th>PnL ($)</th><th>Trades</th>
-          <th>Win Rate (%)</th><th>PF</th><th>DD (%)</th>
-        </tr></thead>
-        <tbody id="pg-variants-body"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody>
-      </table>
-    </div>
-    <div class="section-title" style="margin-top:16px;padding-top:12px;border-top:1px solid #21262d">Recent Paper Grid Trades</div>
-    <div class="tbl-scroll">
-      <table class="tbl" id="pg-trades-table">
-        <thead><tr>
-          <th>Variant</th><th>Symbol</th><th>Direction</th><th>PnL ($)</th><th>Outcome</th><th>Time</th>
-        </tr></thead>
-        <tbody id="pg-trades-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
   <div class="grid-2">
     <!-- Connection Status -->
     <div class="section">
@@ -1974,64 +1892,6 @@ function updateConnections(d){
 }
 fetchJ('/api/public/connections', updateConnections);
 setInterval(function(){ fetchJ('/api/public/connections', updateConnections); }, 15000);
-
-// ── Paper Grid ───────────────────────────────────────────────────
-
-function updatePaperGrid(d){
-  var vBody = $('pg-variants-body');
-  var tBody = $('pg-trades-body');
-  if(!d){ return; }
-
-  // Variant table
-  var variants = d.variants || [];
-  if(!variants.length){
-    vBody.innerHTML = '<tr><td colspan="7" class="empty">No data yet</td></tr>';
-  } else {
-    var vHtml = '';
-    for(var i=0; i<variants.length; i++){
-      var v = variants[i];
-      var pnlCls = pnlColor(v.total_pnl);
-      var wrCls = (v.win_rate >= 50) ? 'green' : '';
-      vHtml += '<tr>';
-      vHtml += '<td style="font-weight:600">'+escHtml(v.name)+'</td>';
-      vHtml += '<td>$'+fmt(v.equity,2)+'</td>';
-      vHtml += '<td class="'+pnlCls+'">'+(v.total_pnl >= 0 ? '+' : '')+'$'+fmt(v.total_pnl,2)+'</td>';
-      vHtml += '<td>'+v.trades+'</td>';
-      vHtml += '<td class="'+wrCls+'">'+fmt(v.win_rate,1)+'%</td>';
-      vHtml += '<td>'+(v.profit_factor >= 999 ? 'INF' : fmt(v.profit_factor,2))+'</td>';
-      vHtml += '<td class="'+(v.drawdown_pct < 0 ? 'red' : '')+'">'+fmt(v.drawdown_pct,2)+'%</td>';
-      vHtml += '</tr>';
-    }
-    vBody.innerHTML = vHtml;
-  }
-
-  // Recent trades table (last 10)
-  var trades = (d.recent_trades || []).slice(0, 10);
-  if(!trades.length){
-    tBody.innerHTML = '<tr><td colspan="6" class="empty">No trades yet</td></tr>';
-  } else {
-    var trHtml = '';
-    for(var j=0; j<trades.length; j++){
-      var t = trades[j];
-      var rowBg = t.outcome === 'win' ? 'background:rgba(63,185,80,0.08)' : t.outcome === 'loss' ? 'background:rgba(248,81,73,0.08)' : '';
-      var ocCls = t.outcome === 'win' ? 'green' : t.outcome === 'loss' ? 'red' : '';
-      var timeStr = t.exit_time ? t.exit_time.substring(0,16) : '--';
-      var dir = t.direction ? (t.direction.charAt(0).toUpperCase() + t.direction.slice(1)) : '--';
-      trHtml += '<tr style="'+rowBg+'">';
-      trHtml += '<td>'+escHtml(t.variant)+'</td>';
-      trHtml += '<td>'+escHtml(t.symbol)+'</td>';
-      trHtml += '<td>'+escHtml(dir)+'</td>';
-      trHtml += '<td class="'+pnlColor(t.pnl)+'">'+(t.pnl >= 0 ? '+' : '')+'$'+fmt(t.pnl,2)+'</td>';
-      trHtml += '<td class="'+ocCls+'">'+(t.outcome ? t.outcome.charAt(0).toUpperCase()+t.outcome.slice(1) : '--')+'</td>';
-      trHtml += '<td style="white-space:nowrap">'+escHtml(timeStr)+'</td>';
-      trHtml += '</tr>';
-    }
-    tBody.innerHTML = trHtml;
-  }
-}
-
-fetchJ('/api/public/paper-grid', updatePaperGrid);
-setInterval(function(){ fetchJ('/api/public/paper-grid', updatePaperGrid); }, 15000);
 
 // ── Active Trades with Charts + Unrealized PnL ──────────────────
 var _atCharts = {};

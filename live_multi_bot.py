@@ -2320,6 +2320,7 @@ class PaperBot:
                 score=score,
                 tier=tier,
                 style=style,
+                features=sig.get("features", {}),
             )
         )
         # Unpack — oanda_trade_id is optional (7th element, None for non-OANDA)
@@ -2423,6 +2424,7 @@ class PaperBot:
         score: float,
         tier: str = TIER_AAA_PLUS,
         style: str = STYLE_DAY,
+        features: dict[str, Any] | None = None,
     ) -> tuple[str | None, str | None, str | None, float, float, int]:
         """
         Execute a bracket order with tier-based risk allocation.
@@ -2450,6 +2452,19 @@ class PaperBot:
 
         dynamic_risk = base_risk + (max_risk - base_risk) * combined_factor
         dynamic_risk = max(base_risk, min(dynamic_risk, max_risk))
+
+        # Apply RL position sizer multiplier
+        if self.rl_suite is not None and self.rl_suite.sizing_enabled:
+            sizing_mult = self.rl_suite.predict_sizing_multiplier(
+                features if features else {}
+            )
+            if abs(sizing_mult - 1.0) > 0.01:
+                old_risk = dynamic_risk
+                dynamic_risk = max(base_risk, min(dynamic_risk * sizing_mult, max_risk))
+                self.logger.info(
+                    "[RL SIZING] %s: mult=%.2f, risk %.3f%% -> %.3f%%",
+                    symbol, sizing_mult, old_risk * 100, dynamic_risk * 100,
+                )
 
         self.logger.info(
             "[TIER RISK] %s|%s | score=%.2f RR=%.1f → risk=%.3f%% "

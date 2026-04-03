@@ -1704,11 +1704,22 @@ class RLBrainSuite:
             exit_cfg.get("model_path", "models/rl_exit_classifier.pkl")
         ) if self.exit_enabled else None
 
+        # Position sizer
+        ps_cfg = rl_cfg.get("position_sizer", {})
+        self.sizing_enabled = ps_cfg.get("enabled", False)
+        self._sizing_target_rr = ps_cfg.get("target_rr", 3.0)
+        self._sizing_min_mult = ps_cfg.get("min_multiplier", 0.33)
+        self._sizing_max_mult = ps_cfg.get("max_multiplier", 1.5)
+        self._sizing_model = self._load_model(
+            ps_cfg.get("model_path", "models/rl_position_sizer.pkl")
+        ) if self.sizing_enabled else None
+
         active = []
         if self._entry_filter: active.append("entry_filter")
         if self._tp_model: active.append("tp_optimizer")
         if self._be_model: active.append("be_manager")
         if self._exit_model: active.append("exit_classifier")
+        if self._sizing_model: active.append("position_sizer")
         logger.info("RLBrainSuite initialized: %s", active if active else "no models loaded")
 
         # Hot-swap: track model file mtimes for live reload
@@ -1717,6 +1728,7 @@ class RLBrainSuite:
             "tp_optimizer": tp_cfg.get("model_path", "models/rl_tp_optimizer.pkl"),
             "be_manager": be_cfg.get("model_path", "models/rl_be_manager.pkl"),
             "exit_classifier": exit_cfg.get("model_path", "models/rl_exit_classifier.pkl"),
+            "position_sizer": ps_cfg.get("model_path", "models/rl_position_sizer.pkl"),
         }
         self._model_mtimes: dict[str, float] = {}
         for name, mpath in self._model_paths.items():
@@ -1765,6 +1777,7 @@ class RLBrainSuite:
             "tp_optimizer": "_tp_model",
             "be_manager": "_be_model",
             "exit_classifier": "_exit_model",
+            "position_sizer": "_sizing_model",
         }
 
         for slot_name, model_path_str in self._model_paths.items():
@@ -1972,6 +1985,25 @@ class RLBrainSuite:
             predicted_be = max(predicted_be, cost_rr * 2.0)
 
         return min(predicted_be, 3.0)  # cap at 3R
+
+    def predict_sizing_multiplier(self, features: dict[str, float]) -> float:
+        """Predict risk multiplier for position sizing.
+
+        Returns a multiplier in [min_multiplier, max_multiplier] range.
+        Higher predicted RR -> higher multiplier -> bigger position.
+        """
+        if not self.sizing_enabled or self._sizing_model is None:
+            return 1.0
+        try:
+            x = self._build_features(features, self._sizing_model)
+            predicted_rr = float(self._sizing_model["model"].predict(x)[0])
+            # Map predicted RR -> risk multiplier
+            mult = predicted_rr / self._sizing_target_rr
+            mult = max(self._sizing_min_mult, min(self._sizing_max_mult, mult))
+            return mult
+        except Exception as exc:
+            logger.debug("Sizing prediction error: %s", exc)
+            return 1.0
 
     def predict_early_exit(
         self, bar_features: dict[str, float],
