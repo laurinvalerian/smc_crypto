@@ -3718,9 +3718,11 @@ class LiveMultiBotRunner:
         self,
         bots: list[PaperBot],
         adapters: dict[str, ExchangeAdapter],
+        config: dict[str, Any] | None = None,
     ) -> None:
         self.bots = bots
         self.adapters = adapters
+        self.config = config or {}
         # Crypto adapter for WebSocket feeds
         self._crypto_adapter = adapters.get("crypto")
         self.brain = None  # Legacy PPO brain, no longer used
@@ -5794,7 +5796,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     logger.info("History loaded for all %d instruments.", len(bots))
 
     # ── Runner ────────────────────────────────────────────────────
-    runner = LiveMultiBotRunner(bots=bots, adapters=adapters)
+    runner = LiveMultiBotRunner(bots=bots, adapters=adapters, config=config)
 
     # ── Sync initial equity from exchange for bots without saved state ─
     seen_adapters: dict[int, float] = {}
