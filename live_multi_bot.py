@@ -525,6 +525,7 @@ class PaperBot:
         self.equity: float = 0.0  # set later by Runner with real balance
         self.peak_equity: float = 0.0  # managed by Runner
         self._account_equity: float = 0.0  # real account equity, set by Runner
+        self._equity_override: float = 0.0  # virtual equity for sizing (from config equity_overrides)
 
         # Tracking
         self.total_pnl: float = 0.0
@@ -2912,14 +2913,20 @@ class PaperBot:
         totalMarginBalance) and Alpaca (equity); OANDA total is deposited
         balance only.  Acceptable for paper trading — position sizing drift
         from unrealized PnL is negligible at current scale.
-        TODO: add sizing_equity() to adapter base class for funded accounts
-        that returns deposited capital without unrealized PnL.
+
+        If equity_overrides is configured for this asset class (e.g., crypto
+        testnet has ~5K but we want 100K sizing), returns the override value
+        instead of the real balance.
         """
         if self.adapter is None:
             return None
         try:
             bal = await self.adapter.fetch_balance()
-            return float(bal.total)
+            real = float(bal.total)
+            # Apply equity override for consistent sizing across asset classes
+            if self._equity_override and self._equity_override > 0:
+                return self._equity_override
+            return real
         except Exception as exc:
             self.logger.warning("fetch_balance failed: %s", exc)
             return None
@@ -5773,6 +5780,10 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             adapter=adapters[ac],
             rl_suite=rl_suite,
         )
+        # Apply equity override for consistent sizing (e.g., crypto testnet 5K → 100K)
+        eq_override = config.get("equity_overrides", {}).get(ac, 0)
+        if eq_override and eq_override > 0:
+            bot._equity_override = float(eq_override)
         bots.append(bot)
 
     console.print(f"[bold green]{len(bots)} bots created.[/bold green]")
@@ -5799,30 +5810,40 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     runner = LiveMultiBotRunner(bots=bots, adapters=adapters, config=config)
 
     # ── Sync initial equity from exchange for bots without saved state ─
+    equity_overrides = config.get("equity_overrides", {})
     seen_adapters: dict[int, float] = {}
+    class_equity: dict[str, float] = {}
     for ac, adapter in adapters.items():
         aid = id(adapter)
         if aid in seen_adapters:
+            class_equity[ac] = seen_adapters[aid]
             continue
         try:
             bal = await adapter.fetch_balance()
             real_equity = bal.total if bal else 0.0
+            override = equity_overrides.get(ac)
+            if override and override > 0:
+                logger.info("Initial equity [%s]: real=%.2f, override=%.0f (virtual sizing)", ac, real_equity, override)
+                real_equity = float(override)
+            else:
+                logger.info("Initial equity [%s]: %.2f", ac, real_equity)
             seen_adapters[aid] = real_equity
-            logger.info("Initial equity [%s]: %.2f", ac, real_equity)
+            class_equity[ac] = real_equity
         except Exception as exc:
             logger.warning("Failed to fetch initial equity [%s]: %s", ac, exc)
-            seen_adapters[aid] = 0.0
+            override = equity_overrides.get(ac)
+            seen_adapters[aid] = float(override) if override else 0.0
+            class_equity[ac] = seen_adapters[aid]
 
     for bot in bots:
         if bot.equity <= 0:
-            adapter_equity = seen_adapters.get(id(adapters.get(bot.asset_class)), 0.0)
+            adapter_equity = class_equity.get(bot.asset_class, 0.0)
             if adapter_equity > 0:
                 bot.equity = adapter_equity
                 bot.peak_equity = adapter_equity
                 bot._account_equity = adapter_equity
 
-    equity_summary = {ac: seen_adapters.get(id(adapters.get(ac)), 0.0) for ac in adapters}
-    logger.info("Equity synced: %s", equity_summary)
+    logger.info("Equity synced: %s", {ac: class_equity.get(ac, 0.0) for ac in adapters})
 
     # Signal handlers
     loop = asyncio.get_event_loop()
