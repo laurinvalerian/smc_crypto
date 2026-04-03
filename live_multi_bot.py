@@ -293,7 +293,7 @@ TIER_SKIP_FLAGS: dict[str, list[str]] = {
 # Per-symbol, not per-class: 28 forex pairs × 3 = 84 theoretical max per class.
 # Portfolio-level protection comes from circuit breakers (daily -3%, weekly -5%).
 MAX_SIGNALS_PER_SYMBOL_4H: dict[str, int] = {
-    "crypto": 5, "forex": 3, "stocks": 5, "commodities": 2,
+    "crypto": 10, "forex": 10, "stocks": 10, "commodities": 5,
 }
 
 # ── Asset-Class IDs for RL Brain ─────────────────────────────────
