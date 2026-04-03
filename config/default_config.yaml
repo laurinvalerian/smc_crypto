@@ -8,11 +8,8 @@ account:
   size: 100_000            # USDT starting balance (fixed)
   currency: "USDT"
 
-equity_overrides:              # Starting equity for sizing (override + total_pnl = sizing equity)
-  crypto: 100_000             # Binance testnet has ~5K; normalize to 100K
-  stocks: 100_000             # Alpaca: prevents margin lock from shrinking position sizes
-  # forex: 100_000            # OANDA: margin doesn't reduce bal.total, no override needed
-  # commodities: 100_000      # OANDA: same as forex
+equity_multipliers:            # Multiplier on real balance for sizing (dynamic — scales with P&L)
+  crypto: 20                  # Binance testnet ~5K * 20 = 100K equivalent, scales with real balance
 
 leverage:
   min: 5
@@ -239,18 +236,14 @@ rl_brain:
     model_path: "models/rl_be_manager.pkl"
     min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
     fee_buffer: true         # Add fee buffer when moving to BE
-
-# ═══════════════════════════════════════════════════════
-# Exit Classifier Configuration (Phase 2A)
-# ═══════════════════════════════════════════════════════
-exit_classifier:
-  enabled: true                     # AUC 0.68, Sharpe +381% in backtest
-  confidence_threshold: 0.65        # Optimal balance at 46% exit rate, +82% Sharpe
-  model_path: "models/rl_exit_classifier.pkl"
-  min_favorable_rr: 0.5            # Only consider exit after 0.5R favorable
-  min_bars_held: 6                  # Minimum 30 minutes before ML exit
-  shadow_log: true                  # Log predictions even when disabled
-  be_ratchet_priority: true         # Suppress between 0.5R and BE trigger level
+  exit_classifier:
+    enabled: true                   # AUC 0.68, Sharpe +381% in backtest
+    confidence_threshold: 0.65      # Optimal balance at 46% exit rate, +82% Sharpe
+    model_path: "models/rl_exit_classifier.pkl"
+    min_favorable_rr: 0.5          # Only consider exit after 0.5R favorable
+    min_bars_held: 6                # Minimum 30 minutes before ML exit
+    shadow_log: true                # Log predictions even when disabled
+    be_ratchet_priority: true       # Suppress between 0.5R and BE trigger level
 
 # ═══════════════════════════════════════════════════════
 # DQN Exit Manager Configuration (Phase 2B)

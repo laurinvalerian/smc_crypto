@@ -525,7 +525,7 @@ class PaperBot:
         self.equity: float = 0.0  # set later by Runner with real balance
         self.peak_equity: float = 0.0  # managed by Runner
         self._account_equity: float = 0.0  # real account equity, set by Runner
-        self._equity_override: float = 0.0  # virtual equity for sizing (from config equity_overrides)
+        self._equity_multiplier: float = 1.0  # balance multiplier for sizing (e.g., 20x for Binance testnet)
 
         # Tracking
         self.total_pnl: float = 0.0
@@ -2914,21 +2914,16 @@ class PaperBot:
         balance only.  Acceptable for paper trading — position sizing drift
         from unrealized PnL is negligible at current scale.
 
-        If equity_overrides is configured for this asset class (e.g., crypto
-        testnet has ~5K but we want 100K sizing), returns the override as
-        starting equity plus cumulative P&L — so sizing scales with performance.
+        If equity_multipliers is configured for this asset class (e.g., crypto
+        testnet 5K * 20x = 100K), the real balance is multiplied. This is fully
+        dynamic — when the real balance grows/shrinks, sizing scales with it.
         """
         if self.adapter is None:
             return None
         try:
             bal = await self.adapter.fetch_balance()
             real = float(bal.total)
-            # Apply equity override: start at override, adjust with realized P&L
-            # This prevents margin lock from reducing sizing while still scaling
-            # with wins/losses (e.g., 100K + $2K profit = size at 102K)
-            if self._equity_override and self._equity_override > 0:
-                return self._equity_override + self.total_pnl
-            return real
+            return real * self._equity_multiplier
         except Exception as exc:
             self.logger.warning("fetch_balance failed: %s", exc)
             return None
@@ -3756,10 +3751,9 @@ class LiveMultiBotRunner:
             bot.circuit_breaker = self.circuit_breaker
 
         # ── Paper Grid (Multi-Variant A/B Testing) ───────────────
-        self.paper_grid = PaperGrid()
-        self.paper_grid.load_state()  # resume from crash
-        for bot in self.bots:
-            bot.paper_grid = self.paper_grid
+        # Disabled: main bot's tier-based risk is well-calibrated from backtesting.
+        # Continuous learner now handles adaptation. Re-enable when needed.
+        self.paper_grid = None
 
         # ── Trade Journal (lifecycle logger for ML training data) ─
         self.journal = TradeJournal("trade_journal/journal.db")
@@ -5782,10 +5776,10 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             adapter=adapters[ac],
             rl_suite=rl_suite,
         )
-        # Apply equity override for consistent sizing (e.g., crypto testnet 5K → 100K)
-        eq_override = config.get("equity_overrides", {}).get(ac, 0)
-        if eq_override and eq_override > 0:
-            bot._equity_override = float(eq_override)
+        # Apply equity multiplier for sizing (e.g., crypto testnet 5K * 20x = 100K)
+        eq_mult = config.get("equity_multipliers", {}).get(ac, 1)
+        if eq_mult and eq_mult > 1:
+            bot._equity_multiplier = float(eq_mult)
         bots.append(bot)
 
     console.print(f"[bold green]{len(bots)} bots created.[/bold green]")
@@ -5812,7 +5806,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     runner = LiveMultiBotRunner(bots=bots, adapters=adapters, config=config)
 
     # ── Sync initial equity from exchange for bots without saved state ─
-    equity_overrides = config.get("equity_overrides", {})
+    equity_multipliers = config.get("equity_multipliers", {})
     seen_adapters: dict[int, float] = {}
     class_equity: dict[str, float] = {}
     for ac, adapter in adapters.items():
@@ -5823,19 +5817,19 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
         try:
             bal = await adapter.fetch_balance()
             real_equity = bal.total if bal else 0.0
-            override = equity_overrides.get(ac)
-            if override and override > 0:
-                logger.info("Initial equity [%s]: real=%.2f, override=%.0f (virtual sizing)", ac, real_equity, override)
-                real_equity = float(override)
+            multiplier = equity_multipliers.get(ac)
+            if multiplier and multiplier > 1:
+                sized_equity = real_equity * float(multiplier)
+                logger.info("Initial equity [%s]: real=%.2f, multiplier=%dx → %.0f (dynamic sizing)", ac, real_equity, multiplier, sized_equity)
+                real_equity = sized_equity
             else:
                 logger.info("Initial equity [%s]: %.2f", ac, real_equity)
             seen_adapters[aid] = real_equity
             class_equity[ac] = real_equity
         except Exception as exc:
             logger.warning("Failed to fetch initial equity [%s]: %s", ac, exc)
-            override = equity_overrides.get(ac)
-            seen_adapters[aid] = float(override) if override else 0.0
-            class_equity[ac] = seen_adapters[aid]
+            seen_adapters[aid] = 0.0
+            class_equity[ac] = 0.0
 
     for bot in bots:
         if bot.equity <= 0:
