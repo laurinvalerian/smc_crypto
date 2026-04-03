@@ -8,11 +8,11 @@ account:
   size: 100_000            # USDT starting balance (fixed)
   currency: "USDT"
 
-equity_overrides:              # Fixed equity for sizing (prevents margin lock reducing position sizes)
+equity_overrides:              # Starting equity for sizing (override + total_pnl = sizing equity)
   crypto: 100_000             # Binance testnet has ~5K; normalize to 100K
-  stocks: 100_000             # Alpaca: prevent open positions from reducing sizing equity
-  # forex: 100_000            # OANDA practice: already 100K, margin doesn't reduce equity
-  # commodities: 100_000      # OANDA: already 100K, margin doesn't reduce equity
+  stocks: 100_000             # Alpaca: prevents margin lock from shrinking position sizes
+  # forex: 100_000            # OANDA: margin doesn't reduce bal.total, no override needed
+  # commodities: 100_000      # OANDA: same as forex
 
 leverage:
   min: 5
