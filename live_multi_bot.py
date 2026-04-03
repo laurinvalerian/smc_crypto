@@ -2915,17 +2915,19 @@ class PaperBot:
         from unrealized PnL is negligible at current scale.
 
         If equity_overrides is configured for this asset class (e.g., crypto
-        testnet has ~5K but we want 100K sizing), returns the override value
-        instead of the real balance.
+        testnet has ~5K but we want 100K sizing), returns the override as
+        starting equity plus cumulative P&L — so sizing scales with performance.
         """
         if self.adapter is None:
             return None
         try:
             bal = await self.adapter.fetch_balance()
             real = float(bal.total)
-            # Apply equity override for consistent sizing across asset classes
+            # Apply equity override: start at override, adjust with realized P&L
+            # This prevents margin lock from reducing sizing while still scaling
+            # with wins/losses (e.g., 100K + $2K profit = size at 102K)
             if self._equity_override and self._equity_override > 0:
-                return self._equity_override
+                return self._equity_override + self.total_pnl
             return real
         except Exception as exc:
             self.logger.warning("fetch_balance failed: %s", exc)
