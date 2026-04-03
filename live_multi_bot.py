@@ -525,7 +525,7 @@ class PaperBot:
         self.equity: float = 0.0  # set later by Runner with real balance
         self.peak_equity: float = 0.0  # managed by Runner
         self._account_equity: float = 0.0  # real account equity, set by Runner
-        self._equity_multiplier: float = 1.0  # balance multiplier for sizing (e.g., 20x for Binance testnet)
+        self._display_multiplier: float = 1.0  # dashboard-only multiplier (does NOT affect trading)
 
         # Tracking
         self.total_pnl: float = 0.0
@@ -2936,16 +2936,14 @@ class PaperBot:
         balance only.  Acceptable for paper trading — position sizing drift
         from unrealized PnL is negligible at current scale.
 
-        If equity_multipliers is configured for this asset class (e.g., crypto
-        testnet 5K * 20x = 100K), the real balance is multiplied. This is fully
-        dynamic — when the real balance grows/shrinks, sizing scales with it.
+        Returns real account equity from the exchange. No multipliers —
+        trading always uses real balance for position sizing.
         """
         if self.adapter is None:
             return None
         try:
             bal = await self.adapter.fetch_balance()
-            real = float(bal.total)
-            return real * self._equity_multiplier
+            return float(bal.total)
         except Exception as exc:
             self.logger.warning("fetch_balance failed: %s", exc)
             return None
@@ -5798,10 +5796,10 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             adapter=adapters[ac],
             rl_suite=rl_suite,
         )
-        # Apply equity multiplier for sizing (e.g., crypto testnet 5K * 20x = 100K)
-        eq_mult = config.get("equity_multipliers", {}).get(ac, 1)
-        if eq_mult and eq_mult > 1:
-            bot._equity_multiplier = float(eq_mult)
+        # Display multiplier for dashboard (does NOT affect trading)
+        disp_mult = config.get("equity_display_multipliers", {}).get(ac, 1)
+        if disp_mult and disp_mult > 1:
+            bot._display_multiplier = float(disp_mult)
         bots.append(bot)
 
     console.print(f"[bold green]{len(bots)} bots created.[/bold green]")
@@ -5828,7 +5826,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     runner = LiveMultiBotRunner(bots=bots, adapters=adapters, config=config)
 
     # ── Sync initial equity from exchange for bots without saved state ─
-    equity_multipliers = config.get("equity_multipliers", {})
+    display_multipliers = config.get("equity_display_multipliers", {})
     seen_adapters: dict[int, float] = {}
     class_equity: dict[str, float] = {}
     for ac, adapter in adapters.items():
@@ -5839,11 +5837,9 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
         try:
             bal = await adapter.fetch_balance()
             real_equity = bal.total if bal else 0.0
-            multiplier = equity_multipliers.get(ac)
-            if multiplier and multiplier > 1:
-                sized_equity = real_equity * float(multiplier)
-                logger.info("Initial equity [%s]: real=%.2f, multiplier=%dx → %.0f (dynamic sizing)", ac, real_equity, multiplier, sized_equity)
-                real_equity = sized_equity
+            disp_mult = display_multipliers.get(ac, 1)
+            if disp_mult and disp_mult > 1:
+                logger.info("Initial equity [%s]: %.2f (dashboard: ×%d = %.0f)", ac, real_equity, disp_mult, real_equity * disp_mult)
             else:
                 logger.info("Initial equity [%s]: %.2f", ac, real_equity)
             seen_adapters[aid] = real_equity

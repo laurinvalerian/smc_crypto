@@ -8,8 +8,8 @@ account:
   size: 100_000            # USDT starting balance (fixed)
   currency: "USDT"
 
-equity_multipliers:            # Multiplier on real balance for sizing (dynamic — scales with P&L)
-  crypto: 20                  # Binance testnet ~5K * 20 = 100K equivalent, scales with real balance
+equity_display_multipliers:    # Dashboard-only multiplier (does NOT affect trading/sizing)
+  crypto: 20                  # Binance testnet ~5K * 20 = 100K equivalent on dashboard
 
 leverage:
   min: 5
