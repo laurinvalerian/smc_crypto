@@ -288,7 +288,7 @@ continuous_learner:
     B: 1.0
     C: 1.0
     D: 1.5
-  timeout_weight: 0.5                # Weight multiplier for timeout exits (noisy signal)
+  timeout_weight: 2.0                # Weight multiplier for timeout exits (informative negatives)
 
 # ═══════════════════════════════════════════════════════
 # Trade Journal Configuration

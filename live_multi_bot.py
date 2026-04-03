@@ -361,6 +361,7 @@ STYLE_SCALP = "scalp"
 STYLE_DAY = "day"
 STYLE_SWING = "swing"
 MAX_PER_STYLE_GLOBAL = 5  # max 5 swing + 5 day + 5 scalp = 15 total across all bots
+MAX_CONCURRENT_REJECTION_WATCHERS = 50  # cap async outcome watchers for rejected signals
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
@@ -602,6 +603,7 @@ class PaperBot:
         # RL monitoring stats
         self._rl_accepted: int = 0
         self._rl_rejected: int = 0
+        self._rejection_watcher_count: int = 0
         # Store last obs so we can record reward when trade closes
         self._pending_obs: np.ndarray | None = None
 
@@ -2239,6 +2241,23 @@ class PaperBot:
                         self.rl_suite.confidence_threshold,
                         self.asset_class, direction,
                     )
+                # Log rejected signal to journal for counterfactual analysis
+                if self.journal is not None and self._rejection_watcher_count < MAX_CONCURRENT_REJECTION_WATCHERS:
+                    try:
+                        self.journal.record_rejected_signal(
+                            symbol=symbol,
+                            asset_class=self.asset_class,
+                            direction=direction,
+                            entry_price=price,
+                            sl_price=sl,
+                            tp_price=tp,
+                            xgb_confidence=rl_confidence,
+                            alignment_score=score,
+                            entry_features=sig.get("features"),
+                        )
+                        self._rejection_watcher_count += 1
+                    except Exception as exc:
+                        self.logger.debug("Failed to log rejected signal: %s", exc)
                 self._pending_signal = None
                 return
             self._rl_accepted += 1

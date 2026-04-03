@@ -115,7 +115,7 @@ def collect_live_data(
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT trade_id, entry_features, outcome, pnl_pct, exit_reason, "
-            "score, style, asset_class, direction "
+            "score, style, asset_class, direction, rr_actual, max_favorable_pct "
             "FROM trades "
             "WHERE exit_time IS NOT NULL "
             "AND entry_features IS NOT NULL "
@@ -153,6 +153,8 @@ def collect_live_data(
         record["outcome"] = row["outcome"]
         record["pnl_pct"] = row["pnl_pct"] or 0.0
         record["exit_reason"] = row["exit_reason"] or ""
+        record["rr_actual"] = row["rr_actual"] or 0.0
+        record["max_favorable_pct"] = row["max_favorable_pct"] or 0.0
         records.append(record)
 
     dropped = len(rows) - len(records)
@@ -179,10 +181,27 @@ def collect_live_data(
     timeout_mask = df["exit_reason"] == "timeout"
     weights[timeout_mask.values] *= timeout_weight
 
+    # P1: RR-proportional weighting (bigger wins AND bigger losses learn more)
+    if "rr_actual" in df.columns:
+        rr_vals = df["rr_actual"].abs().clip(0.1, 3.0).values
+        weights *= rr_vals
+
+    # P5: High MFE losses = good entry, bad exit → reduce weight
+    # Only when MFE > 1.5R AND loss is small (|RR| < 0.5)
+    if "max_favorable_pct" in df.columns and "rr_actual" in df.columns:
+        mfe_rr = df["max_favorable_pct"].values  # already in R-multiples approximately
+        loss_mask = df["label"].values == 0
+        small_loss = df["rr_actual"].abs().values < 0.5
+        good_entry = mfe_rr > 1.5
+        weights[loss_mask & good_entry & small_loss] *= 0.5
+
+    # Cap combined weights to prevent stacking (base 2.0 * grade 1.5 * timeout 2.0 * RR 3.0 = 18x max)
+    weights = np.clip(weights, 0.1, 6.0)
+
     df["sample_weight"] = weights
 
     # Drop helper columns
-    df.drop(columns=["trade_id", "outcome", "pnl_pct", "exit_reason"], inplace=True)
+    df.drop(columns=["trade_id", "outcome", "pnl_pct", "exit_reason", "rr_actual", "max_favorable_pct"], inplace=True)
 
     logger.info("Collected %d live trades (%d wins, %d losses)",
                 len(df), int(df["label"].sum()), int((df["label"] == 0).sum()))

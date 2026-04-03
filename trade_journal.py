@@ -97,11 +97,31 @@ CREATE TABLE IF NOT EXISTS post_trade_bars (
 )
 """
 
+_CREATE_REJECTED_SIGNALS = """
+CREATE TABLE IF NOT EXISTS rejected_signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    asset_class     TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    entry_price     REAL,
+    sl_price        REAL,
+    tp_price        REAL,
+    xgb_confidence  REAL,
+    alignment_score REAL,
+    entry_features  TEXT,
+    outcome_50bar   TEXT,
+    max_favorable   REAL,
+    max_adverse     REAL
+)
+"""
+
 _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_trade_bars_trade ON trade_bars(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_post_bars_trade  ON post_trade_bars(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_trades_symbol    ON trades(symbol)",
     "CREATE INDEX IF NOT EXISTS idx_trades_class     ON trades(asset_class)",
+    "CREATE INDEX IF NOT EXISTS idx_rejected_symbol  ON rejected_signals(symbol)",
 ]
 
 
@@ -128,6 +148,7 @@ class TradeJournal:
         self._conn.execute(_CREATE_TRADES)
         self._conn.execute(_CREATE_TRADE_BARS)
         self._conn.execute(_CREATE_POST_BARS)
+        self._conn.execute(_CREATE_REJECTED_SIGNALS)
         for idx_sql in _CREATE_INDEXES:
             self._conn.execute(idx_sql)
         self._conn.commit()
@@ -262,6 +283,37 @@ class TradeJournal:
             self._max_favorable.pop(trade_id, None)
         except Exception as exc:
             logger.error("journal.close_trade failed for %s: %s", trade_id, exc)
+
+    def record_rejected_signal(
+        self,
+        symbol: str,
+        asset_class: str,
+        direction: str,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        xgb_confidence: float,
+        alignment_score: float,
+        entry_features: dict[str, float] | None = None,
+    ) -> None:
+        """Record a signal rejected by the XGBoost entry filter."""
+        try:
+            self._conn.execute(
+                """INSERT INTO rejected_signals
+                   (timestamp, symbol, asset_class, direction, entry_price,
+                    sl_price, tp_price, xgb_confidence, alignment_score,
+                    entry_features)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    symbol, asset_class, direction, entry_price,
+                    sl_price, tp_price, xgb_confidence, alignment_score,
+                    json.dumps(entry_features or {}),
+                ),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.error("journal.record_rejected_signal failed for %s: %s", symbol, exc)
 
     def record_post_trade_bars(
         self,

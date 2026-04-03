@@ -211,13 +211,26 @@ def prepare_sample_weights(
     df_train: pd.DataFrame,
     task: str = "entry_quality",
 ) -> np.ndarray:
-    """RR-weighted sample weights: high-RR wins count more, losses uniform."""
+    """RR-weighted sample weights for both wins AND losses."""
     weights = np.ones(len(y_train), dtype=np.float32)
     if task == "entry_quality":
         rr_vals = np.abs(df_train["label_rr"].values).astype(np.float32)
-        # Clip RR for weighting to avoid extreme outliers dominating
-        rr_clipped = np.clip(rr_vals, 1.0, 5.0)
-        weights[y_train == 1] = rr_clipped[y_train == 1]
+        # Wins: higher RR = more important to learn (clip [1.0, 5.0])
+        win_rr = np.clip(rr_vals, 1.0, 5.0)
+        weights[y_train == 1] = win_rr[y_train == 1]
+        # Losses: bigger loss = more important to avoid (clip [0.1, 1.5])
+        loss_rr = np.clip(rr_vals, 0.1, 1.5)
+        weights[y_train == 0] = loss_rr[y_train == 0]
+        # P4: Backtest timeout exits = informative negatives (1.5x)
+        if "label_exit_mechanism" in df_train.columns:
+            timeout_mask = df_train["label_exit_mechanism"].values == 4
+            weights[timeout_mask] *= 1.5
+        # P5: High MFE losses = good entry, bad exit → reduce weight
+        # Only when MFE > 1.5R AND loss is small (|RR| < 0.5)
+        if "label_max_favorable_rr" in df_train.columns:
+            mfe = df_train["label_max_favorable_rr"].values.astype(np.float32)
+            good_entry_bad_exit = (y_train == 0) & (mfe > 1.5) & (rr_vals < 0.5)
+            weights[good_entry_bad_exit] *= 0.5
     else:
         entry_mask = df_train["label_action"].values > 0
         rr_vals = np.abs(df_train["label_rr"].values).astype(np.float32)
