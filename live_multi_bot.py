@@ -854,19 +854,32 @@ class PaperBot:
         # Core weights MUST match training (_compute_alignment_score in smc_multi_style.py:1370-1376)
         # The gate threshold (0.50) was calibrated against these training weights.
         _fx = self.asset_class == "forex"
+        _tick_vol = self.asset_class in ("forex", "commodities")  # OANDA tick volume
         if _fx:
             # Forex: match training forex path (smc_multi_style.py:1372-1373)
+            # Volume weight redistributed to HTF structure (tick vol is unreliable)
             _w_bias      = 0.12               # any non-neutral bias (additive base)
             _w_bias_strong = 0.12             # strong bias bonus (additive on top)
-            _w_h4        = 0.12               # more HTF weight for forex
-            _w_h4_poi    = 0.08
-            _w_h1        = 0.10
-            _w_h1_choch  = 0.06
+            _w_h4        = 0.16               # more HTF weight (was 0.12, +0.04 from volume)
+            _w_h4_poi    = 0.12               # POI weight (was 0.08, +0.04 from volume)
+            _w_h1        = 0.12               # (was 0.10, +0.02 from volume)
+            _w_h1_choch  = 0.10               # (was 0.06, +0.04 from volume)
             _w_zone      = 0.08               # forex: zone unreliable w/ tick vol
             _w_trigger   = 0.08               # forex: trigger unreliable
-            _w_volume    = 0.14               # forex: compensate
+            _w_volume    = 0.00               # tick volume — skip entirely, weight redistributed above
+        elif _tick_vol:
+            # Commodities (OANDA tick volume): redistribute volume weight to structure
+            _w_bias      = 0.12
+            _w_bias_strong = 0.08
+            _w_h4        = 0.10               # (was 0.08, +0.02 from volume)
+            _w_h4_poi    = 0.10               # (was 0.08, +0.02 from volume)
+            _w_h1        = 0.10               # (was 0.08, +0.02 from volume)
+            _w_h1_choch  = 0.08               # (was 0.06, +0.02 from volume)
+            _w_zone      = 0.16               # (was 0.15, +0.01 from volume)
+            _w_trigger   = 0.16               # (was 0.15, +0.01 from volume)
+            _w_volume    = 0.00               # tick volume — skip entirely
         else:
-            # Non-forex: match training default path (smc_multi_style.py:1375-1376)
+            # Crypto + Stocks: real volume data, keep volume weight
             _w_bias      = 0.12               # any non-neutral bias (additive base)
             _w_bias_strong = 0.08             # strong bias bonus (additive on top)
             _w_h4        = 0.08
