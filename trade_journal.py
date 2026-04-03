@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     xgb_confidence  REAL,
     alignment_score REAL,
     entry_features  TEXT,
-    outcome_200bar  TEXT,
+    outcome_288bar  TEXT,
     max_favorable   REAL,
     max_adverse     REAL
 )
