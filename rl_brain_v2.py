@@ -1754,14 +1754,14 @@ class RLBrainSuite:
         except (pickle.UnpicklingError, EOFError, OSError) as exc:
             logger.error("Corrupt model file %s: %s -- skipping", path, exc)
             return None
-        # Schema version gate: refuse to load if model was trained with different schema
+        # Schema version gate: skip model if trained with different schema
         model_sv = data.get("schema_version")
         if model_sv is not None and model_sv != _SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Model-schema version mismatch: model has schema_version={model_sv}, "
-                f"code expects schema_version={_SCHEMA_VERSION}. "
-                f"Retrain the model or revert the schema change."
+            logger.warning(
+                "Schema mismatch for %s: model has v%s, code expects v%s — skipping (retrain needed)",
+                path.name, model_sv, _SCHEMA_VERSION,
             )
+            return None
         logger.info("Loaded model: %s (%d features, schema_v%s)", path, len(data.get("feat_names", [])), model_sv or "?")
         return data
 
