@@ -2352,6 +2352,7 @@ class PaperBot:
                 tier=tier,
                 style=style,
                 features=sig.get("features", {}),
+                xgb_confidence=rl_confidence,
             )
         )
         # Unpack — oanda_trade_id is optional (7th element, None for non-OANDA)
@@ -2456,53 +2457,35 @@ class PaperBot:
         tier: str = TIER_AAA_PLUS,
         style: str = STYLE_DAY,
         features: dict[str, Any] | None = None,
+        xgb_confidence: float = 0.6,
     ) -> tuple[str | None, str | None, str | None, float, float, int]:
         """
-        Execute a bracket order with tier-based risk allocation.
+        Execute a bracket order with confidence-based risk allocation.
 
-        Risk allocation:
-          AAA++ → 1.0%–1.5% (sniper trades, highest conviction)
-          AAA+  → 0.5%–1.0% (strong fallback trades)
+        Risk scales linearly with XGB confidence:
+          conf 0.60 (threshold) → 0.25%
+          conf 0.80             → 0.875%
+          conf 1.00             → 1.50%
 
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
-        # === TIER-BASED DYNAMIC RISK ===
+        # === CONFIDENCE-BASED DYNAMIC RISK ===
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
+        conf_threshold = 0.60
+        min_risk = 0.0025   # 0.25%
+        max_risk = 0.015    # 1.50%
 
-        # Get tier-specific risk bounds
-        tier_cfg = TIER_RISK.get(tier, TIER_RISK[TIER_AAA_PLUS])
-        base_risk = tier_cfg["base_risk"]
-        max_risk = tier_cfg["max_risk"]
-
-        # Scale risk within tier bounds based on RR and score
-        # Higher RR + higher score = closer to max_risk
-        rr_factor = min(rr / 6.0, 1.0)        # RR 6+ → full factor
-        score_factor = min(score / 0.90, 1.0)  # Score 0.90+ → full factor
-        combined_factor = (rr_factor * 0.5 + score_factor * 0.5)
-
-        dynamic_risk = base_risk + (max_risk - base_risk) * combined_factor
-        dynamic_risk = max(base_risk, min(dynamic_risk, max_risk))
-
-        # Apply RL position sizer multiplier
-        if self.rl_suite is not None and self.rl_suite.sizing_enabled:
-            sizing_mult = self.rl_suite.predict_sizing_multiplier(
-                features if features else {}
-            )
-            if abs(sizing_mult - 1.0) > 0.01:
-                old_risk = dynamic_risk
-                dynamic_risk = max(base_risk, min(dynamic_risk * sizing_mult, max_risk))
-                self.logger.info(
-                    "[RL SIZING] %s: mult=%.2f, risk %.3f%% -> %.3f%%",
-                    symbol, sizing_mult, old_risk * 100, dynamic_risk * 100,
-                )
+        # Linear scaling: confidence → risk
+        conf_range = max(1.0 - conf_threshold, 0.01)
+        conf_factor = max(0.0, min(1.0, (xgb_confidence - conf_threshold) / conf_range))
+        dynamic_risk = min_risk + (max_risk - min_risk) * conf_factor
+        dynamic_risk = max(min_risk, min(dynamic_risk, max_risk))
 
         self.logger.info(
-            "[TIER RISK] %s|%s | score=%.2f RR=%.1f → risk=%.3f%% "
-            "(tier range %.3f%%–%.3f%%) rr_factor=%.2f score_factor=%.2f",
-            tier, style.upper(), score, rr,
-            dynamic_risk * 100, base_risk * 100, max_risk * 100,
-            rr_factor, score_factor,
+            "[RISK] %s|%s | conf=%.3f score=%.2f RR=%.1f → risk=%.3f%% (range %.2f%%–%.2f%%)",
+            tier, style.upper(), xgb_confidence, score, rr,
+            dynamic_risk * 100, min_risk * 100, max_risk * 100,
         )
 
         if self.adapter is None:
