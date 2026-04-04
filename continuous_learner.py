@@ -115,7 +115,7 @@ def collect_live_data(
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT trade_id, entry_features, outcome, pnl_pct, exit_reason, "
-            "score, style, asset_class, direction, rr_actual, max_favorable_pct "
+            "score, style, asset_class, direction, rr_actual, max_favorable_pct, rr_target "
             "FROM trades "
             "WHERE exit_time IS NOT NULL "
             "AND entry_features IS NOT NULL "
@@ -155,6 +155,7 @@ def collect_live_data(
         record["exit_reason"] = row["exit_reason"] or ""
         record["rr_actual"] = row["rr_actual"] or 0.0
         record["max_favorable_pct"] = row["max_favorable_pct"] or 0.0
+        record["rr_target"] = row["rr_target"] or 3.0
         records.append(record)
 
     dropped = len(rows) - len(records)
@@ -177,31 +178,47 @@ def collect_live_data(
         grade = grade_lookup.get(tid, "")
         weights[i] *= grade_weights.get(grade, 1.0)
 
-    # Timeout penalty
-    timeout_mask = df["exit_reason"] == "timeout"
-    weights[timeout_mask.values] *= timeout_weight
+    # tp_achievement-based weighting (MFE / TP_distance)
+    if "rr_actual" in df.columns and "max_favorable_pct" in df.columns:
+        rr_actual = df["rr_actual"].abs().values
+        mfe = df["max_favorable_pct"].abs().values
+        tp_target = df["rr_target"].values if "rr_target" in df.columns else np.full(len(df), 3.0)
+        tp_target = np.maximum(tp_target, 0.1)
+        tp_achievement = np.clip(mfe / tp_target, 0.0, 1.5)
 
-    # P1: RR-proportional weighting (bigger wins AND bigger losses learn more)
-    if "rr_actual" in df.columns:
-        rr_vals = df["rr_actual"].abs().clip(0.1, 3.0).values
-        weights *= rr_vals
+        exit_reason = df["exit_reason"].values
 
-    # P5: High MFE losses = good entry, bad exit → reduce weight
-    # Only when MFE > 1.5R AND loss is small (|RR| < 0.5)
-    if "max_favorable_pct" in df.columns and "rr_actual" in df.columns:
-        mfe_rr = df["max_favorable_pct"].values  # already in R-multiples approximately
-        loss_mask = df["label"].values == 0
-        small_loss = df["rr_actual"].abs().values < 0.5
-        good_entry = mfe_rr > 1.5
-        weights[loss_mask & good_entry & small_loss] *= 0.5
+        for i in range(len(df)):
+            er = exit_reason[i] if i < len(exit_reason) else ""
+            tpa = tp_achievement[i]
+            rr = rr_actual[i]
 
-    # Cap combined weights to prevent stacking (base 2.0 * grade 1.5 * timeout 2.0 * RR 3.0 = 18x max)
+            if er == "tp_hit":
+                weights[i] *= max(rr, 1.0)  # full win weight
+            elif er == "sl_hit":
+                w = min(rr, 1.5)
+                if tpa > 0.60:
+                    w *= 0.3
+                elif tpa > 0.20:
+                    w *= 0.7
+                weights[i] *= max(w, 0.1)
+            elif er == "timeout":
+                if tpa >= 0.60:
+                    weights[i] *= min(tpa * max(rr, 1.0), 4.0)
+                elif tpa >= 0.20:
+                    weights[i] *= 0.3
+                else:
+                    weights[i] *= 0.5
+            elif "be" in str(er):
+                weights[i] *= 0.3 if tpa >= 0.30 else 0.1
+
+    # Cap combined weights
     weights = np.clip(weights, 0.1, 6.0)
 
     df["sample_weight"] = weights
 
     # Drop helper columns
-    df.drop(columns=["trade_id", "outcome", "pnl_pct", "exit_reason", "rr_actual", "max_favorable_pct"], inplace=True)
+    df.drop(columns=["trade_id", "outcome", "pnl_pct", "exit_reason", "rr_actual", "max_favorable_pct", "rr_target"], inplace=True)
 
     logger.info("Collected %d live trades (%d wins, %d losses)",
                 len(df), int(df["label"].sum()), int((df["label"] == 0).sum()))

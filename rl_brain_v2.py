@@ -211,31 +211,69 @@ def prepare_sample_weights(
     df_train: pd.DataFrame,
     task: str = "entry_quality",
 ) -> np.ndarray:
-    """RR-weighted sample weights for both wins AND losses."""
+    """tp_achievement-based sample weights using MFE / TP_distance."""
     weights = np.ones(len(y_train), dtype=np.float32)
-    if task == "entry_quality":
-        rr_vals = np.abs(df_train["label_rr"].values).astype(np.float32)
-        # Wins: higher RR = more important to learn (clip [1.0, 5.0])
-        win_rr = np.clip(rr_vals, 1.0, 5.0)
-        weights[y_train == 1] = win_rr[y_train == 1]
-        # Losses: bigger loss = more important to avoid (clip [0.1, 1.5])
-        loss_rr = np.clip(rr_vals, 0.1, 1.5)
-        weights[y_train == 0] = loss_rr[y_train == 0]
-        # P4: Backtest timeout exits = informative negatives (1.5x)
-        if "label_exit_mechanism" in df_train.columns:
-            timeout_mask = df_train["label_exit_mechanism"].values == 4
-            weights[timeout_mask] *= 1.5
-        # P5: High MFE losses = good entry, bad exit → reduce weight
-        # Only when MFE > 1.5R AND loss is small (|RR| < 0.5)
-        if "label_max_favorable_rr" in df_train.columns:
-            mfe = df_train["label_max_favorable_rr"].values.astype(np.float32)
-            good_entry_bad_exit = (y_train == 0) & (mfe > 1.5) & (rr_vals < 0.5)
-            weights[good_entry_bad_exit] *= 0.5
-    else:
+    if task != "entry_quality":
+        # Non-entry tasks: keep simple logic
         entry_mask = df_train["label_action"].values > 0
         rr_vals = np.abs(df_train["label_rr"].values).astype(np.float32)
         weights[entry_mask] = np.clip(rr_vals[entry_mask], 0.5, 5.0)
         weights[~entry_mask] = 0.1
+        return weights
+
+    rr_vals = np.abs(df_train["label_rr"].values).astype(np.float32)
+
+    # MFE and TP target
+    mfe = df_train["label_max_favorable_rr"].values.astype(np.float32) if "label_max_favorable_rr" in df_train.columns else np.zeros(len(y_train), dtype=np.float32)
+    tp_rr = df_train["label_tp_rr"].values.astype(np.float32) if "label_tp_rr" in df_train.columns else np.full(len(y_train), 3.0, dtype=np.float32)
+    tp_rr = np.maximum(tp_rr, 0.1)  # prevent division by zero
+
+    # tp_achievement: how much of the way to TP did price go? (0.0 to 1.5)
+    tp_achievement = np.clip(mfe / tp_rr, 0.0, 1.5)
+
+    # Exit mechanism
+    exit_mech = df_train["label_exit_mechanism"].values.astype(np.int32) if "label_exit_mechanism" in df_train.columns else np.zeros(len(y_train), dtype=np.int32)
+
+    # === TP HIT (exit_mech=1): full win, weight by actual RR ===
+    tp_mask = exit_mech == 1
+    weights[tp_mask] = np.clip(rr_vals[tp_mask], 1.0, 5.0)
+
+    # === SL HIT (exit_mech=2): weight by loss RR, reduced if high tp_achievement ===
+    sl_mask = exit_mech == 2
+    sl_weights = np.clip(rr_vals[sl_mask], 0.1, 1.5)
+    sl_tp_ach = tp_achievement[sl_mask]
+    # High tp_achievement SL hits = good entry, bad reversal -> reduce penalty
+    sl_weights[sl_tp_ach > 0.60] *= 0.3  # went 60%+ toward TP before SL
+    sl_weights[(sl_tp_ach > 0.20) & (sl_tp_ach <= 0.60)] *= 0.7  # moderate move
+    weights[sl_mask] = sl_weights
+
+    # === BE EXIT (exit_mech=3): mostly neutral ===
+    be_mask = exit_mech == 3
+    be_weights = np.where(tp_achievement[be_mask] >= 0.30, 0.3, 0.1)
+    weights[be_mask] = be_weights.astype(np.float32)
+
+    # === TIMEOUT (exit_mech=4): dynamic based on tp_achievement ===
+    to_mask = exit_mech == 4
+    to_tp_ach = tp_achievement[to_mask]
+    to_rr = np.clip(rr_vals[to_mask], 0.1, 5.0)
+    to_weights = np.ones(to_mask.sum(), dtype=np.float32)
+    # Near TP (>0.60): good entry, TP was too far -> treat as partial win
+    high_ach = to_tp_ach >= 0.60
+    to_weights[high_ach] = (to_tp_ach[high_ach] * to_rr[high_ach]).clip(0.5, 4.0)
+    # Moderate (0.20-0.60): mediocre, low weight
+    mid_mask = (to_tp_ach >= 0.20) & (to_tp_ach < 0.60)
+    to_weights[mid_mask] = 0.3
+    # Low (<0.20): setup didn't fire, uninformative
+    to_weights[to_tp_ach < 0.20] = 0.5
+    weights[to_mask] = to_weights
+
+    # === REMAINING (exit_mech=0, no mechanism): fallback to simple RR weighting ===
+    remaining = exit_mech == 0
+    win_remaining = remaining & (y_train == 1)
+    loss_remaining = remaining & (y_train == 0)
+    weights[win_remaining] = np.clip(rr_vals[win_remaining], 1.0, 5.0)
+    weights[loss_remaining] = np.clip(rr_vals[loss_remaining], 0.1, 1.5)
+
     return weights
 
 

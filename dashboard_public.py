@@ -410,15 +410,24 @@ def _get_equity_curve() -> list[dict]:
     points: list[dict] = []
     if not RESULTS_DIR.exists():
         return points
+    # Build bot-tag -> asset_class map for display multiplier
+    bot_ac_map: dict[str, str] = {}
+    if DISPLAY_MULTIPLIERS:
+        bots = _discover_bots()
+        for tag, bot in bots.items():
+            bot_ac_map[tag] = bot.get("asset_class", "unknown")
     for eq_path in sorted(RESULTS_DIR.glob("bot_*_equity.csv")):
+        tag = eq_path.stem.replace("_equity", "")
+        ac = bot_ac_map.get(tag, "unknown")
+        mult = DISPLAY_MULTIPLIERS.get(ac, 1.0)
         try:
             with open(eq_path) as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     points.append({
                         "timestamp": row.get("timestamp", ""),
-                        "equity": float(row.get("equity", 0)),
-                        "pnl": float(row.get("pnl", 0)),
+                        "equity": float(row.get("equity", 0)) * mult,
+                        "pnl": float(row.get("pnl", 0)) * mult,
                     })
         except Exception:
             continue
