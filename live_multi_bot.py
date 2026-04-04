@@ -2079,6 +2079,8 @@ class PaperBot:
             tier = TIER_AAA_PLUS_PLUS
 
         # ── Signal rate limiting (per-class safety throttle) ──────
+        # Only counts XGB-accepted signals (moved to after XGB gate below).
+        # Rejected signals don't consume rate limit slots.
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=4)
         self._recent_signal_times = [
@@ -2086,13 +2088,12 @@ class PaperBot:
         ]
         if len(self._recent_signal_times) >= self._max_signals_per_4h:
             self.logger.info(
-                "RATE-LIMITED %s | class=%s | %d signals in 4h (max=%d)",
+                "RATE-LIMITED %s | class=%s | %d trades in 4h (max=%d)",
                 symbol, self.asset_class,
                 len(self._recent_signal_times), self._max_signals_per_4h,
             )
             self._pending_signal = None
             return
-        self._recent_signal_times.append(now)
 
         # ── Final style constraint validation ─────────────────────
         if not self._validate_style_constraints(style, price, sl, tp):
@@ -2266,6 +2267,7 @@ class PaperBot:
                 self._pending_signal = None
                 return
             self._rl_accepted += 1
+            self._recent_signal_times.append(datetime.now(timezone.utc))  # rate limit counts accepted only
             self.logger.info(
                 "XGB ACCEPT %s conf=%.3f score=%.2f | accepted=%d rejected=%d",
                 symbol, rl_confidence, score,
