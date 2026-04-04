@@ -311,8 +311,10 @@ def _aggregate_stats() -> dict:
     max_dd_pct = 0.0
     per_class: dict[str, dict] = {}
 
-    # Track per-class equity from FIRST bot only (all bots share same broker account)
-    class_equity_seen: dict[str, bool] = {}
+    # Track per-broker equity (not per-bot or per-class).
+    # OANDA serves both forex AND commodities from one 100K account.
+    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+    broker_equity_seen: dict[str, bool] = {}
 
     for tag, bot in bots.items():
         trades = bot.get("trades", 0)
@@ -339,18 +341,23 @@ def _aggregate_stats() -> dict:
         per_class[ac]["pnl"] += disp_pnl
         per_class[ac]["active"] += len(actives)
 
-        # Equity: take from first bot per class (all share same broker account)
-        if ac not in class_equity_seen:
+        # Equity: take from first bot per BROKER (forex+commodities share OANDA)
+        broker = _BROKER_MAP.get(ac, ac)
+        if broker not in broker_equity_seen:
             disp_equity = _apply_display_mult(ac, equity)
             disp_peak = _apply_display_mult(ac, peak)
             per_class[ac]["equity"] = round(disp_equity, 2)
             total_equity += disp_equity
-            class_equity_seen[ac] = True
+            broker_equity_seen[broker] = True
 
             if disp_peak > 0:
                 dd = (disp_peak - disp_equity) / disp_peak * 100
                 if dd > max_dd_pct:
                     max_dd_pct = dd
+        else:
+            # Broker already counted — don't add equity again but show per-class
+            if "equity" not in per_class[ac] or per_class[ac]["equity"] == 0:
+                per_class[ac]["equity"] = round(_apply_display_mult(ac, equity), 2)
 
     wr = round(total_wins / total_trades * 100, 2) if total_trades > 0 else 0.0
 
