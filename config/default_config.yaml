@@ -220,7 +220,7 @@ rl_brain:
     confidence_threshold: 0.6
     model_path: "models/rl_entry_filter.pkl"
   position_sizer:
-    enabled: true            # Enabled for paper trading
+    enabled: false           # Disabled: always outputs mult=0.33, tier risk allocation is better
     model_path: "models/rl_position_sizer.pkl"
     target_rr: 3.0           # RR target for full allocation
     min_multiplier: 0.33     # Minimum risk multiplier
