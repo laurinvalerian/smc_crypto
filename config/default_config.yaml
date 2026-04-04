@@ -249,9 +249,9 @@ rl_brain:
 # DQN Exit Manager Configuration (Phase 2B)
 # ═══════════════════════════════════════════════════════
 dqn_exit_manager:
-  enabled: true                     # Shadow mode — logs predictions alongside XGBoost
+  enabled: false                    # Disabled: shape mismatch (16 vs 15 features), exit classifier also off
   model_path: "models/dqn_exit_manager.zip"
-  shadow_log: true
+  shadow_log: false
   agreement_mode: "xgb_primary"    # xgb_primary | dqn_primary | both_agree
   # Training params (MacBook only, not used on server)
   training:
