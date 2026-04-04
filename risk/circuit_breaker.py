@@ -267,18 +267,21 @@ class CircuitBreaker:
             self._state.portfolio_heat_pct >= self._max_heat
         )
 
-        # ── Risk Budget Warning ───────────────────────────────────
+        # ── Risk Budget Warning (throttled: max once per 5 min) ────
         budget = self.remaining_risk_budget()
         if budget < 0.01:  # < 1% remaining
-            logger.warning(
-                "RISK BUDGET LOW: %.2f%% remaining (daily=%.2f%% weekly=%.2f%% "
-                "alltime=%.2f%% heat=%.2f%%)",
-                budget * 100,
-                self._state.daily_pnl_pct * 100,
-                self._state.weekly_pnl_pct * 100,
-                self._state.alltime_dd_pct * 100,
-                self._state.portfolio_heat_pct * 100,
-            )
+            if self._last_log_state.get("_budget_warn_time") is None or \
+               (utc_now - self._last_log_state["_budget_warn_time"]).total_seconds() > 300:
+                logger.warning(
+                    "RISK BUDGET LOW: %.2f%% remaining (daily=%.2f%% weekly=%.2f%% "
+                    "alltime=%.2f%% heat=%.2f%%)",
+                    budget * 100,
+                    self._state.daily_pnl_pct * 100,
+                    self._state.weekly_pnl_pct * 100,
+                    self._state.alltime_dd_pct * 100,
+                    self._state.portfolio_heat_pct * 100,
+                )
+                self._last_log_state["_budget_warn_time"] = utc_now
 
         return self._state
 

@@ -311,6 +311,9 @@ def _aggregate_stats() -> dict:
     max_dd_pct = 0.0
     per_class: dict[str, dict] = {}
 
+    # Track per-class equity from FIRST bot only (all bots share same broker account)
+    class_equity_seen: dict[str, bool] = {}
+
     for tag, bot in bots.items():
         trades = bot.get("trades", 0)
         wins = bot.get("wins", 0)
@@ -322,19 +325,11 @@ def _aggregate_stats() -> dict:
         ac = bot.get("asset_class", "unknown")
         # Apply display multiplier (e.g., crypto ×20 for Binance testnet)
         disp_pnl = _apply_display_mult(ac, pnl)
-        disp_equity = _apply_display_mult(ac, equity)
-        disp_peak = _apply_display_mult(ac, peak)
 
         total_trades += trades
         total_wins += wins
         total_pnl += disp_pnl
-        total_equity += disp_equity
         active_positions += len(actives)
-
-        if disp_peak > 0:
-            dd = (disp_peak - disp_equity) / disp_peak * 100
-            if dd > max_dd_pct:
-                max_dd_pct = dd
 
         if ac not in per_class:
             per_class[ac] = {"trades": 0, "wins": 0, "pnl": 0.0, "equity": 0.0,
@@ -342,8 +337,20 @@ def _aggregate_stats() -> dict:
         per_class[ac]["trades"] += trades
         per_class[ac]["wins"] += wins
         per_class[ac]["pnl"] += disp_pnl
-        per_class[ac]["equity"] += disp_equity
         per_class[ac]["active"] += len(actives)
+
+        # Equity: take from first bot per class (all share same broker account)
+        if ac not in class_equity_seen:
+            disp_equity = _apply_display_mult(ac, equity)
+            disp_peak = _apply_display_mult(ac, peak)
+            per_class[ac]["equity"] = round(disp_equity, 2)
+            total_equity += disp_equity
+            class_equity_seen[ac] = True
+
+            if disp_peak > 0:
+                dd = (disp_peak - disp_equity) / disp_peak * 100
+                if dd > max_dd_pct:
+                    max_dd_pct = dd
 
     wr = round(total_wins / total_trades * 100, 2) if total_trades > 0 else 0.0
 
