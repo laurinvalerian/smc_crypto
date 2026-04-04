@@ -792,10 +792,22 @@ def api_circuit_breaker():
     else:
         status = "CLEAR"
 
+    # Risk budget: how much more risk can be taken (dynamic)
+    risk_budget = max(0.0, 3.0 - abs(min(daily_pnl_pct, 0)) - portfolio_heat_pct)
+
     return jsonify({
         "daily_pnl_pct": round(daily_pnl_pct, 2),
+        "daily_loss_limit": 3.0,
         "weekly_pnl_pct": round(weekly_pnl_pct, 2),
+        "weekly_loss_limit": 5.0,
+        "alltime_dd_pct": round(risk.get("alltime_dd_pct", 0.0), 2),
+        "alltime_dd_limit": 8.0,
         "portfolio_heat_pct": round(portfolio_heat_pct, 2),
+        "risk_budget_remaining": round(risk_budget, 2),
+        "daily_breaker": risk.get("daily_breaker", False),
+        "weekly_breaker": risk.get("weekly_breaker", False),
+        "alltime_breaker": risk.get("alltime_breaker", False),
+        "heat_breaker": risk.get("heat_breaker", False),
         "paused": any_breaker,
         "status": status,
     })
@@ -1771,10 +1783,10 @@ function renderProgressBar(label, current, limit, color){
 function updateRisk(d){
   var el = $('risk-content');
   var html = '';
-  html += renderProgressBar('Daily Loss', d.daily_pnl_pct||0, d.daily_loss_limit||3, '#3fb950');
-  html += renderProgressBar('Weekly Loss', d.weekly_pnl_pct||0, d.weekly_loss_limit||5, '#58a6ff');
+  html += renderProgressBar('Daily DD', d.daily_pnl_pct||0, d.daily_loss_limit||3, '#3fb950');
+  html += renderProgressBar('Weekly DD', d.weekly_pnl_pct||0, d.weekly_loss_limit||5, '#58a6ff');
   html += renderProgressBar('All-Time DD', d.alltime_dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
-  html += renderProgressBar('Portfolio Heat', d.portfolio_heat_pct||0, d.max_heat||6, '#d29922');
+  html += renderProgressBar('Open Risk', d.portfolio_heat_pct||0, d.risk_budget_remaining||3, '#d29922');
 
   // Active breakers
   var breakers = [];

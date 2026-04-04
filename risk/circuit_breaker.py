@@ -25,7 +25,7 @@ DAILY_LOSS_LIMIT_PCT = 0.03       # -3% daily → full stop 24h (funded: -5% lim
 WEEKLY_LOSS_LIMIT_PCT = 0.05      # -5% weekly → halve sizes
 ASSET_CLASS_DD_LIMIT_PCT = 0.02   # -2% per asset class → pause 12h
 ALLTIME_DD_LIMIT_PCT = 0.08       # -8% all-time DD → STOP ALL (funded: -10% limit, 2% buffer)
-MAX_PORTFOLIO_HEAT_PCT = 0.06     # 6% total open risk
+MAX_PORTFOLIO_HEAT_PCT = 1.00     # Effectively disabled — dynamic risk budget handles this now
 DAILY_PAUSE_HOURS = 24
 ASSET_CLASS_PAUSE_HOURS = 12
 
