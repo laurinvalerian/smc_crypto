@@ -1040,6 +1040,9 @@ def api_active_trades():
                 except Exception:
                     pass
 
+            ac = bot.get("asset_class", "unknown")
+            mult = DISPLAY_MULTIPLIERS.get(ac, 1.0)
+            raw_pnl = float(trade.get("unrealized_pnl_usd") or 0.0)
             result.append({
                 "symbol": trade.get("symbol", bot.get("symbol", _tag)),
                 "direction": trade.get("direction", ""),
@@ -1050,8 +1053,8 @@ def api_active_trades():
                 "style": trade.get("style", ""),
                 "tier": trade.get("tier") or trade.get("setup_tier", ""),
                 "confidence": float(trade.get("rl_confidence") or trade.get("confidence") or 0.0),
-                "asset_class": bot.get("asset_class", "unknown"),
-                "unrealized_pnl": float(trade.get("unrealized_pnl_usd") or 0.0),
+                "asset_class": ac,
+                "unrealized_pnl": raw_pnl * mult,
                 "qty": float(trade.get("qty", 0.0)),
                 "hold_time_hours": hold_time_hours,
                 "candles_seen": int(trade.get("_candles_seen", 0)),
