@@ -110,9 +110,18 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     xgb_confidence  REAL,
     alignment_score REAL,
     entry_features  TEXT,
-    outcome_288bar  TEXT,
-    max_favorable   REAL,
-    max_adverse     REAL
+    -- Scalp horizon: 72 bars (6h) — would it have been a good scalp?
+    outcome_scalp   TEXT,
+    mfe_scalp       REAL,
+    mae_scalp       REAL,
+    -- Day horizon: 288 bars (24h) — would it have been a good day trade?
+    outcome_day     TEXT,
+    mfe_day         REAL,
+    mae_day         REAL,
+    -- Swing horizon: 1440 bars (10d) — would it have been a good swing?
+    outcome_swing   TEXT,
+    mfe_swing       REAL,
+    mae_swing       REAL
 )
 """
 
