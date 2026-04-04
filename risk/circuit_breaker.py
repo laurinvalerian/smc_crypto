@@ -267,7 +267,69 @@ class CircuitBreaker:
             self._state.portfolio_heat_pct >= self._max_heat
         )
 
+        # ── Risk Budget Warning ───────────────────────────────────
+        budget = self.remaining_risk_budget()
+        if budget < 0.01:  # < 1% remaining
+            logger.warning(
+                "RISK BUDGET LOW: %.2f%% remaining (daily=%.2f%% weekly=%.2f%% "
+                "alltime=%.2f%% heat=%.2f%%)",
+                budget * 100,
+                self._state.daily_pnl_pct * 100,
+                self._state.weekly_pnl_pct * 100,
+                self._state.alltime_dd_pct * 100,
+                self._state.portfolio_heat_pct * 100,
+            )
+
         return self._state
+
+    def remaining_risk_budget(self) -> float:
+        """Return remaining risk budget as a fraction (0.0 to 1.0).
+
+        Dynamically computed from proximity to DD limits:
+        - Daily DD: limit minus abs(daily_loss) minus current_heat
+        - Weekly DD: limit minus abs(weekly_loss) minus current_heat
+        - Alltime DD: limit minus abs(alltime_dd) minus current_heat
+        - Returns the MINIMUM of all budgets (most restrictive wins)
+        - 0.0 means no more risk allowed
+        """
+        # Daily budget: how much more can we lose today?
+        daily_used = abs(min(self._state.daily_pnl_pct, 0.0))
+        daily_remaining = max(
+            0.0, self._daily_limit - daily_used - self._state.portfolio_heat_pct
+        )
+
+        # Weekly budget
+        weekly_used = abs(min(self._state.weekly_pnl_pct, 0.0))
+        weekly_remaining = max(
+            0.0, self._weekly_limit - weekly_used - self._state.portfolio_heat_pct
+        )
+
+        # Alltime budget
+        alltime_used = abs(min(self._state.alltime_dd_pct, 0.0))
+        alltime_remaining = max(
+            0.0, self._alltime_dd_limit - alltime_used - self._state.portfolio_heat_pct
+        )
+
+        # Return the most restrictive
+        return min(daily_remaining, weekly_remaining, alltime_remaining)
+
+    def risk_budget_allows(self, new_risk_pct: float) -> tuple[bool, str]:
+        """Check if opening a trade with given risk % is within budget.
+
+        Returns (allowed, reason).
+        """
+        budget = self.remaining_risk_budget()
+
+        if budget <= 0.001:  # < 0.1% remaining = emergency stop
+            return False, f"RISK BUDGET EXHAUSTED: budget={budget * 100:.2f}%"
+
+        if new_risk_pct > budget:
+            return False, (
+                f"RISK BUDGET: trade needs {new_risk_pct * 100:.2f}% "
+                f"but only {budget * 100:.2f}% remaining"
+            )
+
+        return True, ""
 
     def can_trade(
         self,

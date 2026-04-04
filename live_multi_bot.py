@@ -360,7 +360,6 @@ MIN_SL_TICKS = 5
 STYLE_SCALP = "scalp"
 STYLE_DAY = "day"
 STYLE_SWING = "swing"
-MAX_PER_STYLE_GLOBAL = 5  # max 5 swing + 5 day + 5 scalp = 15 total across all bots
 MAX_CONCURRENT_REJECTION_WATCHERS = 50  # cap async outcome watchers for rejected signals
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
@@ -2188,16 +2187,15 @@ class PaperBot:
         if any(t["style"] == pending_style for t in self._active_trades):
             self._pending_signal = None
             return
-        # ── Global per-style limit ───────────────────────────────
-        # Max 5 per style across all 112 bots (= max 15 total)
-        _runner = self._runner_ref() if hasattr(self, '_runner_ref') and self._runner_ref else None
-        if _runner:
-            _style_counts = _runner.get_global_style_counts()
-            if _style_counts.get(pending_style, 0) >= MAX_PER_STYLE_GLOBAL:
-                self.logger.info(
-                    "GLOBAL STYLE LIMIT: %s has %d/%d — skipping %s",
-                    pending_style, _style_counts[pending_style], MAX_PER_STYLE_GLOBAL, symbol,
-                )
+        # ── Dynamic risk budget check ────────────────────────────
+        # Instead of fixed per-style limits, check if DD budget allows
+        # another trade. The closer to DD limits, the fewer trades opened.
+        if self.circuit_breaker is not None:
+            # Use the risk_pct that this trade would use (estimate from tier)
+            _est_risk = 0.005  # conservative estimate: 0.5% (AAA+ base risk)
+            allowed, reason = self.circuit_breaker.risk_budget_allows(_est_risk)
+            if not allowed:
+                self.logger.info("RISK BUDGET BLOCK %s | %s", symbol, reason)
                 self._pending_signal = None
                 return
 
