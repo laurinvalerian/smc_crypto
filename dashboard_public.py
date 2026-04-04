@@ -34,6 +34,20 @@ LOG_PATH = Path("paper_trading.log")
 LIVE_LOG_PATH = Path("live_results/live_multi.log")
 MODEL_DIR = Path("models")
 
+# Display multipliers for asset classes with virtual equity (e.g., Binance testnet 5K → 100K)
+try:
+    import yaml as _yaml
+    _cfg = _yaml.safe_load(open("config/default_config.yaml"))
+    DISPLAY_MULTIPLIERS: dict[str, float] = {
+        k: float(v) for k, v in _cfg.get("equity_display_multipliers", {}).items()
+    }
+except Exception:
+    DISPLAY_MULTIPLIERS = {}
+
+def _apply_display_mult(ac: str, value: float) -> float:
+    """Multiply value by display multiplier for the asset class (if configured)."""
+    return value * DISPLAY_MULTIPLIERS.get(ac, 1.0)
+
 # =====================================================================
 #  Helpers
 # =====================================================================
@@ -305,25 +319,30 @@ def _aggregate_stats() -> dict:
         peak = bot.get("peak_equity", 0.0)
         actives = bot.get("active_trades", [])
 
+        ac = bot.get("asset_class", "unknown")
+        # Apply display multiplier (e.g., crypto ×20 for Binance testnet)
+        disp_pnl = _apply_display_mult(ac, pnl)
+        disp_equity = _apply_display_mult(ac, equity)
+        disp_peak = _apply_display_mult(ac, peak)
+
         total_trades += trades
         total_wins += wins
-        total_pnl += pnl
-        total_equity += equity
+        total_pnl += disp_pnl
+        total_equity += disp_equity
         active_positions += len(actives)
 
-        if peak > 0:
-            dd = (peak - equity) / peak * 100
+        if disp_peak > 0:
+            dd = (disp_peak - disp_equity) / disp_peak * 100
             if dd > max_dd_pct:
                 max_dd_pct = dd
 
-        ac = bot.get("asset_class", "unknown")
         if ac not in per_class:
             per_class[ac] = {"trades": 0, "wins": 0, "pnl": 0.0, "equity": 0.0,
                              "active": 0}
         per_class[ac]["trades"] += trades
         per_class[ac]["wins"] += wins
-        per_class[ac]["pnl"] += pnl
-        per_class[ac]["equity"] += equity
+        per_class[ac]["pnl"] += disp_pnl
+        per_class[ac]["equity"] += disp_equity
         per_class[ac]["active"] += len(actives)
 
     wr = round(total_wins / total_trades * 100, 2) if total_trades > 0 else 0.0
@@ -702,13 +721,14 @@ def api_circuit_breaker():
     """Return simplified circuit breaker status derived from bot state files."""
     bots = _discover_bots()
 
-    # Sum total PnL and portfolio heat across all bots
+    # Sum total PnL and portfolio heat across all bots (with display multiplier)
     total_pnl = 0.0
     total_equity = 0.0
     portfolio_heat_pct = 0.0
     for _tag, bot in bots.items():
-        total_pnl += float(bot.get("total_pnl", 0.0))
-        total_equity += float(bot.get("equity", 0.0))
+        ac = bot.get("asset_class", "unknown")
+        total_pnl += _apply_display_mult(ac, float(bot.get("total_pnl", 0.0)))
+        total_equity += _apply_display_mult(ac, float(bot.get("equity", 0.0)))
         for trade in bot.get("active_trades", []):
             if not isinstance(trade, dict):
                 continue

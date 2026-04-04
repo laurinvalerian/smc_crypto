@@ -237,7 +237,7 @@ rl_brain:
     min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
     fee_buffer: true         # Add fee buffer when moving to BE
   exit_classifier:
-    enabled: true                   # AUC 0.68, Sharpe +381% in backtest
+    enabled: false                  # Disabled: AUC 0.685 too low, cuts winners short (SL+TP+BE suffice)
     confidence_threshold: 0.65      # Optimal balance at 46% exit rate, +82% Sharpe
     model_path: "models/rl_exit_classifier.pkl"
     min_favorable_rr: 0.5          # Only consider exit after 0.5R favorable
