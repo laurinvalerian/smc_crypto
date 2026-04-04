@@ -5555,10 +5555,11 @@ class LiveMultiBotRunner:
                     self.circuit_breaker.check()
 
                     # Save paper grid state periodically
-                    try:
-                        self.paper_grid.save_state()
-                    except Exception:
-                        pass
+                    if self.paper_grid is not None:
+                        try:
+                            self.paper_grid.save_state()
+                        except Exception:
+                            pass
 
                     layout = build_dashboard(
                         bots=self.bots,
@@ -5718,13 +5719,14 @@ class LiveMultiBotRunner:
                 pass
 
         # Save Paper Grid state + export results
-        try:
-            self.paper_grid.save_state()
-            self.paper_grid.export_csv()
-            self.paper_grid.export_summary()
-            logger.info("Paper Grid state saved")
-        except Exception as exc:
-            logger.warning("Paper Grid save failed: %s", exc)
+        if self.paper_grid is not None:
+            try:
+                self.paper_grid.save_state()
+                self.paper_grid.export_csv()
+                self.paper_grid.export_summary()
+                logger.info("Paper Grid state saved")
+            except Exception as exc:
+                logger.warning("Paper Grid save failed: %s", exc)
 
         # Close all exchange adapter connections (deduplicate OANDA)
         closed: set[int] = set()
