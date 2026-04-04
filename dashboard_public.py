@@ -539,14 +539,21 @@ def _get_open_positions() -> list[dict]:
     positions: list[dict] = []
     bots = _discover_bots()
     for tag, bot in bots.items():
+        ac = bot.get("asset_class", "unknown")
+        mult = DISPLAY_MULTIPLIERS.get(ac, 1.0)
         for trade in bot.get("active_trades", []):
             pos = {
                 "symbol": bot.get("symbol", tag),
-                "asset_class": bot.get("asset_class", "unknown"),
+                "asset_class": ac,
                 "bot": tag,
             }
             if isinstance(trade, dict):
                 pos.update(trade)
+                # Apply display multiplier to PnL fields for crypto
+                if mult > 1:
+                    for pnl_key in ("unrealized_pnl_usd", "pnl_usd", "risk_amount"):
+                        if pnl_key in pos and isinstance(pos[pnl_key], (int, float)):
+                            pos[pnl_key] = pos[pnl_key] * mult
             else:
                 pos["info"] = str(trade)
             positions.append(pos)
@@ -1406,7 +1413,7 @@ a:hover{text-decoration:underline}
         <thead><tr>
           <th>Symbol</th><th>Dir</th><th>Style</th><th>Tier</th>
           <th>Entry</th><th>Exit</th><th>PnL%</th><th>RR</th>
-          <th>Duration</th><th>Outcome</th>
+          <th>Duration</th><th>Outcome</th><th>Exit Reason</th>
         </tr></thead>
         <tbody id="th-body"></tbody>
       </table>
@@ -1665,7 +1672,7 @@ function updateRL(d){
 function updateTrades(rows){
   var body = $('trades-body');
   if(!rows || !rows.length){
-    body.innerHTML = '<tr><td colspan="11" class="empty">No trades yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty">No trades yet</td></tr>';
     return;
   }
   var html = '';
