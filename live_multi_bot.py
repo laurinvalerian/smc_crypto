@@ -1358,10 +1358,15 @@ class PaperBot:
                         )
                         should_exit, exit_conf = self.rl_suite.predict_early_exit(bar_features)
 
-                        # Safety gates
+                        # Safety gates — scaled by trade style
                         _exit_conf_threshold = self.rl_suite.exit_threshold
-                        _exit_min_bars = 6
-                        _exit_min_favorable = 0.5
+                        _trade_style = trade.get("style", STYLE_DAY)
+                        _style_max_candles = STYLE_CONFIG.get(_trade_style, STYLE_CONFIG[STYLE_DAY]).get("max_hold_candles", 288)
+                        # Min bars before ML exit allowed: 10% of max hold time
+                        # Scalp: 7 bars (35min), Day: 29 bars (2.4h), Swing: 144 bars (12h)
+                        _exit_min_bars = max(6, int(_style_max_candles * 0.10))
+                        # Min favorable RR before exit: higher for longer-term trades
+                        _exit_min_favorable = {"scalp": 0.5, "day": 1.0, "swing": 1.5}.get(_trade_style, 0.5)
                         _exit_be_priority = True
 
                         bars_count = int(trade.get("_bars_held_count", bars_held))
