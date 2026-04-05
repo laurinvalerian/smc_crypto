@@ -1668,28 +1668,30 @@ function updateEquity(data){
     });
   }
 
-  // ── PnL Chart ──
+  // ── PnL Chart (2 datasets: green above 0, red below 0) ──
   if(pnlChart){
     pnlChart.data.labels = labels;
     pnlChart.data.datasets[0].data = pnlVals;
-    pnlChart.data.datasets[0].borderColor = pnlColor;
-    pnlChart.data.datasets[0].backgroundColor = pnlBg;
-    pnlChart.data.datasets[0].pointBackgroundColor = pnlPointColors;
+    pnlChart.data.datasets[1].data = pnlVals;
     pnlChart.update('none');
   } else {
     pnlChart = new Chart(pnlCanvas, {
       type:'line',
-      data:{labels:labels, datasets:[{
-        label:'Cumulative PnL', data:pnlVals,
-        segment:{borderColor:function(ctx){return ctx.p0.parsed.y>=0&&ctx.p1.parsed.y>=0?'#3fb950':'#f85149'}},
-        borderColor:pnlColor,
-        backgroundColor:pnlBg,
-        fill:true, tension:0.3, pointRadius:5, pointBorderWidth:2,
-        pointBackgroundColor:pnlPointColors, pointBorderColor:pnlPointColors, borderWidth:2
-      }]},
+      data:{labels:labels, datasets:[
+        {label:'PnL', data:pnlVals,
+         borderColor:'#3fb950', backgroundColor:'rgba(63,185,80,0.12)',
+         fill:{target:'origin',above:'rgba(63,185,80,0.12)',below:'transparent'},
+         segment:{borderColor:function(ctx){return ctx.p0.parsed.y>=0&&ctx.p1.parsed.y>=0?'#3fb950':'#f85149'}},
+         tension:0.3, pointRadius:5, pointBorderWidth:2,
+         pointBackgroundColor:pnlPointColors, pointBorderColor:pnlPointColors, borderWidth:2},
+        {label:'_neg', data:pnlVals,
+         borderColor:'transparent', backgroundColor:'rgba(248,81,73,0.12)',
+         fill:{target:'origin',above:'transparent',below:'rgba(248,81,73,0.12)'},
+         tension:0.3, pointRadius:0, borderWidth:0}
+      ]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
+        plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}}},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
           y:{ticks:{color:pnlColor,font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
