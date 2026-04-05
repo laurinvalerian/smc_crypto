@@ -1461,6 +1461,12 @@ a:hover{text-decoration:underline}
     <div class="empty" id="equity-empty" style="display:none">No equity data yet</div>
   </div>
 
+  <div class="section">
+    <div class="section-title">PnL Curve</div>
+    <div class="chart-wrap"><canvas id="pnl-chart"></canvas></div>
+    <div class="empty" id="pnl-empty" style="display:none">No PnL data yet</div>
+  </div>
+
   <div class="grid-2">
     <!-- Asset Class Table -->
     <div class="section">
@@ -1596,66 +1602,98 @@ function updateOverview(d){
   $('hd-equity').textContent = d.total_equity ? ('Equity: $' + fmt(d.total_equity,2)) : '';
 }
 
-// ── Equity Chart ─────────────────────────────────────────────────
+// ── Equity + PnL Charts (separate) ───────────────────────────────
 
 var eqChart = null;
+var pnlChart = null;
+
 function updateEquity(data){
-  var canvas = $('equity-chart');
-  var empty = $('equity-empty');
+  var eqCanvas = $('equity-chart');
+  var eqEmpty = $('equity-empty');
+  var pnlCanvas = $('pnl-chart');
+  var pnlEmpty = $('pnl-empty');
+
   if(!data || !data.length){
-    canvas.style.display='none'; empty.style.display='block'; return;
+    if(eqCanvas) eqCanvas.style.display='none';
+    if(eqEmpty) eqEmpty.style.display='block';
+    if(pnlCanvas) pnlCanvas.style.display='none';
+    if(pnlEmpty) pnlEmpty.style.display='block';
+    return;
   }
-  canvas.style.display='block'; empty.style.display='none';
+  if(eqCanvas) eqCanvas.style.display='block';
+  if(eqEmpty) eqEmpty.style.display='none';
+  if(pnlCanvas) pnlCanvas.style.display='block';
+  if(pnlEmpty) pnlEmpty.style.display='none';
+
   var labels = data.map(function(p){ return p.timestamp ? p.timestamp.substring(5,16) : ''; });
   var eqVals = data.map(function(p){ return p.equity; });
   var pnlVals = data.map(function(p){ return p.pnl; });
-  // Bar colors: green for positive, red for negative PnL (semi-transparent)
-  var pnlColors = pnlVals.map(function(v){ return v >= 0 ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)'; });
-  var pnlBorders = pnlVals.map(function(v){ return v >= 0 ? '#3fb950' : '#f85149'; });
-  var lastPnl = pnlVals.length ? pnlVals[pnlVals.length-1] : 0;
-  // Tight Y-axis for equity: show ±2% around mean so small changes are visible
+
+  // Tight equity Y-axis
   var eqMin = Math.min.apply(null, eqVals);
   var eqMax = Math.max.apply(null, eqVals);
-  var eqPad = Math.max((eqMax - eqMin) * 0.3, eqMax * 0.005);  // at least 0.5% padding
-  var pnlAxisColor = lastPnl >= 0 ? '#3fb950' : '#f85149';
+  var eqPad = Math.max((eqMax - eqMin) * 0.3, eqMax * 0.005);
+
+  // PnL color: green if positive, red if negative (current value)
+  var lastPnl = pnlVals[pnlVals.length-1] || 0;
+  var pnlColor = lastPnl >= 0 ? '#3fb950' : '#f85149';
+  var pnlBg = lastPnl >= 0 ? 'rgba(63,185,80,0.1)' : 'rgba(248,81,73,0.1)';
+  // Per-point colors for the line
+  var pnlSegmentColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
+  var pnlPointColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
+
+  // ── Equity Chart ──
   if(eqChart){
     eqChart.data.labels = labels;
     eqChart.data.datasets[0].data = eqVals;
-    eqChart.data.datasets[1].data = pnlVals;
-    eqChart.data.datasets[1].backgroundColor = pnlColors;
-    eqChart.data.datasets[1].borderColor = pnlBorders;
     eqChart.options.scales.y.min = eqMin - eqPad;
     eqChart.options.scales.y.max = eqMax + eqPad;
-    eqChart.options.scales.y1.ticks.color = pnlAxisColor;
-    eqChart.options.scales.y1.title.color = pnlAxisColor;
     eqChart.update('none');
-    return;
-  }
-  eqChart = new Chart(canvas, {
-    type:'bar',
-    data:{
-      labels: labels,
-      datasets:[
-        {label:'Equity', data:eqVals, borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.15)',
-         type:'line', fill:true, tension:0.3, pointRadius:2, borderWidth:2, yAxisID:'y', order:1},
-        {label:'PnL', data:pnlVals, backgroundColor:pnlColors,
-         borderColor:pnlBorders, borderWidth:1, barPercentage:0.5, yAxisID:'y1', order:2}
-      ]
-    },
-    options:{
-      responsive:true, maintainAspectRatio:false, animation:false,
-      plugins:{legend:{labels:{color:'#8b949e',font:{size:11},generateLabels:function(chart){
-        var ds = chart.data.datasets;
-        return [{text:'Equity',fillStyle:'rgba(88,166,255,0.15)',strokeStyle:'#58a6ff',lineWidth:2,datasetIndex:0},
-                {text:'PnL',fillStyle:'rgba(63,185,80,0.4)',strokeStyle:'#f85149',lineWidth:2,datasetIndex:1}];
-      }}}},
-      scales:{
-        x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-        y:{type:'linear',position:'left',min:eqMin-eqPad,max:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'},title:{display:true,text:'Equity',color:'#58a6ff'}},
-        y1:{type:'linear',position:'right',ticks:{color:pnlAxisColor,font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{drawOnChartArea:false},title:{display:true,text:'PnL',color:pnlAxisColor}}
+  } else {
+    eqChart = new Chart(eqCanvas, {
+      type:'line',
+      data:{labels:labels, datasets:[{
+        label:'Portfolio Equity', data:eqVals,
+        borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.08)',
+        fill:true, tension:0.3, pointRadius:3, pointBackgroundColor:'#58a6ff', borderWidth:2
+      }]},
+      options:{
+        responsive:true, maintainAspectRatio:false, animation:false,
+        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
+        scales:{
+          x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
+          y:{min:eqMin-eqPad,max:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'}}
+        }
       }
-    }
-  });
+    });
+  }
+
+  // ── PnL Chart ──
+  if(pnlChart){
+    pnlChart.data.labels = labels;
+    pnlChart.data.datasets[0].data = pnlVals;
+    pnlChart.data.datasets[0].borderColor = pnlColor;
+    pnlChart.data.datasets[0].backgroundColor = pnlBg;
+    pnlChart.data.datasets[0].pointBackgroundColor = pnlPointColors;
+    pnlChart.update('none');
+  } else {
+    pnlChart = new Chart(pnlCanvas, {
+      type:'line',
+      data:{labels:labels, datasets:[{
+        label:'Cumulative PnL', data:pnlVals,
+        borderColor:pnlColor, backgroundColor:pnlBg,
+        fill:true, tension:0.3, pointRadius:4, pointBackgroundColor:pnlPointColors, borderWidth:2
+      }]},
+      options:{
+        responsive:true, maintainAspectRatio:false, animation:false,
+        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
+        scales:{
+          x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
+          y:{ticks:{color:pnlColor,font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
+        }
+      }
+    });
+  }
 }
 
 // ── Per-Class Table ──────────────────────────────────────────────
