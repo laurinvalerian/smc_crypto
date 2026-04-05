@@ -1694,7 +1694,7 @@ function updateEquity(data){
         plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}}},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-          y:{ticks:{color:pnlColor,font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
+          y:{ticks:{color:function(ctx){return ctx.tick.value>=0?'#3fb950':'#f85149'},font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
         }
       }
     });
