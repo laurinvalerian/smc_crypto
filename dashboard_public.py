@@ -1646,8 +1646,8 @@ function updateEquity(data){
   if(eqChart){
     eqChart.data.labels = labels;
     eqChart.data.datasets[0].data = eqVals;
-    eqChart.options.scales.y.min = eqMin - eqPad;
-    eqChart.options.scales.y.max = eqMax + eqPad;
+    eqChart.options.scales.y.suggestedMin = eqMin - eqPad;
+    eqChart.options.scales.y.suggestedMax = eqMax + eqPad;
     eqChart.update('none');
   } else {
     eqChart = new Chart(eqCanvas, {
@@ -1662,7 +1662,7 @@ function updateEquity(data){
         plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-          y:{min:eqMin-eqPad,max:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'}}
+          y:{suggestedMin:eqMin-eqPad,suggestedMax:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},maxTicksLimit:6,callback:function(v){return '$'+Math.round(v).toLocaleString()}},grid:{color:'#21262d'}}
         }
       }
     });
