@@ -1609,22 +1609,29 @@ function updateEquity(data){
   var labels = data.map(function(p){ return p.timestamp ? p.timestamp.substring(5,16) : ''; });
   var eqVals = data.map(function(p){ return p.equity; });
   var pnlVals = data.map(function(p){ return p.pnl; });
+  // Bar colors: green for positive, red for negative PnL
+  var pnlColors = pnlVals.map(function(v){ return v >= 0 ? '#3fb950' : '#f85149'; });
+  var lastPnl = pnlVals.length ? pnlVals[pnlVals.length-1] : 0;
+  var pnlAxisColor = lastPnl >= 0 ? '#3fb950' : '#f85149';
   if(eqChart){
     eqChart.data.labels = labels;
     eqChart.data.datasets[0].data = eqVals;
     eqChart.data.datasets[1].data = pnlVals;
+    eqChart.data.datasets[1].backgroundColor = pnlColors;
+    eqChart.options.scales.y1.ticks.color = pnlAxisColor;
+    eqChart.options.scales.y1.title.color = pnlAxisColor;
     eqChart.update('none');
     return;
   }
   eqChart = new Chart(canvas, {
-    type:'line',
+    type:'bar',
     data:{
       labels: labels,
       datasets:[
-        {label:'Equity', data:eqVals, borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.08)',
-         fill:true, tension:0.3, pointRadius:2, borderWidth:2, yAxisID:'y'},
-        {label:'PnL', data:pnlVals, borderColor:'#3fb950', backgroundColor:'transparent',
-         fill:false, tension:0.3, pointRadius:4, pointBackgroundColor:'#3fb950', borderWidth:2, yAxisID:'y1'}
+        {label:'Equity', data:eqVals, borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.15)',
+         type:'line', fill:true, tension:0.3, pointRadius:2, borderWidth:2, yAxisID:'y', order:1},
+        {label:'PnL', data:pnlVals, backgroundColor:pnlColors,
+         borderColor:pnlColors, borderWidth:1, yAxisID:'y1', order:2}
       ]
     },
     options:{
@@ -1633,7 +1640,7 @@ function updateEquity(data){
       scales:{
         x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
         y:{type:'linear',position:'left',ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'},title:{display:true,text:'Equity',color:'#58a6ff'}},
-        y1:{type:'linear',position:'right',ticks:{color:'#3fb950',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{drawOnChartArea:false},title:{display:true,text:'PnL',color:'#3fb950'}}
+        y1:{type:'linear',position:'right',ticks:{color:pnlAxisColor,font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{drawOnChartArea:false},title:{display:true,text:'PnL',color:pnlAxisColor}}
       }
     }
   });
