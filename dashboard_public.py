@@ -419,43 +419,38 @@ def _get_rl_stats() -> dict:
 
 
 def _get_equity_curve() -> list[dict]:
-    """Read equity CSV files and merge into a single time-sorted series."""
-    points: list[dict] = []
-    if not RESULTS_DIR.exists():
-        return points
-    # Build bot-tag -> asset_class map for display multiplier
-    bot_ac_map: dict[str, str] = {}
-    if DISPLAY_MULTIPLIERS:
-        bots = _discover_bots()
-        for tag, bot in bots.items():
-            bot_ac_map[tag] = bot.get("asset_class", "unknown")
-    for eq_path in sorted(RESULTS_DIR.glob("bot_*_equity.csv")):
-        tag = eq_path.stem.replace("_equity", "")
-        ac = bot_ac_map.get(tag, "unknown")
-        mult = DISPLAY_MULTIPLIERS.get(ac, 1.0)
-        try:
-            with open(eq_path) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    points.append({
-                        "timestamp": row.get("timestamp", ""),
-                        "equity": float(row.get("equity", 0)) * mult,
-                        "pnl": float(row.get("pnl", 0)) * mult,
-                    })
-        except Exception:
-            continue
-    # Aggregate by timestamp (sum equity across bots at same time)
-    by_ts: dict[str, dict] = {}
-    for p in points:
-        ts = p["timestamp"]
-        if ts not in by_ts:
-            by_ts[ts] = {"timestamp": ts, "equity": 0.0, "pnl": 0.0}
-        by_ts[ts]["equity"] += p["equity"]
-        by_ts[ts]["pnl"] += p["pnl"]
+    """Build portfolio equity curve from journal closed trades.
 
-    result = sorted(by_ts.values(), key=lambda x: x["timestamp"])
-    # Limit to last 500 points for chart performance
-    return result[-500:]
+    Starts at 300K (3 brokers × 100K), adds each trade's PnL chronologically.
+    PnL is display-adjusted (crypto ×20).
+    """
+    _INITIAL_PORTFOLIO = 300_000.0  # 3 brokers × 100K
+
+    if not _journal_has_table("trades"):
+        return [{"timestamp": "", "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
+
+    rows = _query_journal(
+        "SELECT exit_time, pnl_pct, asset_class FROM trades "
+        "WHERE exit_time IS NOT NULL ORDER BY exit_time ASC"
+    )
+
+    if not rows:
+        return [{"timestamp": "", "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
+
+    # Each trade's $ PnL = pnl_pct × 100K (all accounts normalized to 100K display)
+    cumulative_pnl = 0.0
+    points = [{"timestamp": rows[0].get("exit_time", "")[:16], "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
+
+    for r in rows:
+        pnl_dollar = (r.get("pnl_pct") or 0.0) * 100_000.0
+        cumulative_pnl += pnl_dollar
+        points.append({
+            "timestamp": (r.get("exit_time") or "")[:16],
+            "equity": round(_INITIAL_PORTFOLIO + cumulative_pnl, 2),
+            "pnl": round(cumulative_pnl, 2),
+        })
+
+    return points[-500:]
 
 
 def _system_stats() -> dict:
@@ -1449,7 +1444,7 @@ a:hover{text-decoration:underline}
       <table class="trade-history-table" id="th-table">
         <thead style="position:sticky;top:0;background:#161b22;z-index:1"><tr>
           <th>Time</th><th>Symbol</th><th>Direction</th>
-          <th>Entry</th><th>Exit</th><th>RR</th><th>Risk%</th><th>Conf</th>
+          <th>Entry</th><th>Exit</th><th>RR</th><th>Risk%</th><th>Score</th>
           <th>PnL %</th><th>PnL $</th><th>Outcome</th><th>Exit Reason</th>
         </tr></thead>
         <tbody id="th-body"></tbody>
