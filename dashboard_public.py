@@ -1681,15 +1681,29 @@ function updateEquity(data){
       type:'line',
       data:{labels:labels, datasets:[{
         label:'Cumulative PnL', data:pnlVals,
-        borderColor:pnlColor, backgroundColor:pnlBg,
-        fill:true, tension:0.3, pointRadius:4, pointBackgroundColor:pnlPointColors, borderWidth:2
+        segment:{borderColor:function(ctx){return ctx.p1.parsed.y>=0?'#3fb950':'#f85149'}},
+        backgroundColor:function(ctx){
+          var chart=ctx.chart, area=chart.chartArea;
+          if(!area) return 'rgba(63,185,80,0.1)';
+          var g=chart.ctx.createLinearGradient(0,area.top,0,area.bottom);
+          var yScale=chart.scales.y, zero=yScale.getPixelForValue(0);
+          var zeroNorm=Math.max(0,Math.min(1,(zero-area.top)/(area.bottom-area.top)));
+          g.addColorStop(0,'rgba(63,185,80,0.15)');
+          g.addColorStop(Math.max(0,zeroNorm-0.01),'rgba(63,185,80,0.05)');
+          g.addColorStop(Math.min(1,zeroNorm+0.01),'rgba(248,81,73,0.05)');
+          g.addColorStop(1,'rgba(248,81,73,0.15)');
+          return g;
+        },
+        borderColor:'#3fb950',
+        fill:true, tension:0.3, pointRadius:5, pointBorderWidth:2,
+        pointBackgroundColor:pnlPointColors, pointBorderColor:pnlPointColors, borderWidth:2
       }]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
         plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-          y:{ticks:{color:pnlColor,font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
+          y:{ticks:{color:function(v){return v>=0?'#3fb950':'#f85149'},font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
         }
       }
     });
