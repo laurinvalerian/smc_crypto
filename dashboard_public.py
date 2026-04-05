@@ -2084,6 +2084,9 @@ function updateActiveTrades(trades){
     html += '<span><span class="label">SL:</span> <span class="red">' + fmt(t.sl,5) + '</span></span>';
     html += '<span><span class="label">TP:</span> <span class="green">' + fmt(t.tp,5) + '</span></span>';
     html += '<span><span class="label">PnL:</span> <span id="pnl-' + symId + '" class="' + pnlColor(pnl) + '">' + (pnl>=0?'+$':'-$') + fmt(Math.abs(pnl),2) + '</span></span>';
+    var hh = t.hold_time_hours || 0;
+    var holdStr = hh < 1 ? Math.round(hh*60)+'m' : (hh < 24 ? fmt(hh,1)+'h' : fmt(hh/24,1)+'d');
+    html += '<span><span class="label">Hold:</span> ' + holdStr + '</span>';
     html += '</div></div>';
   }
   grid.innerHTML = html;
