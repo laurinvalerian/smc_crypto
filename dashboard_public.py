@@ -311,21 +311,19 @@ def _aggregate_stats() -> dict:
     max_dd_pct = 0.0
     per_class: dict[str, dict] = {}
 
-    # Track per-broker equity (not per-bot or per-class).
+    # Per-broker: sum PnL from ALL bots, equity = initial + total PnL
     # OANDA serves both forex AND commodities from one 100K account.
     _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
-    broker_equity_seen: dict[str, bool] = {}
+    _INITIAL_EQUITY = 100_000.0  # all brokers normalized to 100K display
+    broker_pnl: dict[str, float] = {}  # sum of display PnL per broker
 
     for tag, bot in bots.items():
         trades = bot.get("trades", 0)
         wins = bot.get("wins", 0)
         pnl = bot.get("total_pnl", 0.0)
-        equity = bot.get("equity", 0.0)
-        peak = bot.get("peak_equity", 0.0)
         actives = bot.get("active_trades", [])
 
         ac = bot.get("asset_class", "unknown")
-        # Apply display multiplier (e.g., crypto ×20 for Binance testnet)
         disp_pnl = _apply_display_mult(ac, pnl)
 
         total_trades += trades
@@ -341,23 +339,24 @@ def _aggregate_stats() -> dict:
         per_class[ac]["pnl"] += disp_pnl
         per_class[ac]["active"] += len(actives)
 
-        # Equity: take from first bot per BROKER (forex+commodities share OANDA)
+        # Accumulate PnL per broker
         broker = _BROKER_MAP.get(ac, ac)
-        if broker not in broker_equity_seen:
-            disp_equity = _apply_display_mult(ac, equity)
-            disp_peak = _apply_display_mult(ac, peak)
-            per_class[ac]["equity"] = round(disp_equity, 2)
-            total_equity += disp_equity
-            broker_equity_seen[broker] = True
+        broker_pnl[broker] = broker_pnl.get(broker, 0.0) + disp_pnl
 
-            if disp_peak > 0:
-                dd = (disp_peak - disp_equity) / disp_peak * 100
-                if dd > max_dd_pct:
-                    max_dd_pct = dd
-        else:
-            # Broker already counted — don't add equity again but show per-class
-            if "equity" not in per_class[ac] or per_class[ac]["equity"] == 0:
-                per_class[ac]["equity"] = round(_apply_display_mult(ac, equity), 2)
+    # Compute equity per broker: initial 100K + total realized PnL
+    for broker, pnl_sum in broker_pnl.items():
+        broker_equity = _INITIAL_EQUITY + pnl_sum
+        total_equity += broker_equity
+        # Map back to per-class for display
+        for ac, br in _BROKER_MAP.items():
+            if br == broker and ac in per_class:
+                per_class[ac]["equity"] = round(broker_equity, 2)
+                break
+
+    # DD from total
+    if total_equity < _INITIAL_EQUITY * len(broker_pnl):
+        initial_total = _INITIAL_EQUITY * len(broker_pnl)
+        max_dd_pct = (initial_total - total_equity) / initial_total * 100
 
     wr = round(total_wins / total_trades * 100, 2) if total_trades > 0 else 0.0
 
@@ -1199,7 +1198,8 @@ def api_trade_history():
     desired = [
         "trade_id", "symbol", "asset_class", "direction",
         "entry_time", "exit_time", "entry_price", "exit_price",
-        "pnl_pct", "rr_actual", "outcome", "exit_reason",
+        "pnl_pct", "rr_actual", "risk_pct", "score",
+        "outcome", "exit_reason",
     ]
     select_cols = [c for c in desired if c in cols]
     if not select_cols:
@@ -1449,7 +1449,7 @@ a:hover{text-decoration:underline}
       <table class="trade-history-table" id="th-table">
         <thead style="position:sticky;top:0;background:#161b22;z-index:1"><tr>
           <th>Time</th><th>Symbol</th><th>Direction</th>
-          <th>Entry Price</th><th>Exit Price</th><th>RR</th>
+          <th>Entry</th><th>Exit</th><th>RR</th><th>Risk%</th><th>Conf</th>
           <th>PnL %</th><th>PnL $</th><th>Outcome</th><th>Exit Reason</th>
         </tr></thead>
         <tbody id="th-body"></tbody>
@@ -2140,6 +2140,8 @@ function renderTradeHistory(trades, append){
     html += '<td>'+fmt(t.entry_price,5)+'</td>';
     html += '<td>'+fmt(t.exit_price,5)+'</td>';
     html += '<td>'+fmt(t.rr_actual,2)+'</td>';
+    html += '<td>'+((t.risk_pct||0)*100).toFixed(2)+'%</td>';
+    html += '<td>'+fmt(t.score,3)+'</td>';
     html += '<td class="'+pnlColor(pnlPct)+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</td>';
     html += '<td class="'+pnlColor(pnlDollar)+'">'+(pnlDollar>=0?'+$':'-$')+Math.abs(pnlDollar).toFixed(2)+'</td>';
     html += '<td><span class="'+(isWin?'green':'red')+'">'+(t.outcome||'--')+'</span></td>';
