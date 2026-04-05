@@ -1609,15 +1609,23 @@ function updateEquity(data){
   var labels = data.map(function(p){ return p.timestamp ? p.timestamp.substring(5,16) : ''; });
   var eqVals = data.map(function(p){ return p.equity; });
   var pnlVals = data.map(function(p){ return p.pnl; });
-  // Bar colors: green for positive, red for negative PnL
-  var pnlColors = pnlVals.map(function(v){ return v >= 0 ? '#3fb950' : '#f85149'; });
+  // Bar colors: green for positive, red for negative PnL (semi-transparent)
+  var pnlColors = pnlVals.map(function(v){ return v >= 0 ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)'; });
+  var pnlBorders = pnlVals.map(function(v){ return v >= 0 ? '#3fb950' : '#f85149'; });
   var lastPnl = pnlVals.length ? pnlVals[pnlVals.length-1] : 0;
+  // Tight Y-axis for equity: show ±2% around mean so small changes are visible
+  var eqMin = Math.min.apply(null, eqVals);
+  var eqMax = Math.max.apply(null, eqVals);
+  var eqPad = Math.max((eqMax - eqMin) * 0.3, eqMax * 0.005);  // at least 0.5% padding
   var pnlAxisColor = lastPnl >= 0 ? '#3fb950' : '#f85149';
   if(eqChart){
     eqChart.data.labels = labels;
     eqChart.data.datasets[0].data = eqVals;
     eqChart.data.datasets[1].data = pnlVals;
     eqChart.data.datasets[1].backgroundColor = pnlColors;
+    eqChart.data.datasets[1].borderColor = pnlBorders;
+    eqChart.options.scales.y.min = eqMin - eqPad;
+    eqChart.options.scales.y.max = eqMax + eqPad;
     eqChart.options.scales.y1.ticks.color = pnlAxisColor;
     eqChart.options.scales.y1.title.color = pnlAxisColor;
     eqChart.update('none');
@@ -1631,15 +1639,19 @@ function updateEquity(data){
         {label:'Equity', data:eqVals, borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.15)',
          type:'line', fill:true, tension:0.3, pointRadius:2, borderWidth:2, yAxisID:'y', order:1},
         {label:'PnL', data:pnlVals, backgroundColor:pnlColors,
-         borderColor:pnlColors, borderWidth:1, yAxisID:'y1', order:2}
+         borderColor:pnlBorders, borderWidth:1, barPercentage:0.5, yAxisID:'y1', order:2}
       ]
     },
     options:{
       responsive:true, maintainAspectRatio:false, animation:false,
-      plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
+      plugins:{legend:{labels:{color:'#8b949e',font:{size:11},generateLabels:function(chart){
+        var ds = chart.data.datasets;
+        return [{text:'Equity',fillStyle:'rgba(88,166,255,0.15)',strokeStyle:'#58a6ff',lineWidth:2,datasetIndex:0},
+                {text:'PnL',fillStyle:'rgba(63,185,80,0.4)',strokeStyle:'#f85149',lineWidth:2,datasetIndex:1}];
+      }}}},
       scales:{
         x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-        y:{type:'linear',position:'left',ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'},title:{display:true,text:'Equity',color:'#58a6ff'}},
+        y:{type:'linear',position:'left',min:eqMin-eqPad,max:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'},title:{display:true,text:'Equity',color:'#58a6ff'}},
         y1:{type:'linear',position:'right',ticks:{color:pnlAxisColor,font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{drawOnChartArea:false},title:{display:true,text:'PnL',color:pnlAxisColor}}
       }
     }
