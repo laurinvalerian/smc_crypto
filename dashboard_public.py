@@ -1627,9 +1627,9 @@ function updateEquity(data){
       labels: labels,
       datasets:[
         {label:'Equity', data:eqVals, borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.08)',
-         fill:true, tension:0.3, pointRadius:0, borderWidth:2},
+         fill:true, tension:0.3, pointRadius:2, borderWidth:2, yAxisID:'y'},
         {label:'PnL', data:pnlVals, borderColor:'#3fb950', backgroundColor:'rgba(63,185,80,0.08)',
-         fill:true, tension:0.3, pointRadius:0, borderWidth:1.5}
+         fill:true, tension:0.3, pointRadius:2, borderWidth:1.5, yAxisID:'y1'}
       ]
     },
     options:{
@@ -1637,7 +1637,8 @@ function updateEquity(data){
       plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
       scales:{
         x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-        y:{ticks:{color:'#484f58',font:{size:10}},grid:{color:'#21262d'}}
+        y:{type:'linear',position:'left',ticks:{color:'#58a6ff',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{color:'#21262d'},title:{display:true,text:'Equity',color:'#58a6ff'}},
+        y1:{type:'linear',position:'right',ticks:{color:'#3fb950',font:{size:10},callback:function(v){return '$'+v.toLocaleString()}},grid:{drawOnChartArea:false},title:{display:true,text:'PnL',color:'#3fb950'}}
       }
     }
   });
