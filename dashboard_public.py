@@ -1197,10 +1197,9 @@ def api_trade_history():
     cols = _journal_columns()
     # Build SELECT with only columns that exist
     desired = [
-        "trade_id", "symbol", "direction", "style", "tier",
+        "trade_id", "symbol", "asset_class", "direction",
         "entry_time", "exit_time", "entry_price", "exit_price",
-        "pnl_pct", "rr_actual", "bars_held", "outcome",
-        "exit_reason", "confidence",
+        "pnl_pct", "rr_actual", "outcome", "exit_reason",
     ]
     select_cols = [c for c in desired if c in cols]
     if not select_cols:
@@ -1446,12 +1445,12 @@ a:hover{text-decoration:underline}
   <!-- Trade History -->
   <div class="section">
     <div class="section-title">Trade History</div>
-    <div class="tbl-scroll">
+    <div class="tbl-scroll" style="max-height:560px;overflow-y:auto">
       <table class="trade-history-table" id="th-table">
-        <thead><tr>
-          <th>Symbol</th><th>Dir</th><th>Style</th><th>Tier</th>
-          <th>Entry</th><th>Exit</th><th>PnL%</th><th>RR</th>
-          <th>Duration</th><th>Outcome</th><th>Exit Reason</th>
+        <thead style="position:sticky;top:0;background:#161b22;z-index:1"><tr>
+          <th>Time</th><th>Symbol</th><th>Direction</th>
+          <th>Entry Price</th><th>Exit Price</th><th>RR</th>
+          <th>PnL %</th><th>PnL $</th><th>Outcome</th><th>Exit Reason</th>
         </tr></thead>
         <tbody id="th-body"></tbody>
       </table>
@@ -1486,19 +1485,6 @@ a:hover{text-decoration:underline}
     </div>
   </div>
 
-  <!-- Trade Log -->
-  <div class="section">
-    <div class="section-title">Recent Trades (last 100)</div>
-    <div class="tbl-scroll">
-      <table class="tbl">
-        <thead><tr>
-          <th>Time</th><th>Symbol</th><th>Class</th><th>Dir</th><th>Tier</th>
-          <th>Entry</th><th>Exit</th><th>RR</th><th>PnL%</th><th>Outcome</th><th>Reason</th>
-        </tr></thead>
-        <tbody id="trades-body"><tr><td colspan="11" class="empty">No trades yet</td></tr></tbody>
-      </table>
-    </div>
-  </div>
 
   <div class="grid-2">
     <!-- Near-miss Monitor -->
@@ -1705,35 +1691,6 @@ function updateRL(d){
   el.innerHTML = html;
 }
 
-// ── Trades Table ─────────────────────────────────────────────────
-
-function updateTrades(rows){
-  var body = $('trades-body');
-  if(!rows || !rows.length){
-    body.innerHTML = '<tr><td colspan="12" class="empty">No trades yet</td></tr>';
-    return;
-  }
-  var html = '';
-  for(var i=0; i<rows.length; i++){
-    var r = rows[i];
-    var oc = r.outcome === 'win' ? 'green' : r.outcome === 'loss' ? 'red' : '';
-    var et = r.exit_time ? r.exit_time.substring(0,16) : (r.entry_time ? r.entry_time.substring(0,16) : '--');
-    html += '<tr>';
-    html += '<td style="white-space:nowrap">'+escHtml(et)+'</td>';
-    html += '<td>'+escHtml(r.symbol||'--')+'</td>';
-    html += '<td style="text-transform:capitalize">'+escHtml(r.asset_class||'--')+'</td>';
-    html += '<td>'+escHtml(r.direction||'--')+'</td>';
-    html += '<td>'+escHtml(r.tier||'--')+'</td>';
-    html += '<td>'+fmt(r.entry_price,5)+'</td>';
-    html += '<td>'+fmt(r.exit_price,5)+'</td>';
-    html += '<td>'+fmt(r.rr_actual,2)+'</td>';
-    html += '<td class="'+pnlColor(r.pnl_pct)+'">'+fmt(r.pnl_pct,3)+'%</td>';
-    html += '<td class="'+oc+'">'+escHtml(r.outcome||'--')+'</td>';
-    html += '<td>'+escHtml(r.exit_reason||'--')+'</td>';
-    html += '</tr>';
-  }
-  body.innerHTML = html;
-}
 
 // ── Near-misses ──────────────────────────────────────────────────
 
@@ -1863,7 +1820,6 @@ function loadAll(){
   fetchJ('/api/public/status', updateStatus);
   fetchJ('/api/public/overview', updateOverview);
   fetchJ('/api/public/equity', updateEquity);
-  fetchJ('/api/public/trades', updateTrades);
   fetchJ('/api/public/per-class', updatePerClass);
   fetchJ('/api/public/rl-stats', updateRL);
   fetchJ('/api/public/near-misses', updateNearMisses);
@@ -1879,7 +1835,6 @@ loadAll();
 setInterval(function(){ fetchJ('/api/public/status', updateStatus); }, 10000);
 setInterval(function(){ fetchJ('/api/public/overview', updateOverview); }, 30000);
 setInterval(function(){ fetchJ('/api/public/equity', updateEquity); }, 60000);
-setInterval(function(){ fetchJ('/api/public/trades', updateTrades); }, 30000);
 setInterval(function(){ fetchJ('/api/public/per-class', updatePerClass); }, 30000);
 setInterval(function(){ fetchJ('/api/public/rl-stats', updateRL); }, 60000);
 setInterval(function(){ fetchJ('/api/public/near-misses', updateNearMisses); }, 30000);
@@ -2068,7 +2023,6 @@ function updateActiveTrades(trades){
     html += '<span class="trade-card-symbol">' + escHtml(sym) + '</span>';
     html += '<span class="trade-card-dir ' + dirCls + '">' + dir.toUpperCase() + '</span>';
     if(t.style) html += '<span class="trade-card-tag">' + escHtml(t.style) + '</span>';
-    if(t.tier) html += '<span class="trade-card-tag">' + escHtml(t.tier) + '</span>';
     if(t.confidence) html += '<span class="trade-card-tag">conf: ' + fmt(t.confidence,3) + '</span>';
     html += '</div>';
     html += '<div class="trade-card-chart" id="chart-' + symId + '"></div>';
@@ -2175,30 +2129,21 @@ function renderTradeHistory(trades, append){
     var t = trades[i];
     var isWin = t.outcome === 'win';
     var rowCls = isWin ? 'win-row' : (t.outcome === 'loss' ? 'loss-row' : '');
-    var pnl = t.pnl_pct || 0;
+    var pnlPct = (t.pnl_pct || 0) * 100;
+    var pnlDollar = (t.pnl_pct || 0) * 100000;
     var dir = t.direction ? t.direction.charAt(0).toUpperCase() + t.direction.slice(1) : '--';
-    // Duration
-    var dur = '--';
-    if(t.entry_time && t.exit_time){
-      var ms = new Date(t.exit_time) - new Date(t.entry_time);
-      var mins = Math.round(ms/60000);
-      if(mins < 60) dur = mins + 'm';
-      else if(mins < 1440) dur = Math.round(mins/60) + 'h ' + (mins%60) + 'm';
-      else dur = Math.round(mins/1440) + 'd';
-    } else if(t.bars_held){
-      dur = t.bars_held + ' bars';
-    }
+    var exitTime = t.exit_time ? t.exit_time.substring(0,16) : '--';
     html += '<tr class="'+rowCls+'">';
-    html += '<td>'+escHtml(t.symbol)+'</td>';
+    html += '<td style="white-space:nowrap">'+escHtml(exitTime)+'</td>';
+    html += '<td>'+escHtml(t.symbol||'--')+'</td>';
     html += '<td><span class="'+(t.direction==='long'?'green':'red')+'">'+dir+'</span></td>';
-    html += '<td>'+escHtml(t.style||'--')+'</td>';
-    html += '<td>'+escHtml(t.tier||'--')+'</td>';
     html += '<td>'+fmt(t.entry_price,5)+'</td>';
     html += '<td>'+fmt(t.exit_price,5)+'</td>';
-    html += '<td class="'+pnlColor(pnl)+'">'+(pnl>=0?'+':'')+fmt(pnl,2)+'%</td>';
     html += '<td>'+fmt(t.rr_actual,2)+'</td>';
-    html += '<td>'+dur+'</td>';
+    html += '<td class="'+pnlColor(pnlPct)+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</td>';
+    html += '<td class="'+pnlColor(pnlDollar)+'">'+(pnlDollar>=0?'+$':'-$')+Math.abs(pnlDollar).toFixed(2)+'</td>';
     html += '<td><span class="'+(isWin?'green':'red')+'">'+(t.outcome||'--')+'</span></td>';
+    html += '<td>'+escHtml(t.exit_reason||'--')+'</td>';
     html += '</tr>';
   }
   if(append) tbody.innerHTML += html;
