@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS trades (
     rr_actual         REAL,
     risk_pct          REAL,
     score             REAL,
+    xgb_confidence    REAL,
     be_triggered      INTEGER DEFAULT 0,
     max_favorable_pct REAL,
     max_adverse_pct   REAL,
@@ -188,6 +189,7 @@ class TradeJournal:
         leverage: int,
         risk_pct: float,
         entry_features: dict[str, float] | None = None,
+        xgb_confidence: float = 0.0,
     ) -> None:
         """Record trade open.  Call after bracket order is confirmed filled."""
         try:
@@ -195,12 +197,12 @@ class TradeJournal:
                 """INSERT OR IGNORE INTO trades
                    (trade_id, symbol, asset_class, direction, style, tier,
                     entry_time, entry_price, sl_original, tp, score,
-                    rr_target, leverage, risk_pct, entry_features)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    xgb_confidence, rr_target, leverage, risk_pct, entry_features)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     trade_id, symbol, asset_class, direction, style, tier,
                     _ts(entry_time), entry_price, sl_original, tp, score,
-                    rr_target, leverage, risk_pct,
+                    xgb_confidence, rr_target, leverage, risk_pct,
                     json.dumps(entry_features or {}),
                 ),
             )

@@ -2430,6 +2430,7 @@ class PaperBot:
                     leverage=used_leverage,
                     risk_pct=risk_pct,
                     entry_features=sig.get("features", {}),
+                    xgb_confidence=rl_confidence,
                 )
             except Exception as exc:
                 self.logger.debug("journal.open_trade error: %s", exc)

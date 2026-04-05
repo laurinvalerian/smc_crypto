@@ -1193,7 +1193,7 @@ def api_trade_history():
     desired = [
         "trade_id", "symbol", "asset_class", "direction",
         "entry_time", "exit_time", "entry_price", "exit_price",
-        "pnl_pct", "rr_actual", "risk_pct", "score",
+        "pnl_pct", "rr_actual", "risk_pct", "score", "xgb_confidence",
         "outcome", "exit_reason",
     ]
     select_cols = [c for c in desired if c in cols]
@@ -1444,7 +1444,7 @@ a:hover{text-decoration:underline}
       <table class="trade-history-table" id="th-table">
         <thead style="position:sticky;top:0;background:#161b22;z-index:1"><tr>
           <th>Time</th><th>Symbol</th><th>Direction</th>
-          <th>Entry</th><th>Exit</th><th>RR</th><th>Risk%</th><th>Score</th>
+          <th>Entry</th><th>Exit</th><th>RR</th><th>Risk%</th><th>Conf</th>
           <th>PnL %</th><th>PnL $</th><th>Outcome</th><th>Exit Reason</th>
         </tr></thead>
         <tbody id="th-body"></tbody>
@@ -1623,8 +1623,8 @@ function updateEquity(data){
       datasets:[
         {label:'Equity', data:eqVals, borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.08)',
          fill:true, tension:0.3, pointRadius:2, borderWidth:2, yAxisID:'y'},
-        {label:'PnL', data:pnlVals, borderColor:'#3fb950', backgroundColor:'rgba(63,185,80,0.08)',
-         fill:true, tension:0.3, pointRadius:2, borderWidth:1.5, yAxisID:'y1'}
+        {label:'PnL', data:pnlVals, borderColor:'#3fb950', backgroundColor:'transparent',
+         fill:false, tension:0.3, pointRadius:4, pointBackgroundColor:'#3fb950', borderWidth:2, yAxisID:'y1'}
       ]
     },
     options:{
@@ -2137,7 +2137,7 @@ function renderTradeHistory(trades, append){
     html += '<td>'+fmt(t.exit_price,5)+'</td>';
     html += '<td>'+fmt(t.rr_actual,2)+'</td>';
     html += '<td>'+((t.risk_pct||0)*100).toFixed(2)+'%</td>';
-    html += '<td>'+fmt(t.score,3)+'</td>';
+    html += '<td>'+fmt(t.xgb_confidence||t.score,3)+'</td>';
     html += '<td class="'+pnlColor(pnlPct)+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</td>';
     html += '<td class="'+pnlColor(pnlDollar)+'">'+(pnlDollar>=0?'+$':'-$')+Math.abs(pnlDollar).toFixed(2)+'</td>';
     html += '<td><span class="'+(isWin?'green':'red')+'">'+(t.outcome||'--')+'</span></td>';
