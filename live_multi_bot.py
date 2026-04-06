@@ -399,21 +399,8 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
 TIER_AAA_PLUS_PLUS = "AAA++"
 TIER_AAA_PLUS = "AAA+"
 
-TIER_THRESHOLDS: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS_PLUS: {"min_score": 0.75, "min_rr": 2.5},  # lowered from 0.88/3.0 — XGBoost is primary filter
-    TIER_AAA_PLUS:      {"min_score": 0.60, "min_rr": 2.0},  # lowered from 0.78/2.0 — let brain evaluate more signals
-}
-
-TIER_RISK: dict[str, dict[str, float]] = {
-    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.015},  # 1.0%–1.5%
-    TIER_AAA_PLUS:      {"base_risk": 0.005, "max_risk": 0.010},  # 0.5%–1.0%
-}
-
-# Maximum leverage per tier – both tiers get precise entry leverage
-TIER_MAX_LEVERAGE: dict[str, int] = {
-    TIER_AAA_PLUS_PLUS: 50,
-    TIER_AAA_PLUS: 30,
-}
+# Tier labels kept for logging/journal only — NOT used for risk sizing or gates.
+# Risk sizing is 100% confidence-based. Leverage capped by ASSET_MAX_LEVERAGE.
 
 # (removed: _history_exchange / _get_history_exchange — history now loaded via adapter)
 
@@ -2531,16 +2518,14 @@ class PaperBot:
 
         planned_leverage = max(1, int(max_leverage))
 
-        # ── Tier-based leverage cap ──────────────────────────────
-        # SPEC trades get conservative leverage (max 15x),
-        # A trades moderate (max 25x), AAA+ can use full exchange leverage
-        tier_max_lev = TIER_MAX_LEVERAGE.get(tier, 20)
-        if planned_leverage > tier_max_lev:
+        # ── Asset-class leverage cap ─────────────────────────────
+        asset_max_lev = ASSET_MAX_LEVERAGE.get(self.asset_class, 10)
+        if planned_leverage > asset_max_lev:
             self.logger.info(
-                "Capping leverage %dx → %dx for tier %s on %s",
-                planned_leverage, tier_max_lev, tier, symbol,
+                "Capping leverage %dx → %dx for %s on %s",
+                planned_leverage, asset_max_lev, self.asset_class, symbol,
             )
-            planned_leverage = tier_max_lev
+            planned_leverage = asset_max_lev
 
         # ═══════════════════════════════════════════════════════════
         #  STEP 3: Helper functions
@@ -3117,58 +3102,8 @@ class PaperBot:
 
     # ── Setup quality tier classification ─────────────────────────
 
-    def _classify_setup_tier(
-        self, score: float, rr: float, components: dict[str, Any],
-    ) -> str:
-        """
-        Classify setup quality: AAA++ (sniper) or AAA+ (strong fallback).
-
-        AAA++ requires ALL components aligned – the absolute best setups only.
-        AAA+ requires core SMC alignment + strong bias.
-        Per-class skip_flags allow tick-volume classes to bypass unreliable gates.
-
-        No A or SPEC tiers – only high-probability trades.
-        """
-        skip = self._tier_skip_flags
-
-        def _flag(name: str) -> bool:
-            """Check flag, returning True (pass) if flag is in skip list."""
-            if name in skip:
-                return True
-            return bool(components.get(name, False))
-
-        # AAA++: Sniper setup – every single component must be True
-        t = TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]
-        if (score >= t["min_score"]
-                and rr >= t["min_rr"]
-                and _flag("bias_strong")
-                and _flag("h4_confirms")
-                and _flag("h4_poi")
-                and _flag("h1_confirms")
-                and _flag("h1_choch")
-                and (components.get("entry_zone") is not None or "entry_zone" in skip)
-                and _flag("precision_trigger")
-                and _flag("volume_ok")
-                and _flag("adx_strong")
-                and _flag("session_optimal")
-                and _flag("zone_quality_ok")
-                and _flag("momentum_confluent")
-                and (components.get("tf_agreement", 0) >= 4 or "tf_agreement" in skip)):
-            return TIER_AAA_PLUS_PLUS
-
-        # AAA+: Premium setup – core SMC alignment + strong bias
-        t = TIER_THRESHOLDS[TIER_AAA_PLUS]
-        if (score >= t["min_score"]
-                and rr >= t["min_rr"]
-                and _flag("bias_strong")
-                and _flag("h4_confirms")
-                and _flag("h1_confirms")
-                and _flag("precision_trigger")
-                and _flag("volume_ok")
-                and _flag("adx_strong")):
-            return TIER_AAA_PLUS
-
-        return ""  # Don't trade – quality too low
+    # _classify_setup_tier removed — tier labels assigned inline for logging only.
+    # Risk sizing is 100% confidence-based. No tier gates.
 
     # ── Style-aware SL/TP from multiple timeframes ───────────────
 

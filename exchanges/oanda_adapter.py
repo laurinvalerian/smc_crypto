@@ -467,7 +467,7 @@ class OandaAdapter(ExchangeAdapter):
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._api.order.market, self._account_id, **{"order": order_data},
+                    self._api.order.market, self._account_id, **order_data,
                 ),
                 timeout=30.0,
             )
