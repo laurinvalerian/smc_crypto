@@ -5155,7 +5155,11 @@ class LiveMultiBotRunner:
                             continue
 
                         # No exit trade found but position flat → use last known trade price or SL as fallback
-                        if bot.symbol not in pos_map:
+                        # Grace period: don't close freshly opened trades (< 60s) — position may not be synced yet
+                        _trade_age_s = (datetime.now(timezone.utc) - trade["entry_time"]).total_seconds() if isinstance(trade.get("entry_time"), datetime) else 999
+                        if bot.symbol not in pos_map and _trade_age_s > 60:
+                            bot.logger.warning("GHOST EXIT %s: not in pos_map (age=%.0fs, pos_map_keys=%s)",
+                                bot.symbol, _trade_age_s, list(pos_map.keys())[:10])
                             fallback_price = None
                             if recent:
                                 try:
