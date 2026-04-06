@@ -209,8 +209,15 @@ class OandaAdapter(ExchangeAdapter):
             # Override from OANDA API if available
             if oanda_sym in oanda_instruments:
                 inst = oanda_instruments[oanda_sym]
-                pip_loc = getattr(inst, "pipLocation", -4)
-                tick_size = 10 ** pip_loc
+                # Use displayPrecision (number of decimal places) as primary
+                # source for price formatting — more reliable than pipLocation
+                # for SL/TP price precision (avoids PRICE_PRECISION_EXCEEDED).
+                display_prec = getattr(inst, "displayPrecision", None)
+                if display_prec is not None:
+                    tick_size = 10 ** -int(display_prec)
+                else:
+                    pip_loc = getattr(inst, "pipLocation", -4)
+                    tick_size = 10 ** int(pip_loc)
                 min_units = getattr(inst, "minimumTradeSize", "1")
                 min_qty = float(min_units)
                 max_units = getattr(inst, "maximumOrderUnits", None)

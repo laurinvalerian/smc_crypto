@@ -443,6 +443,14 @@ root_logger.addHandler(_central_fh)
 
 logger = root_logger
 
+class _BracketSLTPFailed(Exception):
+    """Raised when SL/TP placement fails after entry was already filled.
+
+    The retry loop must NOT create a new entry — the position was already
+    flattened (or flatten was attempted).  Retrying would create zombie positions.
+    """
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Paper-Trading Bot  (coin-specialised, fixed params, RL brain)
 # ═══════════════════════════════════════════════════════════════════
@@ -2220,7 +2228,7 @@ class PaperBot:
                 )
                 # Alert: abnormal acceptance rate after 20+ decisions
                 if _total_rl >= 20 and (_rate < 10 or _rate > 95):
-                    self.logger.warning(
+                    self.logger.debug(
                         "RL ALERT: acceptance rate %.0f%% (%d/%d) — check feature extraction",
                         _rate, self._rl_accepted, _total_rl,
                     )
@@ -2724,6 +2732,16 @@ class PaperBot:
                         qty, risk_pct, planned_leverage,
                         oanda_trade_id,
                     )
+                except _BracketSLTPFailed as sltp_exc:
+                    # Entry was filled but SL/TP failed — position already
+                    # flattened (or flatten attempted).  Do NOT retry with a
+                    # new entry; that would create zombie positions.
+                    self.logger.error(
+                        "[BRACKET_ABORT] %s %s — SL/TP failed after entry, "
+                        "position flattened. NOT retrying. %s",
+                        direction.upper(), symbol, sltp_exc,
+                    )
+                    return None, None, None, qty, risk_pct, planned_leverage, None
                 except Exception as exc:
                     code, msg = _extract_code_msg(exc)
                     self.logger.error(
@@ -2889,7 +2907,7 @@ class PaperBot:
                     "SL order FAILED %s %s: %s", exit_side.upper(), symbol, exc,
                 )
                 await _close_position("SL placement failure")
-                raise
+                raise _BracketSLTPFailed(f"SL failed after entry: {exc}") from exc
 
             try:
                 tp_order = await self.adapter.create_take_profit(
@@ -2913,7 +2931,7 @@ class PaperBot:
                             sl_order_id, cancel_exc,
                         )
                 await _close_position("TP placement failure")
-                raise
+                raise _BracketSLTPFailed(f"TP failed after entry: {exc}") from exc
 
         return entry_id, sl_order_id, tp_order_id, oanda_trade_id
 
@@ -4780,12 +4798,19 @@ class LiveMultiBotRunner:
                         else:
                             tp_price = float(trade.get("tp", 0.0))
                             sl_price = float(trade.get("sl", 0.0))
-                            if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.003 and net_pnl > 0:
+                            # 1% tolerance (was 0.3%) — wider to handle slippage
+                            # on OANDA and illiquid instruments
+                            if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.01 and net_pnl > 0:
                                 exit_reason = "tp_hit"
-                            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.003 and net_pnl <= 0:
+                            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.01 and net_pnl <= 0:
                                 exit_reason = "sl_hit"
                             else:
-                                exit_reason = "manual"
+                                # PnL-based fallback: if price didn't match SL/TP
+                                # within tolerance, infer from profit direction
+                                if net_pnl > 0:
+                                    exit_reason = "tp_hit"
+                                else:
+                                    exit_reason = "sl_hit"
 
                         # MFE/MAE from journal's running tracker
                         max_fav = bot.journal._max_favorable.get(trade_id_j, abs(pnl_pct / 100))
