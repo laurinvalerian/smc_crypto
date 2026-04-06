@@ -187,11 +187,18 @@ def collect_live_data(
         tp_achievement = np.clip(mfe / tp_target, 0.0, 1.5)
 
         exit_reason = df["exit_reason"].values
+        outcome = df["label"].values  # 1=win, 0=loss
 
         for i in range(len(df)):
             er = exit_reason[i] if i < len(exit_reason) else ""
             tpa = tp_achievement[i]
             rr = rr_actual[i]
+
+            # Sanity: tp_hit must be win, sl_hit must be loss — fix mislabeled journal rows
+            if er == "tp_hit" and outcome[i] == 0:
+                er = "manual"
+            elif er == "sl_hit" and outcome[i] == 1:
+                er = "manual"
 
             if er == "tp_hit":
                 weights[i] *= max(rr, 1.0)  # full win weight

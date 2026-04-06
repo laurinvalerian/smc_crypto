@@ -214,42 +214,8 @@ class CircuitBreaker:
                 self._state.size_reduction_factor = 1.0
                 logger.info("CIRCUIT BREAKER: Weekly loss recovered. Normal sizing.")
 
-        # ── Per-Asset-Class Drawdown ───────────────────────────────
-        for asset_class in ("crypto", "forex", "stocks", "commodities"):
-            class_pnl = self._compute_period_pnl(day_start, asset_class)
-            self._state.asset_class_pnl_pct[asset_class] = class_pnl
-
-            paused_until = self._state.asset_class_paused_until.get(asset_class)
-            log_key = f"class_{asset_class}"
-
-            # If already paused, only check expiry
-            if paused_until is not None:
-                if utc_now >= paused_until:
-                    self._state.asset_class_breakers[asset_class] = False
-                    del self._state.asset_class_paused_until[asset_class]
-                    if self._last_log_state.get(log_key) != "resumed":
-                        logger.info(
-                            "CIRCUIT BREAKER: %s pause expired. Trading resumed.",
-                            asset_class,
-                        )
-                        self._last_log_state[log_key] = "resumed"
-            elif class_pnl <= -self._asset_dd_limit:
-                if self._last_log_state.get(log_key) != "paused":
-                    logger.warning(
-                        "CIRCUIT BREAKER: %s loss %.2f%% exceeds -%.1f%%. "
-                        "Pausing %s for %dh.",
-                        asset_class, class_pnl * 100,
-                        self._asset_dd_limit * 100,
-                        asset_class, ASSET_CLASS_PAUSE_HOURS,
-                    )
-                    self._last_log_state[log_key] = "paused"
-                self._state.asset_class_breakers[asset_class] = True
-                self._state.asset_class_paused_until[asset_class] = (
-                    utc_now + timedelta(hours=ASSET_CLASS_PAUSE_HOURS)
-                )
-            else:
-                # Normal state — clear log dedup so next trigger logs again
-                self._last_log_state.pop(log_key, None)
+        # NOTE: Per-asset-class DD pause removed — each broker now has its own
+        # CircuitBreaker instance, so daily/weekly/alltime limits apply per-account.
 
         # ── All-Time Drawdown (Funded Account Protection) ─────────
         if self._state.alltime_dd_pct <= -self._alltime_dd_limit:
@@ -361,16 +327,6 @@ class CircuitBreaker:
             remaining = state.all_trading_paused_until - utc_now
             return False, (
                 f"All trading paused (daily loss {state.daily_pnl_pct:.2%}). "
-                f"Resumes in {remaining.total_seconds() / 3600:.1f}h"
-            )
-
-        # Asset class pause
-        class_paused = state.asset_class_paused_until.get(asset_class)
-        if class_paused and utc_now < class_paused:
-            remaining = class_paused - utc_now
-            return False, (
-                f"{asset_class} paused (class loss "
-                f"{state.asset_class_pnl_pct.get(asset_class, 0):.2%}). "
                 f"Resumes in {remaining.total_seconds() / 3600:.1f}h"
             )
 

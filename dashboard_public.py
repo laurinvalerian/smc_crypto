@@ -301,14 +301,17 @@ def _discover_bots() -> dict[str, dict]:
 
 
 def _aggregate_stats() -> dict:
-    """Aggregate stats across all bots from live_results state files."""
+    """Aggregate stats across all bots from live_results state files.
+
+    Per-broker DD, active trades, and heat are computed individually
+    because each broker maps to a separate funded account (100K each).
+    """
     bots = _discover_bots()
     total_trades = 0
     total_wins = 0
     total_pnl = 0.0
     total_equity = 0.0
     active_positions = 0
-    max_dd_pct = 0.0
     per_class: dict[str, dict] = {}
 
     # Per-broker: sum PnL from ALL bots, equity = initial + total PnL
@@ -316,6 +319,8 @@ def _aggregate_stats() -> dict:
     _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
     _INITIAL_EQUITY = 100_000.0  # all brokers normalized to 100K display
     broker_pnl: dict[str, float] = {}  # sum of display PnL per broker
+    broker_active: dict[str, int] = {}  # open trades per broker
+    broker_heat: dict[str, float] = {}  # portfolio heat per broker
 
     for tag, bot in bots.items():
         trades = bot.get("trades", 0)
@@ -325,6 +330,7 @@ def _aggregate_stats() -> dict:
 
         ac = bot.get("asset_class", "unknown")
         disp_pnl = _apply_display_mult(ac, pnl)
+        broker = _BROKER_MAP.get(ac, ac)
 
         total_trades += trades
         total_wins += wins
@@ -339,24 +345,35 @@ def _aggregate_stats() -> dict:
         per_class[ac]["pnl"] += disp_pnl
         per_class[ac]["active"] += len(actives)
 
-        # Accumulate PnL per broker
-        broker = _BROKER_MAP.get(ac, ac)
+        # Accumulate per broker
         broker_pnl[broker] = broker_pnl.get(broker, 0.0) + disp_pnl
+        broker_active[broker] = broker_active.get(broker, 0) + len(actives)
 
-    # Compute equity per broker: initial 100K + total realized PnL
+        # Heat per broker (non-BE trades only)
+        for trade in actives:
+            if isinstance(trade, dict) and not trade.get("be_triggered", False):
+                broker_heat[broker] = broker_heat.get(broker, 0.0) + float(trade.get("risk_pct", 0.0))
+
+    # Compute equity + DD per broker (each is a separate funded account)
+    per_broker: dict[str, dict] = {}
+    worst_dd_pct = 0.0
     for broker, pnl_sum in broker_pnl.items():
         broker_equity = _INITIAL_EQUITY + pnl_sum
         total_equity += broker_equity
+        dd_pct = max(0.0, (_INITIAL_EQUITY - broker_equity) / _INITIAL_EQUITY * 100)
+        worst_dd_pct = max(worst_dd_pct, dd_pct)
+        per_broker[broker] = {
+            "equity": round(broker_equity, 2),
+            "pnl": round(pnl_sum, 2),
+            "pnl_pct": round(pnl_sum / _INITIAL_EQUITY * 100, 2),
+            "dd_pct": round(dd_pct, 2),
+            "active": broker_active.get(broker, 0),
+            "heat_pct": round(broker_heat.get(broker, 0.0), 2),
+        }
         # Map back to per-class for display
         for ac, br in _BROKER_MAP.items():
             if br == broker and ac in per_class:
                 per_class[ac]["equity"] = round(broker_equity, 2)
-                break
-
-    # DD from total
-    if total_equity < _INITIAL_EQUITY * len(broker_pnl):
-        initial_total = _INITIAL_EQUITY * len(broker_pnl)
-        max_dd_pct = (initial_total - total_equity) / initial_total * 100
 
     wr = round(total_wins / total_trades * 100, 2) if total_trades > 0 else 0.0
 
@@ -365,10 +382,12 @@ def _aggregate_stats() -> dict:
         "total_wins": total_wins,
         "win_rate": wr,
         "total_pnl": round(total_pnl, 4),
+        "total_pnl_pct": round(total_pnl / (_INITIAL_EQUITY * max(len(broker_pnl), 1)) * 100, 2),
         "total_equity": round(total_equity, 2),
         "active_positions": active_positions,
-        "max_dd_pct": round(max_dd_pct, 2),
+        "max_dd_pct": round(worst_dd_pct, 2),
         "per_class": per_class,
+        "per_broker": per_broker,
     }
 
 
@@ -722,6 +741,53 @@ def api_per_class():
     return jsonify(per_class)
 
 
+@app.route("/api/public/period-stats")
+def api_period_stats():
+    """Return daily/weekly/monthly PnL and DD from journal trades."""
+    if not _journal_has_table("trades"):
+        return jsonify({"daily": {}, "weekly": {}, "monthly": {}})
+    cols = _journal_columns()
+    has_ac = "asset_class" in cols
+
+    def _period(where_clause: str) -> dict:
+        sql = (
+            "SELECT pnl_pct, outcome"
+            + (", asset_class" if has_ac else "")
+            + " FROM trades WHERE exit_time IS NOT NULL AND " + where_clause
+        )
+        rows = _query_journal(sql)
+        if not rows:
+            return {"pnl_pct": 0.0, "pnl_dollar": 0.0, "trades": 0, "wins": 0, "losses": 0, "dd_pct": 0.0}
+        total_pct = sum(r["pnl_pct"] or 0.0 for r in rows)
+        wins = sum(1 for r in rows if r["outcome"] == "win")
+        losses = len(rows) - wins
+        # DD = worst running drawdown within the period
+        running = 0.0
+        peak = 0.0
+        worst_dd = 0.0
+        for r in rows:
+            running += r["pnl_pct"] or 0.0
+            if running > peak:
+                peak = running
+            dd = peak - running
+            if dd > worst_dd:
+                worst_dd = dd
+        return {
+            "pnl_pct": round(total_pct * 100, 2),
+            "pnl_dollar": round(total_pct * 100_000.0, 2),
+            "trades": len(rows),
+            "wins": wins,
+            "losses": losses,
+            "dd_pct": round(worst_dd * 100, 2),
+        }
+
+    daily = _period("DATE(exit_time) = DATE('now')")
+    weekly = _period("DATE(exit_time) >= DATE('now', '-7 days')")
+    monthly = _period("DATE(exit_time) >= DATE('now', '-30 days')")
+
+    return jsonify({"daily": daily, "weekly": weekly, "monthly": monthly})
+
+
 @app.route("/api/public/rl-stats")
 def api_rl_stats():
     stats = _get_rl_stats()
@@ -789,6 +855,10 @@ def api_circuit_breaker():
     # Risk budget: how much more risk can be taken (dynamic)
     risk_budget = max(0.0, 3.0 - abs(min(daily_pnl_pct, 0)) - portfolio_heat_pct)
 
+    # Per-broker breakdown from aggregate stats
+    agg = _aggregate_stats()
+    per_broker = agg.get("per_broker", {})
+
     return jsonify({
         "daily_pnl_pct": round(daily_pnl_pct, 2),
         "daily_loss_limit": 3.0,
@@ -804,6 +874,7 @@ def api_circuit_breaker():
         "heat_breaker": risk.get("heat_breaker", False),
         "paused": any_breaker,
         "status": status,
+        "per_broker": per_broker,
     })
 
 
@@ -1420,6 +1491,7 @@ a:hover{text-decoration:underline}
     <div class="card">
       <div class="card-label">Total PnL</div>
       <div class="card-value" id="c-pnl">--</div>
+      <div class="card-sub" id="c-pnl-dollar"></div>
       <div class="card-sub" id="c-dd">Max DD: --</div>
     </div>
     <div class="card">
@@ -1427,6 +1499,25 @@ a:hover{text-decoration:underline}
       <div class="card-value" id="c-upnl">--</div>
       <div class="card-sub" id="c-upnl-count">0 open positions</div>
       <div class="card-sub" id="c-upnl-breakdown" style="font-size:11px;margin-top:2px"></div>
+    </div>
+  </div>
+
+  <!-- Period PnL Cards -->
+  <div class="cards" id="period-cards" style="margin-top:8px">
+    <div class="card">
+      <div class="card-label">Daily PnL</div>
+      <div class="card-value" id="c-daily-pnl">--</div>
+      <div class="card-sub" id="c-daily-sub">0 trades</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Weekly PnL</div>
+      <div class="card-value" id="c-weekly-pnl">--</div>
+      <div class="card-sub" id="c-weekly-sub">0 trades</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Monthly PnL</div>
+      <div class="card-value" id="c-monthly-pnl">--</div>
+      <div class="card-sub" id="c-monthly-sub">0 trades</div>
     </div>
   </div>
 
@@ -1595,9 +1686,20 @@ function updateOverview(d){
   $('c-sharpe').textContent = 'Sharpe: ' + fmt(d.sharpe,2);
 
   var pnl = d.total_pnl || 0;
-  $('c-pnl').textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl),2);
+  var pnlPct = d.total_pnl_pct || 0;
+  $('c-pnl').textContent = (pnlPct >= 0 ? '+' : '') + fmt(pnlPct,2) + '%';
   $('c-pnl').className = 'card-value ' + pnlColor(pnl);
-  $('c-dd').textContent = 'Max DD: ' + fmt(d.max_dd_pct,2) + '%';
+  $('c-pnl-dollar').innerHTML = '<span style="color:#8b949e;font-size:12px">' + (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl),0) + '</span>';
+  // Show worst per-broker DD (each account is a separate funded account)
+  var ddLabel = 'Max DD: ' + fmt(d.max_dd_pct,2) + '%';
+  var pb = d.per_broker || {};
+  var worstBroker = '';
+  var worstDD = 0;
+  var brokerLabels = {'binance':'Crypto','oanda':'Forex','alpaca':'Stocks'};
+  for(var bk in pb){ if(pb[bk].dd_pct > worstDD){ worstDD = pb[bk].dd_pct; worstBroker = bk; } }
+  if(worstBroker) ddLabel += ' (' + (brokerLabels[worstBroker]||worstBroker) + ')';
+  $('c-dd').textContent = ddLabel;
+  $('c-dd').style.color = worstDD > 3 ? '#f85149' : worstDD > 1 ? '#d29922' : '#8b949e';
 
   $('hd-equity').textContent = d.total_equity ? ('Equity: $' + fmt(d.total_equity,2)) : '';
 }
@@ -1800,8 +1902,30 @@ function updateRisk(d){
   var html = '';
   html += renderProgressBar('Daily DD', d.daily_pnl_pct||0, d.daily_loss_limit||3, '#3fb950');
   html += renderProgressBar('Weekly DD', d.weekly_pnl_pct||0, d.weekly_loss_limit||5, '#58a6ff');
-  html += renderProgressBar('All-Time DD', d.alltime_dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
+  html += renderProgressBar('All-Time DD (worst)', d.alltime_dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
   html += renderProgressBar('Open Risk', d.portfolio_heat_pct||0, d.risk_budget_remaining||3, '#d29922');
+
+  // Per-broker DD breakdown
+  var pb = d.per_broker || {};
+  var brokerNames = {'binance':'Binance (Crypto)','oanda':'OANDA (Forex)','alpaca':'Alpaca (Stocks)'};
+  var brokerKeys = Object.keys(pb);
+  if(brokerKeys.length){
+    html += '<div style="margin-top:10px;font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px">Per Account</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;margin-top:4px">';
+    for(var bi=0; bi<brokerKeys.length; bi++){
+      var bk = brokerKeys[bi];
+      var b = pb[bk];
+      var bName = brokerNames[bk] || bk;
+      var ddCol = (b.dd_pct||0) > 3 ? '#f85149' : (b.dd_pct||0) > 1 ? '#d29922' : '#3fb950';
+      html += '<div style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px">';
+      html += '<div style="font-size:11px;color:#8b949e">'+escHtml(bName)+'</div>';
+      html += '<div style="font-size:16px;font-weight:600;color:'+ddCol+'">DD: '+fmt(b.dd_pct,2)+'%</div>';
+      html += '<div style="font-size:11px;color:#8b949e">PnL: <span style="color:'+(b.pnl>=0?'#3fb950':'#f85149')+'">'+(b.pnl>=0?'+$':'-$')+fmt(Math.abs(b.pnl),0)+'</span>';
+      html += ' · Open: '+(b.active||0)+' · Heat: '+fmt(b.heat_pct,1)+'%</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
 
   // Active breakers
   var breakers = [];
@@ -1872,6 +1996,31 @@ function fetchJ(url, cb, retries){
   });
 }
 
+// ── Period Stats (Daily / Weekly / Monthly) ─────────────────────
+
+function updatePeriodStats(d){
+  function renderPeriod(prefix, p){
+    if(!p || !p.trades){
+      $(prefix+'-pnl').textContent = '--';
+      $(prefix+'-pnl').className = 'card-value';
+      $(prefix+'-sub').textContent = '0 trades';
+      return;
+    }
+    var pct = p.pnl_pct || 0;
+    var dollar = p.pnl_dollar || 0;
+    $(prefix+'-pnl').textContent = (pct >= 0 ? '+' : '') + fmt(pct,2) + '%';
+    $(prefix+'-pnl').className = 'card-value ' + pnlColor(pct);
+    var wr = p.trades > 0 ? (p.wins/p.trades*100) : 0;
+    var sub = (dollar >= 0 ? '+$' : '-$') + fmt(Math.abs(dollar),0);
+    sub += ' · ' + p.trades + ' trades · ' + fmt(wr,0) + '% WR';
+    if(p.dd_pct > 0) sub += ' · DD: ' + fmt(p.dd_pct,2) + '%';
+    $(prefix+'-sub').innerHTML = '<span style="color:#8b949e">' + sub + '</span>';
+  }
+  renderPeriod('c-daily', d.daily);
+  renderPeriod('c-weekly', d.weekly);
+  renderPeriod('c-monthly', d.monthly);
+}
+
 // ── Initial load + polling ───────────────────────────────────────
 
 function loadAll(){
@@ -1879,6 +2028,7 @@ function loadAll(){
   fetchJ('/api/public/overview', updateOverview);
   fetchJ('/api/public/equity', updateEquity);
   fetchJ('/api/public/per-class', updatePerClass);
+  fetchJ('/api/public/period-stats', updatePeriodStats);
   fetchJ('/api/public/rl-stats', updateRL);
   fetchJ('/api/public/near-misses', updateNearMisses);
   fetchJ('/api/public/risk', updateRisk);
@@ -1894,6 +2044,7 @@ setInterval(function(){ fetchJ('/api/public/status', updateStatus); }, 10000);
 setInterval(function(){ fetchJ('/api/public/overview', updateOverview); }, 30000);
 setInterval(function(){ fetchJ('/api/public/equity', updateEquity); }, 60000);
 setInterval(function(){ fetchJ('/api/public/per-class', updatePerClass); }, 30000);
+setInterval(function(){ fetchJ('/api/public/period-stats', updatePeriodStats); }, 30000);
 setInterval(function(){ fetchJ('/api/public/rl-stats', updateRL); }, 60000);
 setInterval(function(){ fetchJ('/api/public/near-misses', updateNearMisses); }, 30000);
 setInterval(function(){ fetchJ('/api/public/risk', updateRisk); }, 15000);

@@ -3773,10 +3773,17 @@ class LiveMultiBotRunner:
         for bot in bots:
             self._bots_by_class[bot.asset_class].append(bot)
 
-        # ── Circuit Breaker (shared across all bots) ───────────────
-        self.circuit_breaker = CircuitBreaker()
+        # ── Circuit Breakers (per-broker for funded account isolation) ──
+        # Each broker = separate funded account → independent DD limits.
+        _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "oanda", "commodities": "oanda"}
+        self._broker_cbs: dict[str, CircuitBreaker] = {}
         for bot in self.bots:
-            bot.circuit_breaker = self.circuit_breaker
+            broker = _BROKER_MAP.get(bot.asset_class, bot.asset_class)
+            if broker not in self._broker_cbs:
+                self._broker_cbs[broker] = CircuitBreaker()
+            bot.circuit_breaker = self._broker_cbs[broker]
+        # Keep reference to primary (worst) for dashboard compatibility
+        self.circuit_breaker = next(iter(self._broker_cbs.values()), CircuitBreaker())
 
         # ── Paper Grid (Multi-Variant A/B Testing) ───────────────
         # Disabled: main bot's tier-based risk is well-calibrated from backtesting.
@@ -4829,15 +4836,18 @@ class LiveMultiBotRunner:
 
                         outcome_str = "win" if net_pnl > 0 else "loss"
                         # Determine exit reason from price proximity to SL/TP
+                        # IMPORTANT: also check profitability — TP hit must be a win,
+                        # SL hit must be a loss. Prevents mislabeling that poisons
+                        # the continuous learner's sample weights.
                         _override_reason = trade.get("_exit_reason_override")
                         if _override_reason:
                             exit_reason = _override_reason
                         else:
                             tp_price = float(trade.get("tp", 0.0))
                             sl_price = float(trade.get("sl", 0.0))
-                            if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.003:
+                            if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.003 and net_pnl > 0:
                                 exit_reason = "tp_hit"
-                            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.003:
+                            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.003 and net_pnl <= 0:
                                 exit_reason = "sl_hit"
                             else:
                                 exit_reason = "manual"
@@ -5503,19 +5513,30 @@ class LiveMultiBotRunner:
 
         Uses bal.total (account equity) instead of bal.free (buying power).
         """
-        total = 0.0
+        totals = await self._fetch_per_broker_equity()
+        return sum(totals.values())
+
+    async def _fetch_per_broker_equity(self) -> dict[str, float]:
+        """Fetch equity per broker for per-account DD tracking.
+
+        Returns dict like {"binance": 5000.0, "oanda": 100000.0, "alpaca": 100000.0}.
+        OANDA is shared by forex + commodities (one account).
+        """
+        _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+        broker_equity: dict[str, float] = {}
         seen: set[int] = set()
         for ac, adapter in self.adapters.items():
             aid = id(adapter)
             if aid in seen:
                 continue
             seen.add(aid)
+            broker = _BROKER_MAP.get(ac, ac)
             try:
                 bal = await adapter.fetch_balance()
-                total += bal.total
+                broker_equity[broker] = bal.total
             except Exception as exc:
                 logger.debug("fetch_balance [%s] failed: %s", ac, exc)
-        return total
+        return broker_equity
 
     async def _dashboard_loop(self) -> None:
         """Render the Rich Live Dashboard every DASHBOARD_REFRESH_SEC."""
@@ -5524,19 +5545,23 @@ class LiveMultiBotRunner:
         with Live(console=console, refresh_per_second=1, screen=True) as live:
             while not self._shutdown.is_set():
                 try:
-                    total_equity = await self._fetch_real_total_equity()
+                    # Per-broker equity + circuit breaker updates
+                    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+                    broker_equity = await self._fetch_per_broker_equity()
                     for b in self.bots:
-                        b._account_equity = total_equity
+                        broker = _BROKER_MAP.get(b.asset_class, b.asset_class)
+                        b._account_equity = broker_equity.get(broker, 0.0)
 
-                    # Update circuit breaker portfolio heat
-                    # BE-triggered trades have SL at breakeven → effective risk is 0
-                    total_risk = sum(
-                        0.0 if t.get("be_triggered") else t.get("risk_pct", 0.0)
-                        for b in self.bots
-                        for t in b._active_trades
-                    )
-                    self.circuit_breaker.update_portfolio_heat(total_risk)
-                    self.circuit_breaker.check()
+                    # Update heat + check per-broker circuit breakers
+                    broker_heat: dict[str, float] = {}
+                    for b in self.bots:
+                        broker = _BROKER_MAP.get(b.asset_class, b.asset_class)
+                        for t in b._active_trades:
+                            risk = 0.0 if t.get("be_triggered") else t.get("risk_pct", 0.0)
+                            broker_heat[broker] = broker_heat.get(broker, 0.0) + risk
+                    for broker, cb in self._broker_cbs.items():
+                        cb.update_portfolio_heat(broker_heat.get(broker, 0.0))
+                        cb.check()
 
                     # Save paper grid state periodically
                     if self.paper_grid is not None:
@@ -5692,10 +5717,12 @@ class LiveMultiBotRunner:
         )
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-        # Fetch final equity before closing exchange
-        final_equity = await self._fetch_real_total_equity()
+        # Fetch final equity per-broker before closing exchange
+        _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+        final_broker_eq = await self._fetch_per_broker_equity()
         for b in self.bots:
-            b._account_equity = final_equity
+            broker = _BROKER_MAP.get(b.asset_class, b.asset_class)
+            b._account_equity = final_broker_eq.get(broker, 0.0)
             # === PERSISTENCE ===
             try:
                 b._save_state()
