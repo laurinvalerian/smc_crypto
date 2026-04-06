@@ -777,16 +777,15 @@ class OandaAdapter(ExchangeAdapter):
         if hasattr(response, "body") and "positions" in response.body:
             for p in response.body["positions"]:
                 instrument = getattr(p, "instrument", "")
-                unified = self._oanda_to_unified.get(
-                    instrument, instrument.replace("_", "/")
-                )
+                # Use OANDA-native symbol (XAG_USD) — bots use this format
+                sym = instrument
 
                 long_units = float(getattr(p.long, "units", 0))
                 short_units = abs(float(getattr(p.short, "units", 0)))
 
                 if long_units > 0:
                     positions.append(PositionInfo(
-                        symbol=unified,
+                        symbol=sym,
                         side="long",
                         qty=long_units,
                         entry_price=float(getattr(p.long, "averagePrice", 0)),
@@ -797,7 +796,7 @@ class OandaAdapter(ExchangeAdapter):
                     ))
                 if short_units > 0:
                     positions.append(PositionInfo(
-                        symbol=unified,
+                        symbol=sym,
                         side="short",
                         qty=short_units,
                         entry_price=float(getattr(p.short, "averagePrice", 0)),
