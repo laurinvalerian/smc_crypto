@@ -2028,7 +2028,7 @@ function loadAll(){
   fetchJ('/api/public/period-stats', updatePeriodStats);
   fetchJ('/api/public/rl-stats', updateRL);
   fetchJ('/api/public/near-misses', updateNearMisses);
-  fetchJ('/api/public/risk', updateRisk);
+  fetchJ('/api/public/circuit-breaker', updateRisk);
   fetchJ('/api/public/logs', updateLogs);
   fetchJ('/api/public/system', updateSystem);
 }
@@ -2044,7 +2044,7 @@ setInterval(function(){ fetchJ('/api/public/per-class', updatePerClass); }, 3000
 setInterval(function(){ fetchJ('/api/public/period-stats', updatePeriodStats); }, 30000);
 setInterval(function(){ fetchJ('/api/public/rl-stats', updateRL); }, 60000);
 setInterval(function(){ fetchJ('/api/public/near-misses', updateNearMisses); }, 30000);
-setInterval(function(){ fetchJ('/api/public/risk', updateRisk); }, 15000);
+setInterval(function(){ fetchJ('/api/public/circuit-breaker', updateRisk); }, 15000);
 setInterval(function(){ fetchJ('/api/public/logs', updateLogs); }, 5000);
 setInterval(function(){ fetchJ('/api/public/system', updateSystem); }, 30000);
 
