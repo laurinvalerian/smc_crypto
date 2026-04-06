@@ -499,6 +499,20 @@ class OandaAdapter(ExchangeAdapter):
                 create = response.body["orderCreateTransaction"]
                 order_id = str(getattr(create, "id", ""))
                 status = "open"
+            elif "orderRejectTransaction" in response.body:
+                reject = response.body["orderRejectTransaction"]
+                reason = getattr(reject, "rejectReason", "unknown")
+                logger.warning("OANDA order REJECTED %s %s %s: %s", side, oanda_sym, qty, reason)
+                status = "rejected"
+            elif "orderCancelTransaction" in response.body:
+                cancel = response.body["orderCancelTransaction"]
+                reason = getattr(cancel, "reason", "unknown")
+                logger.warning("OANDA order CANCELLED %s %s %s: %s", side, oanda_sym, qty, reason)
+                status = "cancelled"
+            else:
+                # Log unexpected response for debugging
+                keys = list(response.body.keys()) if hasattr(response.body, "keys") else str(type(response.body))
+                logger.warning("OANDA unexpected response for %s %s: keys=%s", side, oanda_sym, keys)
 
         return OrderResult(
             order_id=order_id,
