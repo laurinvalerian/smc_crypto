@@ -382,7 +382,7 @@ def _aggregate_stats() -> dict:
         "total_wins": total_wins,
         "win_rate": wr,
         "total_pnl": round(total_pnl, 4),
-        "total_pnl_pct": round(total_pnl / (_INITIAL_EQUITY * max(len(broker_pnl), 1)) * 100, 2),
+        "total_pnl_pct": round(sum(b["pnl_pct"] for b in per_broker.values()) / max(len(per_broker), 1), 2),
         "total_equity": round(total_equity, 2),
         "active_positions": active_positions,
         "max_dd_pct": round(worst_dd_pct, 2),
@@ -1686,13 +1686,20 @@ function updateOverview(d){
   var pnlPct = d.total_pnl_pct || 0;
   $('c-pnl').textContent = (pnlPct >= 0 ? '+' : '') + fmt(pnlPct,2) + '%';
   $('c-pnl').className = 'card-value ' + pnlColor(pnl);
-  $('c-pnl-dollar').innerHTML = '<span style="color:#8b949e;font-size:12px">' + (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl),0) + '</span>';
+  // Per-broker PnL breakdown below total
+  var pb = d.per_broker || {};
+  var brokerLabels = {'binance':'Crypto','oanda':'Forex','alpaca':'Stocks'};
+  var bkParts = [];
+  for(var bk in pb){
+    var bpct = pb[bk].pnl_pct || 0;
+    var bLabel = brokerLabels[bk] || bk;
+    bkParts.push('<span class="'+pnlColor(bpct)+'">' + bLabel + ': ' + (bpct>=0?'+':'') + fmt(bpct,2) + '%</span>');
+  }
+  $('c-pnl-dollar').innerHTML = '<span style="font-size:11px">' + bkParts.join(' &nbsp; ') + '</span>';
   // Show worst per-broker DD (each account is a separate funded account)
   var ddLabel = 'Max DD: ' + fmt(d.max_dd_pct,2) + '%';
-  var pb = d.per_broker || {};
   var worstBroker = '';
   var worstDD = 0;
-  var brokerLabels = {'binance':'Crypto','oanda':'Forex','alpaca':'Stocks'};
   for(var bk in pb){ if(pb[bk].dd_pct > worstDD){ worstDD = pb[bk].dd_pct; worstBroker = bk; } }
   if(worstBroker) ddLabel += ' (' + (brokerLabels[worstBroker]||worstBroker) + ')';
   $('c-dd').textContent = ddLabel;
