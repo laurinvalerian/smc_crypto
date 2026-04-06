@@ -349,10 +349,10 @@ def _aggregate_stats() -> dict:
         broker_pnl[broker] = broker_pnl.get(broker, 0.0) + disp_pnl
         broker_active[broker] = broker_active.get(broker, 0) + len(actives)
 
-        # Heat per broker (non-BE trades only)
+        # Heat per broker (non-BE trades only) — risk_pct stored as fraction (0.01 = 1%)
         for trade in actives:
             if isinstance(trade, dict) and not trade.get("be_triggered", False):
-                broker_heat[broker] = broker_heat.get(broker, 0.0) + float(trade.get("risk_pct", 0.0))
+                broker_heat[broker] = broker_heat.get(broker, 0.0) + float(trade.get("risk_pct", 0.0)) * 100
 
     # Compute equity + DD per broker (each is a separate funded account)
     per_broker: dict[str, dict] = {}
