@@ -5548,6 +5548,7 @@ class LiveMultiBotRunner:
                     # Per-broker equity + circuit breaker updates
                     _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
                     broker_equity = await self._fetch_per_broker_equity()
+                    total_equity = sum(broker_equity.values())
                     for b in self.bots:
                         broker = _BROKER_MAP.get(b.asset_class, b.asset_class)
                         b._account_equity = broker_equity.get(broker, 0.0)
