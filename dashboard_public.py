@@ -808,73 +808,70 @@ def api_risk():
 
 @app.route("/api/public/circuit-breaker")
 def api_circuit_breaker():
-    """Return simplified circuit breaker status derived from bot state files."""
-    bots = _discover_bots()
+    """Return per-broker circuit breaker status (each broker = funded account)."""
+    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+    _INITIAL_EQUITY = 100_000.0
 
-    # Sum total PnL and portfolio heat across all bots (with display multiplier)
-    total_pnl = 0.0
-    total_equity = 0.0
-    portfolio_heat_pct = 0.0
-    for _tag, bot in bots.items():
-        ac = bot.get("asset_class", "unknown")
-        total_pnl += _apply_display_mult(ac, float(bot.get("total_pnl", 0.0)))
-        total_equity += _apply_display_mult(ac, float(bot.get("equity", 0.0)))
-        for trade in bot.get("active_trades", []):
-            if not isinstance(trade, dict):
-                continue
-            # BE-triggered trades contribute 0 heat
-            if not trade.get("be_triggered", False):
-                portfolio_heat_pct += float(trade.get("risk_pct", 0.0))
-
-    # Approximate daily/weekly PnL % from log patterns if available
-    risk = _get_risk_status()
-    daily_pnl_pct = risk.get("daily_pnl_pct", 0.0)
-    weekly_pnl_pct = risk.get("weekly_pnl_pct", 0.0)
-
-    # Fallback: derive from total_equity if log values are 0
-    if daily_pnl_pct == 0.0 and total_equity > 0:
-        daily_pnl_pct = round(total_pnl / total_equity * 100, 2) if total_equity > 0 else 0.0
-
-    any_breaker = (
-        risk.get("daily_breaker", False)
-        or risk.get("weekly_breaker", False)
-        or risk.get("alltime_breaker", False)
-        or risk.get("heat_breaker", False)
-    )
-    if risk.get("alltime_breaker", False):
-        status = "ALLTIME_STOP"
-    elif risk.get("weekly_breaker", False):
-        status = "WEEKLY_PAUSE"
-    elif risk.get("daily_breaker", False):
-        status = "DAILY_PAUSE"
-    elif risk.get("heat_breaker", False):
-        status = "HEAT_PAUSE"
-    else:
-        status = "CLEAR"
-
-    # Risk budget: how much more risk can be taken (dynamic)
-    risk_budget = max(0.0, 3.0 - abs(min(daily_pnl_pct, 0)) - portfolio_heat_pct)
-
-    # Per-broker breakdown from aggregate stats
+    # Per-broker PnL + heat from bot state files
     agg = _aggregate_stats()
     per_broker = agg.get("per_broker", {})
 
+    # Per-broker daily/weekly PnL from journal
+    has_ac = "asset_class" in _journal_columns() if _journal_has_table("trades") else False
+    if has_ac:
+        for period, where in [("daily", "DATE(exit_time) = DATE('now')"),
+                               ("weekly", "DATE(exit_time) >= DATE('now', '-7 days')")]:
+            rows = _query_journal(
+                f"SELECT asset_class, pnl_pct FROM trades WHERE exit_time IS NOT NULL AND {where}"
+            )
+            broker_period: dict[str, float] = {}
+            for r in rows:
+                ac = r.get("asset_class", "unknown")
+                broker = _BROKER_MAP.get(ac, ac)
+                broker_period[broker] = broker_period.get(broker, 0.0) + (r["pnl_pct"] or 0.0)
+            for broker in per_broker:
+                per_broker[broker][f"{period}_pnl_pct"] = round(broker_period.get(broker, 0.0) * 100, 2)
+
+    # Compute per-broker status and risk budget
+    any_breaker = False
+    for broker, bd in per_broker.items():
+        daily = bd.get("daily_pnl_pct", 0.0)
+        weekly = bd.get("weekly_pnl_pct", 0.0)
+        alltime_dd = bd.get("dd_pct", 0.0)
+        heat = bd.get("heat_pct", 0.0)
+
+        # Breaker flags per broker
+        daily_br = daily <= -3.0
+        weekly_br = weekly <= -5.0
+        alltime_br = alltime_dd >= 8.0
+        heat_br = heat >= 6.0
+
+        if daily_br:
+            bd["status"] = "DAILY_PAUSE"
+        elif weekly_br:
+            bd["status"] = "WEEKLY_PAUSE"
+        elif alltime_br:
+            bd["status"] = "ALLTIME_STOP"
+        elif heat_br:
+            bd["status"] = "HEAT_PAUSE"
+        else:
+            bd["status"] = "CLEAR"
+
+        bd["daily_breaker"] = daily_br
+        bd["weekly_breaker"] = weekly_br
+        bd["alltime_breaker"] = alltime_br
+        bd["heat_breaker"] = heat_br
+        bd["risk_budget"] = round(max(0.0, 3.0 - abs(min(daily, 0)) - heat), 2)
+
+        if daily_br or weekly_br or alltime_br or heat_br:
+            any_breaker = True
+
     return jsonify({
-        "daily_pnl_pct": round(daily_pnl_pct, 2),
-        "daily_loss_limit": 3.0,
-        "weekly_pnl_pct": round(weekly_pnl_pct, 2),
-        "weekly_loss_limit": 5.0,
-        "alltime_dd_pct": round(risk.get("alltime_dd_pct", 0.0), 2),
-        "alltime_dd_limit": 8.0,
-        "portfolio_heat_pct": round(portfolio_heat_pct, 2),
-        "risk_budget_remaining": round(risk_budget, 2),
-        "daily_breaker": risk.get("daily_breaker", False),
-        "weekly_breaker": risk.get("weekly_breaker", False),
-        "alltime_breaker": risk.get("alltime_breaker", False),
-        "heat_breaker": risk.get("heat_breaker", False),
-        "paused": any_breaker,
-        "status": status,
         "per_broker": per_broker,
+        "any_breaker": any_breaker,
+        "daily_loss_limit": 3.0,
+        "weekly_loss_limit": 5.0,
+        "alltime_dd_limit": 8.0,
     })
 
 
@@ -1899,45 +1896,45 @@ function renderProgressBar(label, current, limit, color){
 
 function updateRisk(d){
   var el = $('risk-content');
-  var html = '';
-  html += renderProgressBar('Daily DD', d.daily_pnl_pct||0, d.daily_loss_limit||3, '#3fb950');
-  html += renderProgressBar('Weekly DD', d.weekly_pnl_pct||0, d.weekly_loss_limit||5, '#58a6ff');
-  html += renderProgressBar('All-Time DD (worst)', d.alltime_dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
-  html += renderProgressBar('Open Risk', d.portfolio_heat_pct||0, d.risk_budget_remaining||3, '#d29922');
-
-  // Per-broker DD breakdown
   var pb = d.per_broker || {};
-  var brokerNames = {'binance':'Binance (Crypto)','oanda':'OANDA (Forex)','alpaca':'Alpaca (Stocks)'};
-  var brokerKeys = Object.keys(pb);
-  if(brokerKeys.length){
-    html += '<div style="margin-top:10px;font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px">Per Account</div>';
-    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;margin-top:4px">';
-    for(var bi=0; bi<brokerKeys.length; bi++){
-      var bk = brokerKeys[bi];
-      var b = pb[bk];
-      var bName = brokerNames[bk] || bk;
-      var ddCol = (b.dd_pct||0) > 3 ? '#f85149' : (b.dd_pct||0) > 1 ? '#d29922' : '#3fb950';
-      html += '<div style="background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px">';
-      html += '<div style="font-size:11px;color:#8b949e">'+escHtml(bName)+'</div>';
-      html += '<div style="font-size:16px;font-weight:600;color:'+ddCol+'">DD: '+fmt(b.dd_pct,2)+'%</div>';
-      html += '<div style="font-size:11px;color:#8b949e">PnL: <span style="color:'+(b.pnl>=0?'#3fb950':'#f85149')+'">'+(b.pnl>=0?'+$':'-$')+fmt(Math.abs(b.pnl),0)+'</span>';
-      html += ' · Open: '+(b.active||0)+' · Heat: '+fmt(b.heat_pct,1)+'%</div>';
-      html += '</div>';
+  var brokerNames = {'binance':'Binance (Crypto)','oanda':'OANDA (Forex+Commod.)','alpaca':'Alpaca (Stocks)'};
+  var brokerOrder = ['binance','oanda','alpaca'];
+  var html = '';
+
+  for(var bi=0; bi<brokerOrder.length; bi++){
+    var bk = brokerOrder[bi];
+    var b = pb[bk];
+    if(!b) continue;
+    var bName = brokerNames[bk] || bk;
+    var statusCol = b.status === 'CLEAR' ? '#3fb950' : '#f85149';
+
+    html += '<div style="background:#161b22;border:1px solid #21262d;border-radius:8px;padding:10px 12px;margin-bottom:8px">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+    html += '<span style="font-size:13px;font-weight:600;color:#e6edf3">'+escHtml(bName)+'</span>';
+    html += '<span style="font-size:11px;font-weight:600;color:'+statusCol+'">'+escHtml(b.status||'CLEAR')+'</span>';
+    html += '</div>';
+    html += renderProgressBar('Daily DD', Math.abs(b.daily_pnl_pct||0), d.daily_loss_limit||3, '#3fb950');
+    html += renderProgressBar('Weekly DD', Math.abs(b.weekly_pnl_pct||0), d.weekly_loss_limit||5, '#58a6ff');
+    html += renderProgressBar('All-Time DD', b.dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
+    html += renderProgressBar('Open Risk', b.heat_pct||0, 6, '#d29922');
+    html += '<div style="font-size:11px;color:#8b949e;margin-top:4px">';
+    html += 'PnL: <span style="color:'+(b.pnl>=0?'#3fb950':'#f85149')+'">'+(b.pnl>=0?'+$':'-$')+fmt(Math.abs(b.pnl),0)+' ('+fmt(b.pnl_pct,2)+'%)</span>';
+    html += ' · Open: '+(b.active||0)+' · Budget: '+fmt(b.risk_budget||0,2)+'%';
+    html += '</div>';
+
+    // Breaker alerts for this broker
+    var bkBreakers = [];
+    if(b.daily_breaker) bkBreakers.push('DAILY STOP');
+    if(b.weekly_breaker) bkBreakers.push('WEEKLY PAUSE');
+    if(b.alltime_breaker) bkBreakers.push('ALL-TIME STOP');
+    if(b.heat_breaker) bkBreakers.push('HEAT LIMIT');
+    if(bkBreakers.length){
+      html += '<div style="font-size:11px;font-weight:600;color:#f85149;margin-top:3px">⚠ '+bkBreakers.join(' | ')+'</div>';
     }
     html += '</div>';
   }
 
-  // Active breakers
-  var breakers = [];
-  if(d.daily_breaker) breakers.push('<span class="red">DAILY STOP</span>');
-  if(d.weekly_breaker) breakers.push('<span class="yellow">WEEKLY HALVED</span>');
-  if(d.alltime_breaker) breakers.push('<span class="red">ALL-TIME STOP</span>');
-  if(d.heat_breaker) breakers.push('<span class="yellow">HEAT LIMIT</span>');
-  if(breakers.length){
-    html += '<div style="margin-top:8px;font-size:13px;font-weight:600">Active: '+breakers.join(' | ')+'</div>';
-  } else {
-    html += '<div style="margin-top:8px;font-size:13px;color:#3fb950">All breakers clear</div>';
-  }
+  if(!html) html = '<div class="empty">No broker data</div>';
   el.innerHTML = html;
 }
 
