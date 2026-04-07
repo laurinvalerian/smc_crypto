@@ -717,6 +717,30 @@ class PaperBot:
                 len(self._candle_buf.get(self.symbol, [])), self.symbol,
             )
 
+    # === CAPACITY-REJECTED SIGNAL TRACKING ===
+    def _record_capacity_rejected(self, sig: dict[str, Any], reason: str) -> None:
+        """Record a signal blocked by capacity limits for counterfactual learning."""
+        if self.journal is None:
+            return
+        try:
+            self.journal.record_rejected_signal(
+                symbol=sig.get("symbol", self.symbol),
+                asset_class=self.asset_class,
+                direction=sig.get("direction", ""),
+                entry_price=sig.get("ref_price", 0.0),
+                sl_price=sig.get("sl", 0.0),
+                tp_price=sig.get("tp", 0.0),
+                xgb_confidence=-1.0,  # marker: not XGB-evaluated
+                alignment_score=sig.get("score", 0.0),
+                entry_features=sig.get("features"),
+            )
+            self.logger.debug(
+                "CAPACITY REJECT recorded %s score=%.2f reason=%s",
+                sig.get("symbol", "?"), sig.get("score", 0), reason,
+            )
+        except Exception as exc:
+            self.logger.debug("Failed to record capacity-rejected signal: %s", exc)
+
     # === PERSISTENCE ===
     def _save_state(self) -> None:
         """Persist core bot state to JSON (atomic write)."""
@@ -2164,6 +2188,8 @@ class PaperBot:
         # Never two trades of the same style on the same coin.
         pending_style = sig.get("style", STYLE_DAY)
         if any(t["style"] == pending_style for t in self._active_trades):
+            # Record for counterfactual learning before discarding
+            self._record_capacity_rejected(sig, "duplicate_style")
             self._pending_signal = None
             return
         # ── Dynamic risk budget check ────────────────────────────
@@ -2175,6 +2201,8 @@ class PaperBot:
             allowed, reason = self.circuit_breaker.risk_budget_allows(_est_risk)
             if not allowed:
                 self.logger.info("RISK BUDGET BLOCK %s | %s", symbol, reason)
+                # Record for counterfactual learning before discarding
+                self._record_capacity_rejected(sig, reason)
                 self._pending_signal = None
                 return
 

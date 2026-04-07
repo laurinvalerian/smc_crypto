@@ -2024,7 +2024,7 @@ function _renderPnlCard(valId, breakdownId, ddId, pct, classMap, dd, ddLimit){
     parts.push('<span class="'+pnlColor(v)+'">'+ac+': '+(v>=0?'+':'')+fmt(v,2)+'%</span>');
   }
   var bkEl = $(breakdownId);
-  if(bkEl) bkEl.innerHTML = parts.length > 0 ? '<span style="font-size:11px">'+parts.join(' &nbsp; ')+'</span>' : '';
+  if(bkEl) bkEl.innerHTML = parts.length > 0 ? '<span style="font-size:11px">'+parts.join('<br>')+'</span>' : '';
   // DD with color based on proximity to limit
   var ddEl = $(ddId);
   if(ddEl && dd > 0){
@@ -2222,7 +2222,7 @@ function updateActiveTrades(trades){
       var prefix = cls.charAt(0).toUpperCase()+cls.slice(1)+': ';
       bk.push('<span class="'+pnlColor(pct)+'">' + prefix + (pct >= 0 ? '+' : '') + fmt(pct, 2) + '%</span>');
     }
-    upnlBreakdown.innerHTML = bk.length > 0 ? bk.join(' &nbsp; ') : '';
+    upnlBreakdown.innerHTML = bk.length > 0 ? bk.join('<br>') : '';
   }
 
   if(!trades || trades.length === 0){
