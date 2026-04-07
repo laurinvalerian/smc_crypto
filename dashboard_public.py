@@ -1486,10 +1486,10 @@ a:hover{text-decoration:underline}
       <div class="card-sub" id="c-sharpe">Sharpe: --</div>
     </div>
     <div class="card">
-      <div class="card-label">Total PnL</div>
+      <div class="card-label">All-Time PnL</div>
       <div class="card-value" id="c-pnl">--</div>
-      <div class="card-sub" id="c-pnl-dollar"></div>
-      <div class="card-sub" id="c-dd">Max DD: --</div>
+      <div class="card-sub" id="c-pnl-breakdown"></div>
+      <div class="card-sub" id="c-pnl-dd"></div>
     </div>
     <div class="card">
       <div class="card-label">Unrealized PnL</div>
@@ -1505,16 +1505,19 @@ a:hover{text-decoration:underline}
       <div class="card-label">Daily PnL</div>
       <div class="card-value" id="c-daily-pnl">--</div>
       <div class="card-sub" id="c-daily-sub"></div>
+      <div class="card-sub" id="c-daily-dd"></div>
     </div>
     <div class="card">
       <div class="card-label">Weekly PnL</div>
       <div class="card-value" id="c-weekly-pnl">--</div>
       <div class="card-sub" id="c-weekly-sub"></div>
+      <div class="card-sub" id="c-weekly-dd"></div>
     </div>
     <div class="card">
       <div class="card-label">Monthly PnL</div>
       <div class="card-value" id="c-monthly-pnl">--</div>
       <div class="card-sub" id="c-monthly-sub"></div>
+      <div class="card-sub" id="c-monthly-dd"></div>
     </div>
   </div>
 
@@ -1683,28 +1686,14 @@ function updateOverview(d){
   $('c-pf').className = 'card-value ' + (pf >= 1.5 ? 'green' : pf >= 1 ? 'yellow' : pf > 0 ? 'red' : '');
   $('c-sharpe').textContent = 'Sharpe: ' + fmt(d.sharpe,2);
 
-  var pnl = d.total_pnl || 0;
+  // All-Time PnL card (same format as period cards)
   var pnlPct = d.total_pnl_pct || 0;
-  $('c-pnl').textContent = (pnlPct >= 0 ? '+' : '') + fmt(pnlPct,2) + '%';
-  $('c-pnl').className = 'card-value ' + pnlColor(pnl);
-  // Per-broker PnL breakdown below total
   var pb = d.per_broker || {};
   var brokerLabels = {'binance':'Crypto','oanda':'Forex','alpaca':'Stocks'};
-  var bkParts = [];
-  for(var bk in pb){
-    var bpct = pb[bk].pnl_pct || 0;
-    var bLabel = brokerLabels[bk] || bk;
-    bkParts.push('<span class="'+pnlColor(bpct)+'">' + bLabel + ': ' + (bpct>=0?'+':'') + fmt(bpct,2) + '%</span>');
-  }
-  $('c-pnl-dollar').innerHTML = '<span style="font-size:11px">' + bkParts.join(' &nbsp; ') + '</span>';
-  // Show worst per-broker DD (each account is a separate funded account)
-  var ddLabel = 'Max DD: ' + fmt(d.max_dd_pct,2) + '%';
-  var worstBroker = '';
-  var worstDD = 0;
-  for(var bk in pb){ if(pb[bk].dd_pct > worstDD){ worstDD = pb[bk].dd_pct; worstBroker = bk; } }
-  if(worstBroker) ddLabel += ' (' + (brokerLabels[worstBroker]||worstBroker) + ')';
-  $('c-dd').textContent = ddLabel;
-  $('c-dd').style.color = worstDD > 3 ? '#f85149' : worstDD > 1 ? '#d29922' : '#8b949e';
+  // Build per-asset breakdown from brokers
+  var classMap = {};
+  for(var bk in pb){ classMap[brokerLabels[bk]||bk] = pb[bk].pnl_pct || 0; }
+  _renderPnlCard('c-pnl', 'c-pnl-breakdown', 'c-pnl-dd', pnlPct, classMap, d.max_dd_pct||0, 8.0);
 
   $('hd-equity').textContent = d.total_equity ? ('Equity: $' + fmt(d.total_equity,2)) : '';
 }
@@ -2001,34 +1990,57 @@ function fetchJ(url, cb, retries){
   });
 }
 
+// ── Shared PnL Card Renderer ─────────────────────────────────────
+
+function _ddColor(dd, limit){
+  if(dd <= 0) return '#3fb950';
+  var ratio = dd / limit;
+  if(ratio < 0.3) return '#3fb950';
+  if(ratio < 0.6) return '#d29922';
+  return '#f85149';
+}
+
+function _renderPnlCard(valId, breakdownId, ddId, pct, classMap, dd, ddLimit){
+  var el = $(valId);
+  if(!el) return;
+  el.textContent = (pct >= 0 ? '+' : '') + fmt(pct,2) + '%';
+  el.className = 'card-value ' + pnlColor(pct);
+  // Per-asset-class breakdown (only show classes with non-zero PnL)
+  var parts = [];
+  for(var ac in classMap){
+    var v = classMap[ac];
+    if(v === 0) continue;
+    parts.push('<span class="'+pnlColor(v)+'">'+ac+': '+(v>=0?'+':'')+fmt(v,2)+'%</span>');
+  }
+  var bkEl = $(breakdownId);
+  if(bkEl) bkEl.innerHTML = parts.length > 0 ? '<span style="font-size:11px">'+parts.join(' &nbsp; ')+'</span>' : '';
+  // DD with color based on proximity to limit
+  var ddEl = $(ddId);
+  if(ddEl && dd > 0){
+    ddEl.innerHTML = '<span style="font-size:11px;color:'+_ddColor(dd,ddLimit)+'">DD: '+fmt(dd,2)+'% / '+fmt(ddLimit,0)+'%</span>';
+  } else if(ddEl){
+    ddEl.innerHTML = '';
+  }
+}
+
 // ── Period Stats (Daily / Weekly / Monthly) ─────────────────────
 
 function updatePeriodStats(d){
-  function renderPeriod(prefix, p){
+  function renderPeriod(prefix, p, ddLimit){
     if(!p || p.pnl_pct === undefined){
       $(prefix+'-pnl').textContent = '--';
       $(prefix+'-pnl').className = 'card-value';
-      $(prefix+'-sub').textContent = '';
+      $(prefix+'-sub').innerHTML = '';
       return;
     }
-    var pct = p.pnl_pct || 0;
-    $(prefix+'-pnl').textContent = (pct >= 0 ? '+' : '') + fmt(pct,2) + '%';
-    $(prefix+'-pnl').className = 'card-value ' + pnlColor(pct);
-    var parts = [];
-    // Per-class breakdown
+    var classMap = {};
     var pc = p.per_class || {};
-    for(var ac in pc){
-      var v = pc[ac];
-      var label = ac.charAt(0).toUpperCase()+ac.slice(1);
-      parts.push('<span class="'+pnlColor(v)+'">'+label+': '+(v>=0?'+':'')+fmt(v,2)+'%</span>');
-    }
-    var sub = parts.length > 0 ? parts.join(' &nbsp; ') : '';
-    if(p.dd_pct > 0) sub += (sub ? ' &nbsp; ' : '') + '<span style="color:#d29922">DD: '+fmt(p.dd_pct,2)+'%</span>';
-    $(prefix+'-sub').innerHTML = sub ? '<span style="font-size:11px">'+sub+'</span>' : '';
+    for(var ac in pc){ classMap[ac.charAt(0).toUpperCase()+ac.slice(1)] = pc[ac]; }
+    _renderPnlCard(prefix+'-pnl', prefix+'-sub', prefix+'-dd', p.pnl_pct||0, classMap, p.dd_pct||0, ddLimit);
   }
-  renderPeriod('c-daily', d.daily);
-  renderPeriod('c-weekly', d.weekly);
-  renderPeriod('c-monthly', d.monthly);
+  renderPeriod('c-daily', d.daily, 3.0);
+  renderPeriod('c-weekly', d.weekly, 5.0);
+  renderPeriod('c-monthly', d.monthly, 8.0);
 }
 
 // ── Initial load + polling ───────────────────────────────────────
