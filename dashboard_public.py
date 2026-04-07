@@ -708,7 +708,7 @@ def api_trades():
         "trade_id", "symbol", "asset_class", "direction",
         "entry_time", "exit_time", "entry_price", "exit_price",
         "pnl_pct", "rr_actual", "rr_target", "outcome",
-        "exit_reason", "bars_held", "tier", "score",
+        "exit_reason", "bars_held", "score",
     ]
     existing = _journal_columns()
     if not existing:
@@ -757,10 +757,8 @@ def api_period_stats():
         )
         rows = _query_journal(sql)
         if not rows:
-            return {"pnl_pct": 0.0, "pnl_dollar": 0.0, "trades": 0, "wins": 0, "losses": 0, "dd_pct": 0.0}
+            return {"pnl_pct": 0.0, "dd_pct": 0.0, "per_class": {}}
         total_pct = sum(r["pnl_pct"] or 0.0 for r in rows)
-        wins = sum(1 for r in rows if r["outcome"] == "win")
-        losses = len(rows) - wins
         # DD = worst running drawdown within the period
         running = 0.0
         peak = 0.0
@@ -772,13 +770,16 @@ def api_period_stats():
             dd = peak - running
             if dd > worst_dd:
                 worst_dd = dd
+        # Per-asset-class PnL breakdown
+        class_pnl: dict[str, float] = {}
+        if has_ac:
+            for r in rows:
+                ac = r.get("asset_class", "unknown")
+                class_pnl[ac] = class_pnl.get(ac, 0.0) + (r["pnl_pct"] or 0.0)
         return {
             "pnl_pct": round(total_pct * 100, 2),
-            "pnl_dollar": round(total_pct * 100_000.0, 2),
-            "trades": len(rows),
-            "wins": wins,
-            "losses": losses,
             "dd_pct": round(worst_dd * 100, 2),
+            "per_class": {ac: round(v * 100, 2) for ac, v in class_pnl.items()},
         }
 
     daily = _period("DATE(exit_time) = DATE('now')")
@@ -1139,7 +1140,6 @@ def api_active_trades():
                 "tp": float(trade.get("tp", 0.0)),
                 "entry_time": entry_time_str,
                 "style": trade.get("style", ""),
-                "tier": trade.get("tier") or trade.get("setup_tier", ""),
                 "confidence": float(trade.get("rl_confidence") or trade.get("confidence") or 0.0),
                 "asset_class": ac,
                 "unrealized_pnl": raw_pnl * mult,
@@ -1504,17 +1504,17 @@ a:hover{text-decoration:underline}
     <div class="card">
       <div class="card-label">Daily PnL</div>
       <div class="card-value" id="c-daily-pnl">--</div>
-      <div class="card-sub" id="c-daily-sub">0 trades</div>
+      <div class="card-sub" id="c-daily-sub"></div>
     </div>
     <div class="card">
       <div class="card-label">Weekly PnL</div>
       <div class="card-value" id="c-weekly-pnl">--</div>
-      <div class="card-sub" id="c-weekly-sub">0 trades</div>
+      <div class="card-sub" id="c-weekly-sub"></div>
     </div>
     <div class="card">
       <div class="card-label">Monthly PnL</div>
       <div class="card-value" id="c-monthly-pnl">--</div>
-      <div class="card-sub" id="c-monthly-sub">0 trades</div>
+      <div class="card-sub" id="c-monthly-sub"></div>
     </div>
   </div>
 
@@ -1637,7 +1637,7 @@ a:hover{text-decoration:underline}
   </div>
 
   <div style="text-align:center;padding:16px;color:#484f58;font-size:12px">
-    SMC Multi-Asset AAA++ Trading Bot &mdash; Public Read-Only Dashboard
+    SMC Multi-Asset Trading Bot &mdash; Public Read-Only Dashboard
   </div>
 </div>
 
@@ -1666,6 +1666,7 @@ function updateStatus(d){
 // ── Overview ─────────────────────────────────────────────────────
 
 function updateOverview(d){
+  window._lastOverview = d;
   $('c-trades').textContent = d.total_trades || 0;
   $('c-active').textContent = (d.active_positions||0) + ' open';
 
@@ -2004,21 +2005,26 @@ function fetchJ(url, cb, retries){
 
 function updatePeriodStats(d){
   function renderPeriod(prefix, p){
-    if(!p || !p.trades){
+    if(!p || p.pnl_pct === undefined){
       $(prefix+'-pnl').textContent = '--';
       $(prefix+'-pnl').className = 'card-value';
-      $(prefix+'-sub').textContent = '0 trades';
+      $(prefix+'-sub').textContent = '';
       return;
     }
     var pct = p.pnl_pct || 0;
-    var dollar = p.pnl_dollar || 0;
     $(prefix+'-pnl').textContent = (pct >= 0 ? '+' : '') + fmt(pct,2) + '%';
     $(prefix+'-pnl').className = 'card-value ' + pnlColor(pct);
-    var wr = p.trades > 0 ? (p.wins/p.trades*100) : 0;
-    var sub = (dollar >= 0 ? '+$' : '-$') + fmt(Math.abs(dollar),0);
-    sub += ' · ' + p.trades + ' trades · ' + fmt(wr,0) + '% WR';
-    if(p.dd_pct > 0) sub += ' · DD: ' + fmt(p.dd_pct,2) + '%';
-    $(prefix+'-sub').innerHTML = '<span style="color:#8b949e">' + sub + '</span>';
+    var parts = [];
+    // Per-class breakdown
+    var pc = p.per_class || {};
+    for(var ac in pc){
+      var v = pc[ac];
+      var label = ac.charAt(0).toUpperCase()+ac.slice(1);
+      parts.push('<span class="'+pnlColor(v)+'">'+label+': '+(v>=0?'+':'')+fmt(v,2)+'%</span>');
+    }
+    var sub = parts.length > 0 ? parts.join(' &nbsp; ') : '';
+    if(p.dd_pct > 0) sub += (sub ? ' &nbsp; ' : '') + '<span style="color:#d29922">DD: '+fmt(p.dd_pct,2)+'%</span>';
+    $(prefix+'-sub').innerHTML = sub ? '<span style="font-size:11px">'+sub+'</span>' : '';
   }
   renderPeriod('c-daily', d.daily);
   renderPeriod('c-weekly', d.weekly);
@@ -2170,20 +2176,30 @@ function updateActiveTrades(trades){
       classPnl[ac] = (classPnl[ac] || 0) + upnl;
     }
   }
+  // Fetch equity for % calculation
+  var eqData = window._lastOverview || {};
+  var totalEq = eqData.total_equity || 300000;
+  var upnlPct = totalEq > 0 ? (totalUpnl / totalEq * 100) : 0;
   if(upnlEl){
-    upnlEl.textContent = (totalUpnl >= 0 ? '+$' : '-$') + fmt(Math.abs(totalUpnl), 2);
-    upnlEl.className = 'card-value ' + pnlColor(totalUpnl);
+    upnlEl.textContent = (upnlPct >= 0 ? '+' : '') + fmt(upnlPct, 2) + '%';
+    upnlEl.className = 'card-value ' + pnlColor(upnlPct);
   }
-  if(upnlCountEl) upnlCountEl.textContent = posCount + ' open position' + (posCount !== 1 ? 's' : '');
-  // Per-class breakdown
+  if(upnlCountEl) upnlCountEl.textContent = posCount + ' open · ' + (totalUpnl >= 0 ? '+$' : '-$') + fmt(Math.abs(totalUpnl), 0);
+  // Per-class breakdown in %
   if(upnlBreakdown){
+    var brokerEq = {'binance':'crypto','oanda':'forex','alpaca':'stocks'};
+    var pb = eqData.per_broker || {};
     var bk = [];
     for(var cls in classPnl){
       var v = classPnl[cls];
+      var clsEq = 100000;
+      for(var bkey in pb){ if(brokerEq[bkey]===cls) clsEq = pb[bkey].equity || 100000; }
+      if(cls==='commodities'){ for(var bkey in pb){ if(bkey==='oanda') clsEq = pb[bkey].equity || 100000; } }
+      var pct = clsEq > 0 ? (v / clsEq * 100) : 0;
       var prefix = cls.charAt(0).toUpperCase()+cls.slice(1)+': ';
-      bk.push(prefix + (v >= 0 ? '+$' : '-$') + fmt(Math.abs(v), 2));
+      bk.push('<span class="'+pnlColor(pct)+'">' + prefix + (pct >= 0 ? '+' : '') + fmt(pct, 2) + '%</span>');
     }
-    upnlBreakdown.innerHTML = bk.length > 0 ? bk.join(' &nbsp;|&nbsp; ') : '';
+    upnlBreakdown.innerHTML = bk.length > 0 ? bk.join(' &nbsp; ') : '';
   }
 
   if(!trades || trades.length === 0){

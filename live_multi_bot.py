@@ -279,10 +279,10 @@ ASSET_MAX_LEVERAGE: dict[str, int] = {
     "crypto": 10, "forex": 15, "stocks": 4, "commodities": 10,
 }
 
-# ── Per-Class Tier Flag Configuration ────────────────────────────
-# Flags to SKIP for tier gate checks (still contribute to alignment score).
+# ── Per-Class Flag Configuration ─────────────────────────────────
+# Flags to SKIP for alignment checks (still contribute to alignment score).
 # Tick-volume classes skip volume_ok since it's unreliable without real volume.
-TIER_SKIP_FLAGS: dict[str, list[str]] = {
+CLASS_SKIP_FLAGS: dict[str, list[str]] = {
     "crypto": [],
     "forex": ["volume_ok"],
     "stocks": [],
@@ -392,14 +392,6 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
     },
 }
 
-# ── Setup Quality Tiers ─────────────────────────────────────────
-# AAA++ = sniper-only (highest probability, all components aligned)
-# AAA+  = strong fallback (still high quality)
-# No A or SPEC tiers – only the best trades
-TIER_AAA_PLUS_PLUS = "AAA++"
-TIER_AAA_PLUS = "AAA+"
-
-# Tier labels kept for logging/journal only — NOT used for risk sizing or gates.
 # Risk sizing is 100% confidence-based. Leverage capped by ASSET_MAX_LEVERAGE.
 
 # (removed: _history_exchange / _get_history_exchange — history now loaded via adapter)
@@ -537,13 +529,13 @@ class PaperBot:
         # Pending signal for real-time entry (set by on_candle, consumed by on_tick)
         self._pending_signal: dict[str, Any] | None = None
 
-        # Per-class tier flag skip list and signal rate limiting
+        # Per-class flag skip list and signal rate limiting
         # On testnet, skip volume_ok for crypto (unrealistic testnet volumes)
-        _skip = list(TIER_SKIP_FLAGS.get(asset_class, []))
+        _skip = list(CLASS_SKIP_FLAGS.get(asset_class, []))
         if asset_class == "crypto" and getattr(adapter, "_testnet", False):
             if "volume_ok" not in _skip:
                 _skip.append("volume_ok")
-        self._tier_skip_flags: set[str] = set(_skip)
+        self._class_skip_flags: set[str] = set(_skip)
         self._max_signals_per_4h: int = MAX_SIGNALS_PER_SYMBOL_4H.get(asset_class, 5)
         self._recent_signal_times: list[datetime] = []
 
@@ -806,7 +798,7 @@ class PaperBot:
         self, current_candle: dict[str, Any],
     ) -> tuple[float, str, dict[str, Any]]:
         """
-        AAA++ Granular multi-timeframe SMC alignment score.
+        Granular multi-timeframe SMC alignment score.
 
         13-component scoring system (max 1.0):
           1D  → Daily bias (0.10)
@@ -828,14 +820,14 @@ class PaperBot:
         ob_lookback = self.ob_lookback
         liq_range = self.liq_range
 
-        # Components tracked for tier classification (expanded for AAA++)
+        # Components tracked for alignment scoring
         comp: dict[str, Any] = {
             "bias": False, "bias_strong": False,
             "h4_confirms": False, "h4_poi": False,
             "h1_confirms": False, "h1_choch": False,
             "entry_zone": None, "zone_fresh": False,
             "precision_trigger": False, "volume_ok": False,
-            # New AAA++ components
+            # Extended components
             "adx_strong": False, "adx_value": 0.0,
             "session_optimal": False, "session_score": 0.0,
             "momentum_confluent": False, "momentum_score": 0.0,
@@ -1908,7 +1900,7 @@ class PaperBot:
         1. Volatility filter (skip coins with too little price movement)
         2. Granular multi-TF alignment scoring
         3. Style-aware SL/TP (scalp/day/swing – never mixed)
-        4. Setup quality tier classification (AAA+/A/SPEC)
+        4. XGBoost confidence gate
         5. ATR-based minimum SL distance (not just fixed %)
         """
         # ── Pause flag check ──────────────────────────────────────────
@@ -2065,13 +2057,6 @@ class PaperBot:
             self.logger.debug("RR TOO LOW %s | rr=%.2f min=1.0", symbol, rr)
             return
 
-        # ── Tier removed — XGBoost brain is the primary filter ─────
-        # Training has no tier system; brain learned on raw score+features.
-        # Assign tier label for logging/risk only (not as a gate).
-        tier = TIER_AAA_PLUS  # default tier for risk sizing
-        if score >= 0.75:
-            tier = TIER_AAA_PLUS_PLUS
-
         # ── Signal rate limiting (per-class safety throttle) ──────
         # Only counts XGB-accepted signals (moved to after XGB gate below).
         # Rejected signals don't consume rate limit slots.
@@ -2113,7 +2098,7 @@ class PaperBot:
         _xgb_features["style_id"] = _style_map.get(style, 0.5)
         _ppo_obs = extract_features(
             buf, score, direction,
-            setup_tier=tier, trade_style=style,
+            setup_tier="", trade_style=style,
             rr_ratio=rr, daily_atr_pct=daily_atr,
             adx_normalized=min(components.get("adx_value", 0.0) / 50.0, 1.0),
             session_score=components.get("session_score", 0.5),
@@ -2138,7 +2123,6 @@ class PaperBot:
             "rr": rr,
             "score": score,
             "style": style,
-            "tier": tier,
             "components": components,
             "daily_atr_pct": daily_atr,
             "obs": _ppo_obs,
@@ -2148,9 +2132,9 @@ class PaperBot:
             "features": _xgb_features,
         }
         self.logger.info(
-            "PENDING %s %s %s [%s] | zone=[%.6f, %.6f] SL=%.6f TP=%.6f "
+            "PENDING %s %s [%s] | zone=[%.6f, %.6f] SL=%.6f TP=%.6f "
             "RR=%.1f score=%.2f daily_atr=%.3f%%",
-            tier, style.upper(), direction.upper(), symbol,
+            style.upper(), direction.upper(), symbol,
             zone_low, zone_high, sl, tp, rr, score, daily_atr * 100,
         )
 
@@ -2186,8 +2170,8 @@ class PaperBot:
         # Instead of fixed per-style limits, check if DD budget allows
         # another trade. The closer to DD limits, the fewer trades opened.
         if self.circuit_breaker is not None:
-            # Use the risk_pct that this trade would use (estimate from tier)
-            _est_risk = 0.005  # conservative estimate: 0.5% (AAA+ base risk)
+            # Use the risk_pct that this trade would use (conservative estimate)
+            _est_risk = 0.005  # conservative estimate: 0.5%
             allowed, reason = self.circuit_breaker.risk_budget_allows(_est_risk)
             if not allowed:
                 self.logger.info("RISK BUDGET BLOCK %s | %s", symbol, reason)
@@ -2203,7 +2187,6 @@ class PaperBot:
         tp = sig["tp"]
         score = sig["score"]
         obs = sig["obs"]
-        tier = sig.get("tier", TIER_AAA_PLUS)
         style = sig.get("style", STYLE_DAY)
 
         # ── RL Brain gate ────────────────────────────────────────────
@@ -2344,7 +2327,6 @@ class PaperBot:
                 sl_dist=sl_dist,
                 tp_dist=tp_dist,
                 score=score,
-                tier=tier,
                 style=style,
                 features=sig.get("features", {}),
                 xgb_confidence=rl_confidence,
@@ -2385,7 +2367,6 @@ class PaperBot:
             "risk_pct": risk_pct,
             "entry_time": datetime.now(timezone.utc),
             "score": score,
-            "tier": tier,
             "style": style,
             "order_id": order_id,
             "sl_order_id": sl_order_id,
@@ -2415,7 +2396,7 @@ class PaperBot:
                     asset_class=self.asset_class,
                     direction=direction,
                     style=style,
-                    tier=tier,
+                    tier="",
                     entry_time=datetime.now(timezone.utc),
                     entry_price=price,
                     sl_original=sl,
@@ -2431,9 +2412,9 @@ class PaperBot:
                 self.logger.debug("journal.open_trade error: %s", exc)
 
         self.logger.info(
-            "OPEN [%s|%s] %s %s @ %.6f | SL=%.6f TP=%.6f RR=%.1f | qty=%.4f "
+            "OPEN [%s] %s %s @ %.6f | SL=%.6f TP=%.6f RR=%.1f | qty=%.4f "
             "risk=%.2f%% lev=%dx score=%.2f bal=%.2f order=%s",
-            tier, style.upper(), direction.upper(), symbol, price, sl, tp,
+            style.upper(), direction.upper(), symbol, price, sl, tp,
             abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0,
             qty, risk_pct * 100, used_leverage, score, balance,
             order_id or "no-exchange",
@@ -2450,7 +2431,6 @@ class PaperBot:
         sl_dist: float,
         tp_dist: float,
         score: float,
-        tier: str = TIER_AAA_PLUS,
         style: str = STYLE_DAY,
         features: dict[str, Any] | None = None,
         xgb_confidence: float = 0.6,
@@ -2479,8 +2459,8 @@ class PaperBot:
         dynamic_risk = max(min_risk, min(dynamic_risk, max_risk))
 
         self.logger.info(
-            "[RISK] %s|%s | conf=%.3f score=%.2f RR=%.1f → risk=%.3f%% (range %.2f%%–%.2f%%)",
-            tier, style.upper(), xgb_confidence, score, rr,
+            "[RISK] %s | conf=%.3f score=%.2f RR=%.1f → risk=%.3f%% (range %.2f%%–%.2f%%)",
+            style.upper(), xgb_confidence, score, rr,
             dynamic_risk * 100, min_risk * 100, max_risk * 100,
         )
 
@@ -3118,9 +3098,6 @@ class PaperBot:
 
         return True
 
-    # ── Setup quality tier classification ─────────────────────────
-
-    # _classify_setup_tier removed — tier labels assigned inline for logging only.
     # Risk sizing is 100% confidence-based. No tier gates.
 
     # ── Style-aware SL/TP from multiple timeframes ───────────────
@@ -3739,7 +3716,7 @@ class LiveMultiBotRunner:
         self.circuit_breaker = next(iter(self._broker_cbs.values()), CircuitBreaker())
 
         # ── Paper Grid (Multi-Variant A/B Testing) ───────────────
-        # Disabled: main bot's tier-based risk is well-calibrated from backtesting.
+        # Disabled: main bot's confidence-based risk is well-calibrated from backtesting.
         # Continuous learner now handles adaptation. Re-enable when needed.
         self.paper_grid = None
 
@@ -4124,7 +4101,19 @@ class LiveMultiBotRunner:
 
                 # Compute ATR from bot's 5m buffer
                 if not (hasattr(bot, '_buffer_5m_deque') and bot._buffer_5m_deque and len(bot._buffer_5m_deque) >= 14):
-                    logger.warning("UNPROTECTED %s: no candle data for ATR SL/TP — needs manual SL", bot.symbol)
+                    logger.error("UNPROTECTED %s: no candle data for ATR SL/TP — CLOSING POSITION", bot.symbol)
+                    if bot.adapter is not None:
+                        try:
+                            _close_side = "sell" if trade["direction"] == "long" else "buy"
+                            await bot.adapter.create_market_order(
+                                bot.symbol, _close_side, trade["qty"],
+                                {"reduceOnly": True},
+                            )
+                            logger.warning("UNPROTECTED %s: CLOSED position (no candle data for SL)", bot.symbol)
+                            bot._active_trades.remove(trade)
+                            bot._save_state()
+                        except Exception as close_exc:
+                            logger.error("UNPROTECTED %s: FAILED to close: %s — REQUIRES MANUAL INTERVENTION", bot.symbol, close_exc)
                     continue
 
                 try:
@@ -4172,15 +4161,30 @@ class LiveMultiBotRunner:
                             else:
                                 logger.info("ATTACH SL/TP %s: existing stop order found, skipping", bot.symbol)
                         except Exception as exc:
-                            logger.warning(
-                                "ATTACH SL/TP %s: exchange orders FAILED: %s — local only, needs manual attention",
+                            logger.error(
+                                "ATTACH SL/TP %s: exchange orders FAILED: %s — CLOSING UNPROTECTED POSITION",
                                 bot.symbol, exc,
                             )
-                            trade["_needs_manual_sl_tp"] = True
+                            # Close unprotected position immediately
+                            try:
+                                await bot.adapter.create_market_order(
+                                    bot.symbol, _closing_side, trade["qty"],
+                                    {"reduceOnly": True},
+                                )
+                                logger.warning(
+                                    "ATTACH SL/TP %s: CLOSED unprotected position (SL/TP submit failed)",
+                                    bot.symbol,
+                                )
+                                bot._active_trades.remove(trade)
+                            except Exception as close_exc:
+                                logger.error(
+                                    "ATTACH SL/TP %s: FAILED to close unprotected position: %s — REQUIRES MANUAL INTERVENTION",
+                                    bot.symbol, close_exc,
+                                )
 
                     bot._save_state()
                 except Exception as exc:
-                    logger.warning("ATTACH SL/TP %s: ATR computation failed: %s", bot.symbol, exc)
+                    logger.error("ATTACH SL/TP %s: ATR computation failed: %s — position remains UNPROTECTED", bot.symbol, exc)
 
     # ── Trade-aware startup zombie sweep ────────────────────────────
 
@@ -4405,15 +4409,71 @@ class LiveMultiBotRunner:
                                 else:
                                     logger.info("RECONCILED %s: existing stop order found, skipping SL/TP submit", bot.symbol)
                             except Exception as exc:
-                                logger.warning(
-                                    "RECONCILED %s: exchange SL/TP FAILED: %s — local only, needs manual attention",
+                                logger.error(
+                                    "RECONCILED %s: exchange SL/TP FAILED: %s — CLOSING UNPROTECTED POSITION",
                                     bot.symbol, exc,
                                 )
-                                trade["_needs_manual_sl_tp"] = True
+                                # Close unprotected position immediately
+                                try:
+                                    _close_side = "sell" if trade["direction"] == "long" else "buy"
+                                    await bot.adapter.create_market_order(
+                                        bot.symbol, _close_side, trade["qty"],
+                                        {"reduceOnly": True},
+                                    )
+                                    logger.warning(
+                                        "RECONCILED %s: CLOSED unprotected position (SL/TP submit failed)",
+                                        bot.symbol,
+                                    )
+                                except Exception as close_exc:
+                                    logger.error(
+                                        "RECONCILED %s: FAILED to close unprotected position: %s — REQUIRES MANUAL INTERVENTION",
+                                        bot.symbol, close_exc,
+                                    )
+                                continue  # skip adding to active_trades
                 except Exception as exc:
-                    logger.warning("RECONCILED %s: ATR SL/TP computation failed: %s", bot.symbol, exc)
+                    logger.error(
+                        "RECONCILED %s: ATR SL/TP computation failed: %s — CLOSING UNPROTECTED POSITION",
+                        bot.symbol, exc,
+                    )
+                    # Close unprotected position immediately
+                    try:
+                        _close_side = "sell" if trade["direction"] == "long" else "buy"
+                        await bot.adapter.create_market_order(
+                            bot.symbol, _close_side, trade["qty"],
+                            {"reduceOnly": True},
+                        )
+                        logger.warning(
+                            "RECONCILED %s: CLOSED unprotected position (ATR computation failed)",
+                            bot.symbol,
+                        )
+                    except Exception as close_exc:
+                        logger.error(
+                            "RECONCILED %s: FAILED to close unprotected position: %s — REQUIRES MANUAL INTERVENTION",
+                            bot.symbol, close_exc,
+                        )
+                    continue  # skip adding to active_trades
             elif trade["sl"] == 0.0:
-                logger.warning("RECONCILED %s: no candle data for ATR SL/TP — trade UNPROTECTED, needs manual SL", bot.symbol)
+                logger.error(
+                    "RECONCILED %s: no candle data for ATR SL/TP — CLOSING UNPROTECTED POSITION",
+                    bot.symbol,
+                )
+                # Close unprotected position immediately
+                try:
+                    _close_side = "sell" if trade["direction"] == "long" else "buy"
+                    await bot.adapter.create_market_order(
+                        bot.symbol, _close_side, trade["qty"],
+                        {"reduceOnly": True},
+                    )
+                    logger.warning(
+                        "RECONCILED %s: CLOSED unprotected position (no candle data for SL)",
+                        bot.symbol,
+                    )
+                except Exception as close_exc:
+                    logger.error(
+                        "RECONCILED %s: FAILED to close unprotected position: %s — REQUIRES MANUAL INTERVENTION",
+                        bot.symbol, close_exc,
+                    )
+                continue  # skip adding to active_trades
 
             bot._active_trades.append(trade)
             bot._save_state()
