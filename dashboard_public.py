@@ -749,6 +749,9 @@ def api_period_stats():
     cols = _journal_columns()
     has_ac = "asset_class" in cols
 
+    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+    _ALL_BROKERS = {"binance", "oanda", "alpaca"}
+
     def _period(where_clause: str) -> dict:
         sql = (
             "SELECT pnl_pct, outcome"
@@ -758,7 +761,15 @@ def api_period_stats():
         rows = _query_journal(sql)
         if not rows:
             return {"pnl_pct": 0.0, "dd_pct": 0.0, "per_class": {}}
-        total_pct = sum(r["pnl_pct"] or 0.0 for r in rows)
+        # Aggregate per-broker then average (matches All-Time calculation)
+        broker_pnl: dict[str, float] = {b: 0.0 for b in _ALL_BROKERS}
+        if has_ac:
+            for r in rows:
+                ac = r.get("asset_class", "unknown")
+                broker = _BROKER_MAP.get(ac, ac)
+                if broker in broker_pnl:
+                    broker_pnl[broker] += (r["pnl_pct"] or 0.0)
+        total_pct = sum(broker_pnl.values()) / max(len(_ALL_BROKERS), 1)
         # DD = worst running drawdown within the period
         running = 0.0
         peak = 0.0
