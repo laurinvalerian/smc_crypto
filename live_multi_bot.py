@@ -368,7 +368,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_sl_pct": 0.008,    # 0.8% max SL
         "min_tp_pct": 0.002,    # 0.2% min TP (lowered from 0.6% — was blocking forex)
         "max_tp_pct": 0.015,    # 1.5% max TP
-        "min_rr": 1.5,          # lowered from 2.0 — brain filters bad RR
+        "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
         "cooldown_minutes": 20,
         "max_hold_candles": 72,  # 6h × 12 candles/h (5m bars, market-hours only)
     },
@@ -377,7 +377,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "max_sl_pct": 0.025,    # 2.5% max SL
         "min_tp_pct": 0.004,    # 0.4% min TP (lowered from 0.8%)
         "max_tp_pct": 0.06,     # 6% max TP
-        "min_rr": 1.5,          # lowered from 2.5 — brain filters bad RR
+        "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
         "cooldown_minutes": 60,
         "max_hold_candles": 288, # 24h × 12 candles/h (5m bars, market-hours only)
     },

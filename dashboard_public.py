@@ -1536,7 +1536,7 @@ a:hover{text-decoration:underline}
         <thead style="position:sticky;top:0;background:#161b22;z-index:1"><tr>
           <th>Time</th><th>Symbol</th><th>Direction</th>
           <th>Entry</th><th>Exit</th><th>RR</th><th>Risk%</th><th>Conf</th>
-          <th>PnL %</th><th>PnL $</th><th>Outcome</th><th>Exit Reason</th>
+          <th>PnL %</th><th>Outcome</th><th>Exit Reason</th>
         </tr></thead>
         <tbody id="th-body"></tbody>
       </table>
@@ -1915,7 +1915,7 @@ function updateRisk(d){
     html += renderProgressBar('All-Time DD', b.dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
     html += renderProgressBar('Open Risk', b.heat_pct||0, 6, '#d29922');
     html += '<div style="font-size:11px;color:#8b949e;margin-top:4px">';
-    html += 'PnL: <span style="color:'+(b.pnl>=0?'#3fb950':'#f85149')+'">'+(b.pnl>=0?'+$':'-$')+fmt(Math.abs(b.pnl),0)+' ('+fmt(b.pnl_pct,2)+'%)</span>';
+    html += 'PnL: <span style="color:'+((b.pnl_pct||0)>=0?'#3fb950':'#f85149')+'">'+(b.pnl_pct>=0?'+':'')+fmt(b.pnl_pct,2)+'%</span>';
     html += ' · Open: '+(b.active||0)+' · Budget: '+fmt(b.risk_budget||0,2)+'%';
     html += '</div>';
 
@@ -2196,7 +2196,7 @@ function updateActiveTrades(trades){
     upnlEl.textContent = (upnlPct >= 0 ? '+' : '') + fmt(upnlPct, 2) + '%';
     upnlEl.className = 'card-value ' + pnlColor(upnlPct);
   }
-  if(upnlCountEl) upnlCountEl.textContent = posCount + ' open · ' + (totalUpnl >= 0 ? '+$' : '-$') + fmt(Math.abs(totalUpnl), 0);
+  if(upnlCountEl) upnlCountEl.textContent = '';
   // Per-class breakdown in %
   if(upnlBreakdown){
     var brokerEq = {'binance':'crypto','oanda':'forex','alpaca':'stocks'};
@@ -2238,7 +2238,8 @@ function updateActiveTrades(trades){
       if(pnlSpan){
         var pnl = t.unrealized_pnl || 0;
         pnlSpan.className = pnlColor(pnl);
-        pnlSpan.textContent = (pnl>=0?'+$':'-$') + fmt(Math.abs(pnl),2);
+        var pnlPctVal = totalEq > 0 ? (pnl / totalEq * 100) : 0;
+        pnlSpan.textContent = (pnlPctVal >= 0 ? '+' : '') + fmt(pnlPctVal, 2) + '%';
       }
     }
     return;
@@ -2271,7 +2272,8 @@ function updateActiveTrades(trades){
     html += '<span><span class="label">Entry:</span> ' + fmt(t.entry_price,5) + '</span>';
     html += '<span><span class="label">SL:</span> <span class="red">' + fmt(t.sl,5) + '</span></span>';
     html += '<span><span class="label">TP:</span> <span class="green">' + fmt(t.tp,5) + '</span></span>';
-    html += '<span><span class="label">PnL:</span> <span id="pnl-' + symId + '" class="' + pnlColor(pnl) + '">' + (pnl>=0?'+$':'-$') + fmt(Math.abs(pnl),2) + '</span></span>';
+    var tPnlPct = totalEq > 0 ? (pnl / totalEq * 100) : 0;
+    html += '<span><span class="label">PnL:</span> <span id="pnl-' + symId + '" class="' + pnlColor(tPnlPct) + '">' + (tPnlPct>=0?'+':'') + fmt(tPnlPct,2) + '%</span></span>';
     var hh = t.hold_time_hours || 0;
     var holdStr = hh < 1 ? Math.round(hh*60)+'m' : (hh < 24 ? fmt(hh,1)+'h' : fmt(hh/24,1)+'d');
     html += '<span><span class="label">Hold:</span> ' + holdStr + '</span>';
@@ -2374,7 +2376,6 @@ function renderTradeHistory(trades, append){
     var isWin = t.outcome === 'win';
     var rowCls = isWin ? 'win-row' : (t.outcome === 'loss' ? 'loss-row' : '');
     var pnlPct = (t.pnl_pct || 0) * 100;
-    var pnlDollar = (t.pnl_pct || 0) * 100000;
     var dir = t.direction ? t.direction.charAt(0).toUpperCase() + t.direction.slice(1) : '--';
     var exitTime = t.exit_time ? t.exit_time.substring(0,16) : '--';
     html += '<tr class="'+rowCls+'">';
@@ -2387,7 +2388,6 @@ function renderTradeHistory(trades, append){
     html += '<td>'+((t.risk_pct||0)*100).toFixed(2)+'%</td>';
     html += '<td>'+fmt(t.xgb_confidence||t.score,3)+'</td>';
     html += '<td class="'+pnlColor(pnlPct)+'">'+(pnlPct>=0?'+':'')+pnlPct.toFixed(2)+'%</td>';
-    html += '<td class="'+pnlColor(pnlDollar)+'">'+(pnlDollar>=0?'+$':'-$')+Math.abs(pnlDollar).toFixed(2)+'</td>';
     html += '<td><span class="'+(isWin?'green':'red')+'">'+(t.outcome||'--')+'</span></td>';
     html += '<td>'+escHtml(t.exit_reason||'--')+'</td>';
     html += '</tr>';
