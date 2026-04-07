@@ -1494,7 +1494,7 @@ a:hover{text-decoration:underline}
     <div class="card">
       <div class="card-label">Unrealized PnL</div>
       <div class="card-value" id="c-upnl">--</div>
-      <div class="card-sub" id="c-upnl-count">0 open positions</div>
+      <div class="card-sub" id="c-upnl-count"></div>
       <div class="card-sub" id="c-upnl-breakdown" style="font-size:11px;margin-top:2px"></div>
     </div>
   </div>
