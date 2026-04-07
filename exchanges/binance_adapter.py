@@ -90,7 +90,7 @@ class BinanceAdapter(ExchangeAdapter):
             "options": {"defaultType": "future"},
         })
         if self._testnet:
-            self._exchange.set_sandbox_mode(True)
+            self._exchange.enable_demo_trading(True)
 
         # Sync client for history
         self._sync_exchange = ccxt_sync.binanceusdm({"enableRateLimit": True})
