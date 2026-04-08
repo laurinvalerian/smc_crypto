@@ -11,9 +11,9 @@ from __future__ import annotations
 
 # Bump this on every feature list change. Stored in model pickle at train time,
 # checked at startup. Mismatch → hard RuntimeError (no silent degradation).
-SCHEMA_VERSION: int = 2  # v1=40 features, v2=41 features (+style_id)
+SCHEMA_VERSION: int = 3  # v1=40, v2=41 (+style_id), v3=42 (+alignment_score)
 
-# The 41 features the entry_quality XGBoost model expects, in order.
+# The 42 features the entry_quality XGBoost model expects, in order.
 ENTRY_QUALITY_FEATURES: list[str] = [
     # Structure direction per TF (causal SMC indicators)
     "struct_1d", "struct_4h", "struct_1h", "struct_15m", "struct_5m",
@@ -44,13 +44,14 @@ ENTRY_QUALITY_FEATURES: list[str] = [
     "asset_class_id",
     # Trade style encoding: scalp=0.0, day=0.5, swing=1.0 (SL distance classifier)
     "style_id",
+    # Alignment score (composite of all SMC components — gives model calibration signal)
+    "alignment_score",
 ]
 
-# Features excluded from entry_quality model (data leaks in training context)
+# Features excluded from entry_quality model (true data leaks)
 # These ARE still computed and passed — used by TP/BE/sizing models.
 ENTRY_QUALITY_EXCLUDE: frozenset[str] = frozenset({
-    "has_entry_zone",
-    "alignment_score",
+    "has_entry_zone",  # always 1.0 for entry signals — no information
 })
 
 # All features including excluded ones (for models that need them)

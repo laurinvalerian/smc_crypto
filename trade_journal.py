@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS rejected_signals (
     outcome_day     TEXT,
     mfe_day         REAL,
     mae_day         REAL,
-    -- Swing horizon: 1440 bars (10d) — would it have been a good swing?
+    -- Swing horizon: 1440 bars (5d) — would it have been a good swing?
     outcome_swing   TEXT,
     mfe_swing       REAL,
     mae_swing       REAL
@@ -307,10 +307,13 @@ class TradeJournal:
         xgb_confidence: float,
         alignment_score: float,
         entry_features: dict[str, float] | None = None,
-    ) -> None:
-        """Record a signal rejected by the XGBoost entry filter."""
+    ) -> int | None:
+        """Record a signal rejected by the XGBoost entry filter.
+
+        Returns the row ID (for outcome tracking) or None on failure.
+        """
         try:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """INSERT INTO rejected_signals
                    (timestamp, symbol, asset_class, direction, entry_price,
                     sl_price, tp_price, xgb_confidence, alignment_score,
@@ -324,8 +327,44 @@ class TradeJournal:
                 ),
             )
             self._conn.commit()
+            return cursor.lastrowid
         except Exception as exc:
             logger.error("journal.record_rejected_signal failed for %s: %s", symbol, exc)
+            return None
+
+    def update_rejection_outcome(
+        self,
+        rejection_id: int,
+        horizon: str,
+        outcome: str,
+        mfe: float,
+        mae: float,
+    ) -> None:
+        """Write counterfactual outcome for a rejected signal.
+
+        horizon: "scalp" (72 bars/6h), "day" (288 bars/24h), "swing" (1440 bars/5d)
+        outcome: "win" (TP would hit), "loss" (SL would hit), "timeout"
+        mfe/mae: max favorable/adverse excursion as fraction of entry price
+        """
+        col_map = {
+            "scalp": ("outcome_scalp", "mfe_scalp", "mae_scalp"),
+            "day": ("outcome_day", "mfe_day", "mae_day"),
+            "swing": ("outcome_swing", "mfe_swing", "mae_swing"),
+        }
+        cols = col_map.get(horizon)
+        if not cols:
+            return
+        out_col, mfe_col, mae_col = cols
+        try:
+            self._conn.execute(
+                f"UPDATE rejected_signals SET {out_col}=?, {mfe_col}=?, {mae_col}=? "
+                f"WHERE id=?",
+                (outcome, mfe, mae, rejection_id),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.error("journal.update_rejection_outcome failed id=%d: %s",
+                         rejection_id, exc)
 
     def record_post_trade_bars(
         self,

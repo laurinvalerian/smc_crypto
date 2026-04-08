@@ -46,6 +46,7 @@ import weakref
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -361,6 +362,26 @@ STYLE_SCALP = "scalp"
 STYLE_DAY = "day"
 STYLE_SWING = "swing"
 MAX_CONCURRENT_REJECTION_WATCHERS = 50  # cap async outcome watchers for rejected signals
+REJECTION_DEDUP_BARS = 6        # 30 min in 5m candles — skip duplicate rejections (candle-time)
+REJECTION_HORIZON_SCALP = 72    # 6h in 5m bars
+REJECTION_HORIZON_DAY = 288     # 24h in 5m bars
+REJECTION_HORIZON_SWING = 1440  # 5d in 5m bars
+
+
+@dataclass
+class _RejectionTracker:
+    """Tracks counterfactual outcome of a rejected signal over 3 horizons."""
+    db_id: int
+    entry_price: float
+    sl_price: float
+    tp_price: float
+    direction: str  # "long" or "short"
+    bars_elapsed: int = 0
+    mfe: float = 0.0  # max favorable excursion (fraction of entry)
+    mae: float = 0.0  # max adverse excursion (fraction of entry)
+    scalp_done: bool = False
+    day_done: bool = False
+    # swing_done implied by removal from list
 
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
@@ -369,7 +390,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "min_tp_pct": 0.002,    # 0.2% min TP (lowered from 0.6% — was blocking forex)
         "max_tp_pct": 0.015,    # 1.5% max TP
         "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
-        "cooldown_minutes": 20,
+        # cooldown removed — circuit breaker + rate limit are sufficient
         "max_hold_candles": 72,  # 6h × 12 candles/h (5m bars, market-hours only)
     },
     STYLE_DAY: {
@@ -378,7 +399,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "min_tp_pct": 0.004,    # 0.4% min TP (lowered from 0.8%)
         "max_tp_pct": 0.06,     # 6% max TP
         "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
-        "cooldown_minutes": 60,
+        # cooldown removed — circuit breaker + rate limit are sufficient
         "max_hold_candles": 288, # 24h × 12 candles/h (5m bars, market-hours only)
     },
     STYLE_SWING: {
@@ -387,7 +408,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
         "min_tp_pct": 0.02,     # 2% min TP
         "max_tp_pct": 0.15,     # 15% max TP
         "min_rr": 2.0,          # lowered from 3.0 — brain filters bad RR
-        "cooldown_minutes": 240,
+        # cooldown removed — circuit breaker + rate limit are sufficient
         "max_hold_candles": 1440, # 10d × 12 candles/h × ~12h avg market day (5m bars, market-hours only)
     },
 }
@@ -537,12 +558,10 @@ class PaperBot:
                 _skip.append("volume_ok")
         self._class_skip_flags: set[str] = set(_skip)
         self._max_signals_per_4h: int = MAX_SIGNALS_PER_SYMBOL_4H.get(asset_class, 5)
-        self._recent_signal_times: list[datetime] = []
+        self._recent_signal_bars: list[int] = []  # bar counts of accepted signals (candle-time)
 
-        # Cooldown: dynamic per trade style
-        self._last_entry_time: datetime | None = None
-        self._entry_cooldown = timedelta(hours=1)
-        self._last_trade_style: str = STYLE_DAY
+        # Bar counter for candle-time-based rate limiting and dedup
+        self._total_bars: int = 0
 
         # Volatility cache (refreshed every candle)
         self._daily_atr_pct: float = 0.0
@@ -592,6 +611,10 @@ class PaperBot:
         self._rejection_watcher_count: int = 0
         # Store last obs so we can record reward when trade closes
         self._pending_obs: np.ndarray | None = None
+
+        # Counterfactual outcome tracking for rejected signals
+        self._last_rejection_bar: dict[str, int] = {}  # direction -> last bar count (dedup)
+        self._rejection_trackers: list[_RejectionTracker] = []
 
         # Trade lifecycle journal (set by Runner; logs every bar for ML training)
         self.journal: TradeJournal | None = None
@@ -717,15 +740,144 @@ class PaperBot:
                 len(self._candle_buf.get(self.symbol, [])), self.symbol,
             )
 
+    # === COUNTERFACTUAL OUTCOME TRACKING ===
+
+    def _rejection_dedup_ok(self, direction: str) -> bool:
+        """Return True if this rejection is NOT a duplicate (>6 bars since last same-dir).
+
+        Uses candle-time (bar count) not wall-clock — weekends/market-close don't count.
+        6 bars = 30 min in 5m candles.
+        """
+        last_bar = self._last_rejection_bar.get(direction)
+        if last_bar is not None and (self._total_bars - last_bar) < 6:
+            return False
+        self._last_rejection_bar[direction] = self._total_bars
+        return True
+
+    def _record_and_track_rejection(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        xgb_confidence: float,
+        alignment_score: float,
+        entry_features: dict[str, float] | None,
+    ) -> None:
+        """Deduplicated rejection recording + start counterfactual outcome tracker."""
+        if self.journal is None:
+            return
+        if not self._rejection_dedup_ok(direction):
+            return  # duplicate within 30 min window
+
+        db_id = self.journal.record_rejected_signal(
+            symbol=symbol,
+            asset_class=self.asset_class,
+            direction=direction,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            xgb_confidence=xgb_confidence,
+            alignment_score=alignment_score,
+            entry_features=entry_features,
+        )
+        if db_id is not None and entry_price > 0:
+            # Cap at 100 trackers per bot; evict oldest with timeout if full
+            if len(self._rejection_trackers) >= 100:
+                oldest = self._rejection_trackers[0]
+                if self.journal:
+                    if not oldest.scalp_done:
+                        self.journal.update_rejection_outcome(oldest.db_id, "scalp", "timeout", oldest.mfe, oldest.mae)
+                    if not oldest.day_done:
+                        self.journal.update_rejection_outcome(oldest.db_id, "day", "timeout", oldest.mfe, oldest.mae)
+                    self.journal.update_rejection_outcome(oldest.db_id, "swing", "timeout", oldest.mfe, oldest.mae)
+                self._rejection_trackers.pop(0)
+            self._rejection_trackers.append(_RejectionTracker(
+                db_id=db_id,
+                entry_price=entry_price,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                direction=direction,
+            ))
+
+    def _update_rejection_outcomes(self, candle: dict[str, Any]) -> None:
+        """Update all pending rejection trackers with this candle's price action.
+
+        Called once per 5m candle from on_candle. Checks SL/TP hits,
+        updates MFE/MAE, writes outcomes to journal at each horizon.
+        """
+        if not self._rejection_trackers:
+            return
+
+        high = float(candle.get("high", 0.0))
+        low = float(candle.get("low", 0.0))
+        to_remove: list[_RejectionTracker] = []
+
+        for t in self._rejection_trackers:
+            t.bars_elapsed += 1
+            entry = t.entry_price
+            if entry <= 0:
+                to_remove.append(t)
+                continue
+
+            # Update MFE / MAE
+            if t.direction == "long":
+                fav = (high - entry) / entry
+                adv = (entry - low) / entry
+                sl_hit = low <= t.sl_price
+                tp_hit = high >= t.tp_price
+            else:
+                fav = (entry - low) / entry
+                adv = (high - entry) / entry
+                sl_hit = high >= t.sl_price
+                tp_hit = low <= t.tp_price
+
+            t.mfe = max(t.mfe, max(fav, 0.0))
+            t.mae = max(t.mae, max(adv, 0.0))
+
+            # If SL or TP hit, finalize ALL remaining horizons and remove
+            # Conservative: if BOTH hit on same candle, label as "loss"
+            # (intra-bar order unknown — avoids optimistic bias in training data)
+            if sl_hit or tp_hit:
+                outcome = "loss" if (sl_hit and tp_hit) else ("win" if tp_hit else "loss")
+                if not t.scalp_done and self.journal:
+                    self.journal.update_rejection_outcome(t.db_id, "scalp", outcome, t.mfe, t.mae)
+                if not t.day_done and self.journal:
+                    self.journal.update_rejection_outcome(t.db_id, "day", outcome, t.mfe, t.mae)
+                if self.journal:
+                    self.journal.update_rejection_outcome(t.db_id, "swing", outcome, t.mfe, t.mae)
+                to_remove.append(t)
+                continue
+
+            # Timeout checks per horizon
+            if not t.scalp_done and t.bars_elapsed >= REJECTION_HORIZON_SCALP:
+                if self.journal:
+                    self.journal.update_rejection_outcome(t.db_id, "scalp", "timeout", t.mfe, t.mae)
+                t.scalp_done = True
+
+            if not t.day_done and t.bars_elapsed >= REJECTION_HORIZON_DAY:
+                if self.journal:
+                    self.journal.update_rejection_outcome(t.db_id, "day", "timeout", t.mfe, t.mae)
+                t.day_done = True
+
+            if t.bars_elapsed >= REJECTION_HORIZON_SWING:
+                if self.journal:
+                    self.journal.update_rejection_outcome(t.db_id, "swing", "timeout", t.mfe, t.mae)
+                to_remove.append(t)
+
+        if to_remove:
+            remove_set = set(id(t) for t in to_remove)
+            self._rejection_trackers = [t for t in self._rejection_trackers if id(t) not in remove_set]
+
     # === CAPACITY-REJECTED SIGNAL TRACKING ===
     def _record_capacity_rejected(self, sig: dict[str, Any], reason: str) -> None:
         """Record a signal blocked by capacity limits for counterfactual learning."""
         if self.journal is None:
             return
         try:
-            self.journal.record_rejected_signal(
+            self._record_and_track_rejection(
                 symbol=sig.get("symbol", self.symbol),
-                asset_class=self.asset_class,
                 direction=sig.get("direction", ""),
                 entry_price=sig.get("ref_price", 0.0),
                 sl_price=sig.get("sl", 0.0),
@@ -1238,6 +1390,12 @@ class PaperBot:
         })
         self._buffer_5m_dirty = True
 
+        # Increment candle-time bar counter (used for rate limiting + dedup)
+        self._total_bars += 1
+
+        # Update counterfactual outcome trackers for rejected signals
+        self._update_rejection_outcomes(candle)
+
         if len(buf) >= self.swing_length + 5:
             self._prepare_signal(symbol, buf, candle)
 
@@ -1707,6 +1865,12 @@ class PaperBot:
                      "precision_trigger", "volume_ok"):
             feat[flag] = 1.0 if components.get(flag) else 0.0
 
+        # Tick-volume classes: override volume_ok to neutral 0.5
+        # Real volume_ok is unreliable for forex/commodities (tick volume),
+        # and must match training data to avoid train/inference mismatch.
+        if self.asset_class in ("forex", "commodities"):
+            feat["volume_ok"] = 0.5
+
         # has_entry_zone: always 1.0 for live entry signals — by the time we
         # reach _build_xgb_features, entry zone existence is already confirmed.
         # Entry filter model excludes this (ENTRY_QUALITY_EXCLUDE), but
@@ -1936,12 +2100,7 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # ── Duplicate zone check (replaces cooldown timer) ─────────
-        # Don't prepare a new signal if there's already an active trade
-        # on this symbol – prevents double-entries on the same zone
-        if self._active_trades:
-            self._pending_signal = None
-            return
+        # (no early block — style check happens after classification at line ~2191)
 
         # ── Circuit breaker check ──────────────────────────────────
         if self.circuit_breaker is not None:
@@ -2024,6 +2183,12 @@ class PaperBot:
         # Classify style from the resulting SL/TP
         style = self._classify_trade_style(price, sl, tp)
 
+        # ── Per-style limit: max 1 trade per style on same symbol ──
+        # Different styles (scalp + day, day + swing) allowed simultaneously.
+        # Circuit breaker + rate limit handle overall risk.
+        if any(t.get("style") == style for t in self._active_trades):
+            return
+
         sl_dist = abs(price - sl)
         tp_dist = abs(tp - price)
 
@@ -2084,16 +2249,16 @@ class PaperBot:
         # ── Signal rate limiting (per-class safety throttle) ──────
         # Only counts XGB-accepted signals (moved to after XGB gate below).
         # Rejected signals don't consume rate limit slots.
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=4)
-        self._recent_signal_times = [
-            t for t in self._recent_signal_times if t > cutoff
+        # Uses candle-time (bar count) — 48 bars = 4h in 5m candles.
+        cutoff_bar = self._total_bars - 48
+        self._recent_signal_bars = [
+            b for b in self._recent_signal_bars if b > cutoff_bar
         ]
-        if len(self._recent_signal_times) >= self._max_signals_per_4h:
+        if len(self._recent_signal_bars) >= self._max_signals_per_4h:
             self.logger.info(
-                "RATE-LIMITED %s | class=%s | %d trades in 4h (max=%d)",
+                "RATE-LIMITED %s | class=%s | %d signals in 48 bars (max=%d)",
                 symbol, self.asset_class,
-                len(self._recent_signal_times), self._max_signals_per_4h,
+                len(self._recent_signal_bars), self._max_signals_per_4h,
             )
             self._pending_signal = None
             return
@@ -2184,14 +2349,6 @@ class PaperBot:
             return
         if sig["symbol"] != symbol:
             return
-        # ── Duplicate style check (per-bot) ──────────────────────
-        # Never two trades of the same style on the same coin.
-        pending_style = sig.get("style", STYLE_DAY)
-        if any(t["style"] == pending_style for t in self._active_trades):
-            # Record for counterfactual learning before discarding
-            self._record_capacity_rejected(sig, "duplicate_style")
-            self._pending_signal = None
-            return
         # ── Dynamic risk budget check ────────────────────────────
         # Instead of fixed per-style limits, check if DD budget allows
         # another trade. The closer to DD limits, the fewer trades opened.
@@ -2251,27 +2408,24 @@ class PaperBot:
                         self.rl_suite.confidence_threshold,
                         self.asset_class, direction,
                     )
-                # Log rejected signal to journal for counterfactual analysis
-                if self.journal is not None and self._rejection_watcher_count < MAX_CONCURRENT_REJECTION_WATCHERS:
-                    try:
-                        self.journal.record_rejected_signal(
-                            symbol=symbol,
-                            asset_class=self.asset_class,
-                            direction=direction,
-                            entry_price=price,
-                            sl_price=sl,
-                            tp_price=tp,
-                            xgb_confidence=rl_confidence,
-                            alignment_score=score,
-                            entry_features=sig.get("features"),
-                        )
-                        self._rejection_watcher_count += 1
-                    except Exception as exc:
-                        self.logger.debug("Failed to log rejected signal: %s", exc)
+                # Log rejected signal + start counterfactual outcome tracker
+                try:
+                    self._record_and_track_rejection(
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=price,
+                        sl_price=sl,
+                        tp_price=tp,
+                        xgb_confidence=rl_confidence,
+                        alignment_score=score,
+                        entry_features=sig.get("features"),
+                    )
+                except Exception as exc:
+                    self.logger.debug("Failed to log rejected signal: %s", exc)
                 self._pending_signal = None
                 return
             self._rl_accepted += 1
-            self._recent_signal_times.append(datetime.now(timezone.utc))  # rate limit counts accepted only
+            self._recent_signal_bars.append(self._total_bars)  # rate limit counts accepted only (candle-time)
             self.logger.info(
                 "XGB ACCEPT %s conf=%.3f score=%.2f | accepted=%d rejected=%d",
                 symbol, rl_confidence, score,
@@ -2408,8 +2562,7 @@ class PaperBot:
             "be_triggered": False,
         }
         self._active_trades.append(trade_info)
-        self._last_entry_time = datetime.now(timezone.utc)
-        self._last_trade_style = style
+        # (cooldown code removed — circuit breaker + rate limit are sufficient)
 
         # ── Trade Journal: record trade open ─────────────────────────
         trade_id_for_journal = rl_trade_id or order_id or f"t_{len(self._active_trades)}"

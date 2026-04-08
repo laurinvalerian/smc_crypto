@@ -686,8 +686,13 @@ def extract_features_for_instrument(
 
     # Volume OK
     volume_ok = np.zeros(n, dtype=np.float32)
-    for i in range(20, n):
-        volume_ok[i] = float(_check_volume_ok(df_5m, i))
+    if asset_class in ("forex", "commodities"):
+        # Tick-volume classes: neutral 0.5 (tick volume unreliable for dollar-floor)
+        # Must match live inference in _build_xgb_features to avoid train/live mismatch
+        volume_ok[:] = 0.5
+    else:
+        for i in range(20, n):
+            volume_ok[i] = float(_check_volume_ok(df_5m, i))
 
     # ── Market Context ───────────────────────────────────────────
     ema20_5m = _compute_ema(close_5m, 20)

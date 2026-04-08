@@ -61,8 +61,8 @@ META_COLS = {"timestamp", "symbol", "asset_class", "window",
              "outcome", "exit_mechanism", "max_favorable_rr", "entry_price",
              "tp_rr", "direction"}
 
-# Features to exclude from entry_quality task (data leaks)
-ENTRY_QUALITY_EXCLUDE = {"has_entry_zone", "alignment_score"}
+# Features to exclude from entry_quality task (true data leaks only)
+ENTRY_QUALITY_EXCLUDE = {"has_entry_zone"}  # alignment_score moved to FEATURES in schema v3
 
 # Dead features: constant or redundant — carry no signal
 DEAD_FEATURES = {"bias_strong", "daily_bias"}

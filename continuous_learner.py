@@ -233,6 +233,129 @@ def collect_live_data(
 
 
 # ===================================================================
+#  1b. Collect counterfactual data from rejected signals
+# ===================================================================
+
+def collect_counterfactual_data(
+    db_path: str,
+    horizon: str = "scalp",
+) -> pd.DataFrame:
+    """Load rejected signals with filled outcomes for counterfactual learning.
+
+    Deduplicates by (symbol, direction, 30-min window) to avoid overweighting
+    repeated rejections of the same setup.
+
+    Labels: outcome=="win" → 1 (model should have accepted),
+            outcome=="loss" → 0 (model correctly rejected),
+            outcome=="timeout" → based on MFE (>60% of TP distance = 1, else 0).
+    Weight: 0.3× base (lower than actual trades, counterfactual uncertainty).
+    """
+    if not Path(db_path).exists():
+        return pd.DataFrame()
+
+    outcome_col = f"outcome_{horizon}"
+    mfe_col = f"mfe_{horizon}"
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        if horizon not in ("scalp", "day", "swing"):
+            return pd.DataFrame()
+        cursor = conn.execute(
+            f"SELECT id, timestamp, symbol, direction, entry_price, sl_price, tp_price, "
+            f"entry_features, xgb_confidence, {outcome_col}, {mfe_col} "
+            f"FROM rejected_signals "
+            f"WHERE {outcome_col} IS NOT NULL "
+            f"AND entry_features IS NOT NULL "
+            f"AND entry_features != '{{}}' "
+            # Include both XGB-rejected (conf>=0) and capacity-rejected (conf=-1)
+            f"ORDER BY timestamp ASC"
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error as exc:
+        logger.error("Counterfactual query failed: %s", exc)
+        return pd.DataFrame()
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not rows:
+        logger.info("No counterfactual data with filled %s outcomes", horizon)
+        return pd.DataFrame()
+
+    # ── Deduplicate: one sample per (symbol, direction, 30-min window) ──
+    deduped: list[sqlite3.Row] = []
+    seen: dict[tuple[str, str], str] = {}  # (sym, dir) -> last_ts
+    for row in rows:
+        key = (row["symbol"], row["direction"])
+        ts_str = row["timestamp"]
+        last_ts = seen.get(key)
+        if last_ts:
+            try:
+                t_cur = datetime.fromisoformat(ts_str)
+                t_last = datetime.fromisoformat(last_ts)
+                if abs((t_cur - t_last).total_seconds()) < 1800:
+                    continue  # duplicate within 30-min window
+            except (ValueError, TypeError):
+                pass
+        seen[key] = ts_str
+        deduped.append(row)
+
+    logger.info("Counterfactual dedup: %d → %d samples", len(rows), len(deduped))
+
+    # ── Parse features and build training rows ──────────────────────
+    feat_names = list(ENTRY_QUALITY_FEATURES)
+    records: list[dict[str, Any]] = []
+
+    for row in deduped:
+        try:
+            feats = json.loads(row["entry_features"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        missing = [f for f in feat_names if f not in feats]
+        if missing:
+            continue
+
+        record: dict[str, Any] = {f: feats[f] for f in feat_names}
+
+        outcome = row[outcome_col]
+        mfe = row[mfe_col] or 0.0
+
+        # Label assignment
+        if outcome == "win":
+            record["label"] = 1  # model was wrong to reject
+        elif outcome == "loss":
+            record["label"] = 0  # model correctly rejected
+        else:  # timeout
+            # Use MFE heuristic: if price moved >60% toward TP, it was a good trade
+            entry = row["entry_price"] or 0.0
+            sl = row["sl_price"] or 0.0
+            tp = row["tp_price"] or 0.0
+            if entry > 0 and tp > 0 and sl > 0:
+                tp_dist = abs(tp - entry) / entry
+                mfe_ratio = mfe / tp_dist if tp_dist > 0 else 0.0
+                record["label"] = 1 if mfe_ratio > 0.6 else 0
+            else:
+                record["label"] = 0
+
+        # Lower weight: counterfactual data has inherent uncertainty
+        record["sample_weight"] = 0.3
+        records.append(record)
+
+    if not records:
+        logger.info("No counterfactual samples with complete features")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    n_pos = int(df["label"].sum())
+    logger.info("Counterfactual data: %d samples (%d positive, %d negative)",
+                len(df), n_pos, len(df) - n_pos)
+    return df
+
+
+# ===================================================================
 #  2. Load subsampled backtest data
 # ===================================================================
 
@@ -354,6 +477,17 @@ def retrain_if_ready(config: dict) -> bool:
     # ── Load backtest data ───────────────────────────────────────
     backtest_df = load_backtest_data(subsample_per_class=subsample_per_class)
 
+    # ── Load counterfactual data from rejected signals ───────────
+    # Use all 3 horizons: scalp (6h), day (24h), swing (5d).
+    # Each horizon gives independent signal — a reject might be loss at 6h but win at 24h.
+    # Deduplicated per horizon so same signal appears max 3× with potentially different labels.
+    cf_frames = []
+    for hz in ("scalp", "day", "swing"):
+        cf = collect_counterfactual_data(db_path, horizon=hz)
+        if len(cf) > 0:
+            cf_frames.append(cf)
+    counterfactual_df = pd.concat(cf_frames, ignore_index=True) if cf_frames else pd.DataFrame()
+
     # ── Walk-forward split: last 30% of live = validation ────────
     feat_names = list(ENTRY_QUALITY_FEATURES)
     split_idx = n_live - n_val
@@ -361,11 +495,9 @@ def retrain_if_ready(config: dict) -> bool:
     live_train = live_df.iloc[:split_idx]
     live_val = live_df.iloc[split_idx:]
 
-    # ── Combine backtest + live train ────────────────────────────
-    if len(backtest_df) > 0:
-        train_df = pd.concat([backtest_df, live_train], ignore_index=True)
-    else:
-        train_df = live_train.copy()
+    # ── Combine backtest + live train + counterfactual ───────────
+    frames = [f for f in [backtest_df, live_train, counterfactual_df] if len(f) > 0]
+    train_df = pd.concat(frames, ignore_index=True) if frames else live_train.copy()
 
     # ── Apply recency halflife to live training weights ──────────
     # Position from newest: live_train rows are at the end of train_df

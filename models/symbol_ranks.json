@@ -1,0 +1,1095 @@
+{
+  "crypto": {
+    "0GUSDT": {
+      "volatility_rank": 0.8880597014925373,
+      "liquidity_rank": 0.917910447761194,
+      "spread_rank": 0.7686567164179104
+    },
+    "1000000BOBUSDT": {
+      "volatility_rank": 0.746268656716418,
+      "liquidity_rank": 0.417910447761194,
+      "spread_rank": 0.7611940298507462
+    },
+    "1000000MOGUSDT": {
+      "volatility_rank": 0.6492537313432836,
+      "liquidity_rank": 0.3283582089552239,
+      "spread_rank": 0.746268656716418
+    },
+    "1000BONKUSDT": {
+      "volatility_rank": 0.8432835820895522,
+      "liquidity_rank": 0.664179104477612,
+      "spread_rank": 0.7238805970149254
+    },
+    "1000CATUSDT": {
+      "volatility_rank": 0.5970149253731343,
+      "liquidity_rank": 0.4925373134328358,
+      "spread_rank": 0.6865671641791045
+    },
+    "1000CHEEMSUSDT": {
+      "volatility_rank": 0.5447761194029851,
+      "liquidity_rank": 0.2835820895522388,
+      "spread_rank": 0.47761194029850745
+    },
+    "1000FLOKIUSDT": {
+      "volatility_rank": 0.3283582089552239,
+      "liquidity_rank": 0.1791044776119403,
+      "spread_rank": 0.5
+    },
+    "1000LUNCUSDT": {
+      "volatility_rank": 0.30597014925373134,
+      "liquidity_rank": 0.47761194029850745,
+      "spread_rank": 0.2835820895522388
+    },
+    "1000PEPEUSDT": {
+      "volatility_rank": 0.8134328358208955,
+      "liquidity_rank": 0.9776119402985075,
+      "spread_rank": 0.6492537313432836
+    },
+    "1000RATSUSDT": {
+      "volatility_rank": 0.7910447761194029,
+      "liquidity_rank": 0.6716417910447762,
+      "spread_rank": 0.8283582089552238
+    },
+    "1000SATSUSDT": {
+      "volatility_rank": 0.7313432835820896,
+      "liquidity_rank": 0.9029850746268657,
+      "spread_rank": 0.7985074626865671
+    },
+    "1000SHIBUSDT": {
+      "volatility_rank": 0.23880597014925373,
+      "liquidity_rank": 0.746268656716418,
+      "spread_rank": 0.1417910447761194
+    },
+    "1000XECUSDT": {
+      "volatility_rank": 0.17164179104477612,
+      "liquidity_rank": 0.08208955223880597,
+      "spread_rank": 0.11194029850746269
+    },
+    "1INCHUSDT": {
+      "volatility_rank": 0.1044776119402985,
+      "liquidity_rank": 0.16417910447761194,
+      "spread_rank": 0.16417910447761194
+    },
+    "1MBABYDOGEUSDT": {
+      "volatility_rank": 0.5223880597014925,
+      "liquidity_rank": 0.7313432835820896,
+      "spread_rank": 0.48507462686567165
+    },
+    "2ZUSDT": {
+      "volatility_rank": 0.582089552238806,
+      "liquidity_rank": 0.6940298507462687,
+      "spread_rank": 0.5149253731343284
+    },
+    "4USDT": {
+      "volatility_rank": 0.9925373134328358,
+      "liquidity_rank": 0.835820895522388,
+      "spread_rank": 0.9552238805970149
+    },
+    "A2ZUSDT": {
+      "volatility_rank": 0.6716417910447762,
+      "liquidity_rank": 0.582089552238806,
+      "spread_rank": 0.6119402985074627
+    },
+    "AAVEUSDT": {
+      "volatility_rank": 0.20149253731343283,
+      "liquidity_rank": 0.3582089552238806,
+      "spread_rank": 0.22388059701492538
+    },
+    "ACEUSDT": {
+      "volatility_rank": 0.5746268656716418,
+      "liquidity_rank": 0.7686567164179104,
+      "spread_rank": 0.5597014925373134
+    },
+    "ACHUSDT": {
+      "volatility_rank": 0.5074626865671642,
+      "liquidity_rank": 0.34328358208955223,
+      "spread_rank": 0.3880597014925373
+    },
+    "ACTUSDT": {
+      "volatility_rank": 0.8656716417910447,
+      "liquidity_rank": 0.9253731343283582,
+      "spread_rank": 0.7014925373134329
+    },
+    "ACUUSDT": {
+      "volatility_rank": 0.9626865671641791,
+      "liquidity_rank": 0.4701492537313433,
+      "spread_rank": 0.9328358208955224
+    },
+    "ACXUSDT": {
+      "volatility_rank": 0.6865671641791045,
+      "liquidity_rank": 0.5149253731343284,
+      "spread_rank": 0.417910447761194
+    },
+    "ADAUSDT": {
+      "volatility_rank": 0.16417910447761194,
+      "liquidity_rank": 0.8059701492537313,
+      "spread_rank": 0.13432835820895522
+    },
+    "AERGOUSDT": {
+      "volatility_rank": 0.7388059701492538,
+      "liquidity_rank": 0.7835820895522388,
+      "spread_rank": 0.26119402985074625
+    },
+    "AEROUSDT": {
+      "volatility_rank": 0.41044776119402987,
+      "liquidity_rank": 0.19402985074626866,
+      "spread_rank": 0.44776119402985076
+    },
+    "AEVOUSDT": {
+      "volatility_rank": 0.5522388059701493,
+      "liquidity_rank": 0.7014925373134329,
+      "spread_rank": 0.5447761194029851
+    },
+    "AGLDUSDT": {
+      "volatility_rank": 0.208955223880597,
+      "liquidity_rank": 0.11194029850746269,
+      "spread_rank": 0.41044776119402987
+    },
+    "AGTUSDT": {
+      "volatility_rank": 0.44029850746268656,
+      "liquidity_rank": 0.15671641791044777,
+      "spread_rank": 0.8805970149253731
+    },
+    "AIAUSDT": {
+      "volatility_rank": 0.8955223880597015,
+      "liquidity_rank": 0.3358208955223881,
+      "spread_rank": 0.9253731343283582
+    },
+    "AINUSDT": {
+      "volatility_rank": 0.835820895522388,
+      "liquidity_rank": 0.3805970149253731,
+      "spread_rank": 0.8134328358208955
+    },
+    "AIOTUSDT": {
+      "volatility_rank": 0.5373134328358209,
+      "liquidity_rank": 0.5895522388059702,
+      "spread_rank": 0.7835820895522388
+    },
+    "AIOUSDT": {
+      "volatility_rank": 0.6194029850746269,
+      "liquidity_rank": 0.3208955223880597,
+      "spread_rank": 0.8582089552238806
+    },
+    "AIUSDT": {
+      "volatility_rank": 0.6119402985074627,
+      "liquidity_rank": 0.5298507462686567,
+      "spread_rank": 0.5895522388059702
+    },
+    "AIXBTUSDT": {
+      "volatility_rank": 0.7089552238805971,
+      "liquidity_rank": 0.6492537313432836,
+      "spread_rank": 0.8059701492537313
+    },
+    "AKEUSDT": {
+      "volatility_rank": 0.9776119402985075,
+      "liquidity_rank": 0.44029850746268656,
+      "spread_rank": 0.917910447761194
+    },
+    "AKTUSDT": {
+      "volatility_rank": 0.43283582089552236,
+      "liquidity_rank": 0.1865671641791045,
+      "spread_rank": 0.31343283582089554
+    },
+    "ALCHUSDT": {
+      "volatility_rank": 0.8208955223880597,
+      "liquidity_rank": 0.5074626865671642,
+      "spread_rank": 0.8432835820895522
+    },
+    "ALGOUSDT": {
+      "volatility_rank": 0.1791044776119403,
+      "liquidity_rank": 0.26119402985074625,
+      "spread_rank": 0.23134328358208955
+    },
+    "ALICEUSDT": {
+      "volatility_rank": 0.21641791044776118,
+      "liquidity_rank": 0.11940298507462686,
+      "spread_rank": 0.5746268656716418
+    },
+    "ALLOUSDT": {
+      "volatility_rank": 0.8731343283582089,
+      "liquidity_rank": 0.6567164179104478,
+      "spread_rank": 0.8208955223880597
+    },
+    "ALLUSDT": {
+      "volatility_rank": 0.13432835820895522,
+      "liquidity_rank": 0.21641791044776118,
+      "spread_rank": 0.05223880597014925
+    },
+    "ALPINEUSDT": {
+      "volatility_rank": 0.4701492537313433,
+      "liquidity_rank": 0.12686567164179105,
+      "spread_rank": 0.4626865671641791
+    },
+    "ALTUSDT": {
+      "volatility_rank": 0.5,
+      "liquidity_rank": 0.8283582089552238,
+      "spread_rank": 0.5522388059701493
+    },
+    "AMZNUSDT": {
+      "volatility_rank": 0.007462686567164179,
+      "liquidity_rank": 0.007462686567164179,
+      "spread_rank": 0.007462686567164179
+    },
+    "ANIMEUSDT": {
+      "volatility_rank": 0.6343283582089553,
+      "liquidity_rank": 0.6119402985074627,
+      "spread_rank": 0.6194029850746269
+    },
+    "ANKRUSDT": {
+      "volatility_rank": 0.31343283582089554,
+      "liquidity_rank": 0.26865671641791045,
+      "spread_rank": 0.1865671641791045
+    },
+    "APEUSDT": {
+      "volatility_rank": 0.29850746268656714,
+      "liquidity_rank": 0.7089552238805971,
+      "spread_rank": 0.291044776119403
+    },
+    "API3USDT": {
+      "volatility_rank": 0.19402985074626866,
+      "liquidity_rank": 0.022388059701492536,
+      "spread_rank": 0.3805970149253731
+    },
+    "APRUSDT": {
+      "volatility_rank": 0.9253731343283582,
+      "liquidity_rank": 0.6417910447761194,
+      "spread_rank": 0.8955223880597015
+    },
+    "APTUSDT": {
+      "volatility_rank": 0.4626865671641791,
+      "liquidity_rank": 0.9402985074626866,
+      "spread_rank": 0.30597014925373134
+    },
+    "ARBUSDT": {
+      "volatility_rank": 0.40298507462686567,
+      "liquidity_rank": 0.9477611940298507,
+      "spread_rank": 0.2537313432835821
+    },
+    "ARCUSDT": {
+      "volatility_rank": 0.9328358208955224,
+      "liquidity_rank": 0.6791044776119403,
+      "spread_rank": 0.9402985074626866
+    },
+    "ARIAUSDT": {
+      "volatility_rank": 0.7611940298507462,
+      "liquidity_rank": 0.43283582089552236,
+      "spread_rank": 0.8731343283582089
+    },
+    "ARKMUSDT": {
+      "volatility_rank": 0.22388059701492538,
+      "liquidity_rank": 0.1044776119402985,
+      "spread_rank": 0.5970149253731343
+    },
+    "ARKUSDT": {
+      "volatility_rank": 0.5149253731343284,
+      "liquidity_rank": 0.5671641791044776,
+      "spread_rank": 0.3582089552238806
+    },
+    "ARPAUSDT": {
+      "volatility_rank": 0.08208955223880597,
+      "liquidity_rank": 0.014925373134328358,
+      "spread_rank": 0.29850746268656714
+    },
+    "ARUSDT": {
+      "volatility_rank": 0.27611940298507465,
+      "liquidity_rank": 0.14925373134328357,
+      "spread_rank": 0.4253731343283582
+    },
+    "ASRUSDT": {
+      "volatility_rank": 0.48507462686567165,
+      "liquidity_rank": 0.13432835820895522,
+      "spread_rank": 0.34328358208955223
+    },
+    "ASTERUSDT": {
+      "volatility_rank": 0.8507462686567164,
+      "liquidity_rank": 0.9850746268656716,
+      "spread_rank": 0.7164179104477612
+    },
+    "ASTRUSDT": {
+      "volatility_rank": 0.4552238805970149,
+      "liquidity_rank": 0.31343283582089554,
+      "spread_rank": 0.208955223880597
+    },
+    "ATAUSDT": {
+      "volatility_rank": 0.1865671641791045,
+      "liquidity_rank": 0.03731343283582089,
+      "spread_rank": 0.5074626865671642
+    },
+    "ATHUSDT": {
+      "volatility_rank": 0.3805970149253731,
+      "liquidity_rank": 0.05223880597014925,
+      "spread_rank": 0.4701492537313433
+    },
+    "ATOMUSDT": {
+      "volatility_rank": 0.12686567164179105,
+      "liquidity_rank": 0.4626865671641791,
+      "spread_rank": 0.08955223880597014
+    },
+    "ATUSDT": {
+      "volatility_rank": 0.6044776119402985,
+      "liquidity_rank": 0.30597014925373134,
+      "spread_rank": 0.6567164179104478
+    },
+    "AUCTIONUSDT": {
+      "volatility_rank": 0.6417910447761194,
+      "liquidity_rank": 0.6044776119402985,
+      "spread_rank": 0.4552238805970149
+    },
+    "AUSDT": {
+      "volatility_rank": 0.35074626865671643,
+      "liquidity_rank": 0.23880597014925373,
+      "spread_rank": 0.09701492537313433
+    },
+    "AVAAIUSDT": {
+      "volatility_rank": 0.9701492537313433,
+      "liquidity_rank": 0.3656716417910448,
+      "spread_rank": 0.9029850746268657
+    },
+    "AVAUSDT": {
+      "volatility_rank": 0.6791044776119403,
+      "liquidity_rank": 0.5522388059701493,
+      "spread_rank": 0.3283582089552239
+    },
+    "AVAXUSDT": {
+      "volatility_rank": 0.26865671641791045,
+      "liquidity_rank": 0.8134328358208955,
+      "spread_rank": 0.1791044776119403
+    },
+    "AVNTUSDT": {
+      "volatility_rank": 0.9552238805970149,
+      "liquidity_rank": 0.9552238805970149,
+      "spread_rank": 0.8507462686567164
+    },
+    "AWEUSDT": {
+      "volatility_rank": 0.3358208955223881,
+      "liquidity_rank": 0.05970149253731343,
+      "spread_rank": 0.26865671641791045
+    },
+    "AXLUSDT": {
+      "volatility_rank": 0.3880597014925373,
+      "liquidity_rank": 0.23134328358208955,
+      "spread_rank": 0.43283582089552236
+    },
+    "AXSUSDT": {
+      "volatility_rank": 0.291044776119403,
+      "liquidity_rank": 0.6343283582089553,
+      "spread_rank": 0.23880597014925373
+    },
+    "AZTECUSDT": {
+      "volatility_rank": 0.753731343283582,
+      "liquidity_rank": 0.4552238805970149,
+      "spread_rank": 0.8880597014925373
+    },
+    "B2USDT": {
+      "volatility_rank": 0.23134328358208955,
+      "liquidity_rank": 0.08955223880597014,
+      "spread_rank": 0.6044776119402985
+    },
+    "B3USDT": {
+      "volatility_rank": 0.7014925373134329,
+      "liquidity_rank": 0.29850746268656714,
+      "spread_rank": 0.6343283582089553
+    },
+    "BABYUSDT": {
+      "volatility_rank": 0.8283582089552238,
+      "liquidity_rank": 0.8507462686567164,
+      "spread_rank": 0.5373134328358209
+    },
+    "BANANAS31USDT": {
+      "volatility_rank": 0.6940298507462687,
+      "liquidity_rank": 0.291044776119403,
+      "spread_rank": 0.7388059701492538
+    },
+    "BANANAUSDT": {
+      "volatility_rank": 0.44776119402985076,
+      "liquidity_rank": 0.373134328358209,
+      "spread_rank": 0.4925373134328358
+    },
+    "BANDUSDT": {
+      "volatility_rank": 0.2462686567164179,
+      "liquidity_rank": 0.208955223880597,
+      "spread_rank": 0.2462686567164179
+    },
+    "BANKUSDT": {
+      "volatility_rank": 0.7238805970149254,
+      "liquidity_rank": 0.27611940298507465,
+      "spread_rank": 0.753731343283582
+    },
+    "BANUSDT": {
+      "volatility_rank": 0.8582089552238806,
+      "liquidity_rank": 0.6268656716417911,
+      "spread_rank": 0.7761194029850746
+    },
+    "BARDUSDT": {
+      "volatility_rank": 0.5671641791044776,
+      "liquidity_rank": 0.7761194029850746,
+      "spread_rank": 0.5223880597014925
+    },
+    "BASUSDT": {
+      "volatility_rank": 0.8059701492537313,
+      "liquidity_rank": 0.5223880597014925,
+      "spread_rank": 0.9776119402985075
+    },
+    "BATUSDT": {
+      "volatility_rank": 0.11940298507462686,
+      "liquidity_rank": 0.07462686567164178,
+      "spread_rank": 0.12686567164179105
+    },
+    "BBUSDT": {
+      "volatility_rank": 0.6567164179104478,
+      "liquidity_rank": 0.8582089552238806,
+      "spread_rank": 0.6716417910447762
+    },
+    "BCHUSDT": {
+      "volatility_rank": 0.05223880597014925,
+      "liquidity_rank": 0.48507462686567165,
+      "spread_rank": 0.08208955223880597
+    },
+    "BEAMXUSDT": {
+      "volatility_rank": 0.4253731343283582,
+      "liquidity_rank": 0.20149253731343283,
+      "spread_rank": 0.5298507462686567
+    },
+    "BEATUSDT": {
+      "volatility_rank": 0.9104477611940298,
+      "liquidity_rank": 0.753731343283582,
+      "spread_rank": 0.9850746268656716
+    },
+    "BELUSDT": {
+      "volatility_rank": 0.14925373134328357,
+      "liquidity_rank": 0.029850746268656716,
+      "spread_rank": 0.39552238805970147
+    },
+    "BERAUSDT": {
+      "volatility_rank": 0.6268656716417911,
+      "liquidity_rank": 0.8955223880597015,
+      "spread_rank": 0.6417910447761194
+    },
+    "BICOUSDT": {
+      "volatility_rank": 0.2537313432835821,
+      "liquidity_rank": 0.06716417910447761,
+      "spread_rank": 0.3656716417910448
+    },
+    "BIGTIMEUSDT": {
+      "volatility_rank": 0.7686567164179104,
+      "liquidity_rank": 0.7985074626865671,
+      "spread_rank": 0.6791044776119403
+    },
+    "BIOUSDT": {
+      "volatility_rank": 0.5298507462686567,
+      "liquidity_rank": 0.7164179104477612,
+      "spread_rank": 0.7313432835820896
+    },
+    "BIRBUSDT": {
+      "volatility_rank": 0.7164179104477612,
+      "liquidity_rank": 0.5746268656716418,
+      "spread_rank": 0.7910447761194029
+    },
+    "BLESSUSDT": {
+      "volatility_rank": 0.9850746268656716,
+      "liquidity_rank": 0.7611940298507462,
+      "spread_rank": 0.9626865671641791
+    },
+    "BLUAIUSDT": {
+      "volatility_rank": 0.9402985074626866,
+      "liquidity_rank": 0.4253731343283582,
+      "spread_rank": 0.9104477611940298
+    },
+    "BLURUSDT": {
+      "volatility_rank": 0.34328358208955223,
+      "liquidity_rank": 0.2537313432835821,
+      "spread_rank": 0.373134328358209
+    },
+    "BNBUSDT": {
+      "volatility_rank": 0.04477611940298507,
+      "liquidity_rank": 0.8805970149253731,
+      "spread_rank": 0.03731343283582089
+    },
+    "BRUSDT": {
+      "volatility_rank": 0.664179104477612,
+      "liquidity_rank": 0.17164179104477612,
+      "spread_rank": 0.6268656716417911
+    },
+    "BSBUSDT": {
+      "volatility_rank": 1.0,
+      "liquidity_rank": 0.5373134328358209,
+      "spread_rank": 1.0
+    },
+    "BTCUSDT": {
+      "volatility_rank": 0.022388059701492536,
+      "liquidity_rank": 1.0,
+      "spread_rank": 0.029850746268656716
+    },
+    "BUSDT": {
+      "volatility_rank": 0.5895522388059702,
+      "liquidity_rank": 0.6865671641791045,
+      "spread_rank": 0.664179104477612
+    },
+    "CRCLUSDT": {
+      "volatility_rank": 0.09701492537313433,
+      "liquidity_rank": 0.09701492537313433,
+      "spread_rank": 0.11940298507462686
+    },
+    "CUSDT": {
+      "volatility_rank": 0.8805970149253731,
+      "liquidity_rank": 0.8432835820895522,
+      "spread_rank": 0.7089552238805971
+    },
+    "DOGEUSDT": {
+      "volatility_rank": 0.15671641791044777,
+      "liquidity_rank": 0.9104477611940298,
+      "spread_rank": 0.17164179104477612
+    },
+    "DOTUSDT": {
+      "volatility_rank": 0.07462686567164178,
+      "liquidity_rank": 0.6194029850746269,
+      "spread_rank": 0.1044776119402985
+    },
+    "ENAUSDT": {
+      "volatility_rank": 0.7761194029850746,
+      "liquidity_rank": 0.9701492537313433,
+      "spread_rank": 0.6940298507462687
+    },
+    "ETHUSDT": {
+      "volatility_rank": 0.029850746268656716,
+      "liquidity_rank": 0.9925373134328358,
+      "spread_rank": 0.04477611940298507
+    },
+    "FETUSDT": {
+      "volatility_rank": 0.47761194029850745,
+      "liquidity_rank": 0.39552238805970147,
+      "spread_rank": 0.5671641791044776
+    },
+    "HBARUSDT": {
+      "volatility_rank": 0.417910447761194,
+      "liquidity_rank": 0.7910447761194029,
+      "spread_rank": 0.20149253731343283
+    },
+    "HYPEUSDT": {
+      "volatility_rank": 0.3656716417910448,
+      "liquidity_rank": 0.7388059701492538,
+      "spread_rank": 0.44029850746268656
+    },
+    "LINKUSDT": {
+      "volatility_rank": 0.08955223880597014,
+      "liquidity_rank": 0.7238805970149254,
+      "spread_rank": 0.15671641791044777
+    },
+    "LTCUSDT": {
+      "volatility_rank": 0.3208955223880597,
+      "liquidity_rank": 0.8880597014925373,
+      "spread_rank": 0.06716417910447761
+    },
+    "MUSDT": {
+      "volatility_rank": 0.9477611940298507,
+      "liquidity_rank": 0.8208955223880597,
+      "spread_rank": 0.835820895522388
+    },
+    "NEARUSDT": {
+      "volatility_rank": 0.3582089552238806,
+      "liquidity_rank": 0.5970149253731343,
+      "spread_rank": 0.3208955223880597
+    },
+    "ONTUSDT": {
+      "volatility_rank": 0.11194029850746269,
+      "liquidity_rank": 0.04477611940298507,
+      "spread_rank": 0.19402985074626866
+    },
+    "OPNUSDT": {
+      "volatility_rank": 0.7835820895522388,
+      "liquidity_rank": 0.5,
+      "spread_rank": 0.9477611940298507
+    },
+    "PAXGUSDT": {
+      "volatility_rank": 0.014925373134328358,
+      "liquidity_rank": 0.1417910447761194,
+      "spread_rank": 0.0
+    },
+    "PIPPINUSDT": {
+      "volatility_rank": 0.9029850746268657,
+      "liquidity_rank": 0.35074626865671643,
+      "spread_rank": 0.9701492537313433
+    },
+    "PROVEUSDT": {
+      "volatility_rank": 0.5597014925373134,
+      "liquidity_rank": 0.8656716417910447,
+      "spread_rank": 0.35074626865671643
+    },
+    "RIVERUSDT": {
+      "volatility_rank": 0.917910447761194,
+      "liquidity_rank": 0.5597014925373134,
+      "spread_rank": 0.9925373134328358
+    },
+    "SIRENUSDT": {
+      "volatility_rank": 0.7985074626865671,
+      "liquidity_rank": 0.22388059701492538,
+      "spread_rank": 0.8656716417910447
+    },
+    "SOLUSDT": {
+      "volatility_rank": 0.39552238805970147,
+      "liquidity_rank": 0.9626865671641791,
+      "spread_rank": 0.21641791044776118
+    },
+    "SUIUSDT": {
+      "volatility_rank": 0.373134328358209,
+      "liquidity_rank": 0.8731343283582089,
+      "spread_rank": 0.40298507462686567
+    },
+    "TAOUSDT": {
+      "volatility_rank": 0.4925373134328358,
+      "liquidity_rank": 0.3880597014925373,
+      "spread_rank": 0.582089552238806
+    },
+    "TONUSDT": {
+      "volatility_rank": 0.26119402985074625,
+      "liquidity_rank": 0.44776119402985076,
+      "spread_rank": 0.05970149253731343
+    },
+    "TRXUSDT": {
+      "volatility_rank": 0.03731343283582089,
+      "liquidity_rank": 0.5447761194029851,
+      "spread_rank": 0.014925373134328358
+    },
+    "UNIUSDT": {
+      "volatility_rank": 0.2835820895522388,
+      "liquidity_rank": 0.40298507462686567,
+      "spread_rank": 0.27611940298507465
+    },
+    "XAGUSDT": {
+      "volatility_rank": 0.05970149253731343,
+      "liquidity_rank": 0.41044776119402987,
+      "spread_rank": 0.14925373134328357
+    },
+    "XAUUSDT": {
+      "volatility_rank": 0.0,
+      "liquidity_rank": 0.0,
+      "spread_rank": 0.022388059701492536
+    },
+    "XRPUSDT": {
+      "volatility_rank": 0.06716417910447761,
+      "liquidity_rank": 0.9328358208955224,
+      "spread_rank": 0.07462686567164178
+    },
+    "ZECUSDT": {
+      "volatility_rank": 0.1417910447761194,
+      "liquidity_rank": 0.2462686567164179,
+      "spread_rank": 0.3358208955223881
+    }
+  },
+  "forex": {
+    "AUD_CAD": {
+      "volatility_rank": 0.37037037037037035,
+      "liquidity_rank": 0.0,
+      "spread_rank": 0.37037037037037035
+    },
+    "AUD_CHF": {
+      "volatility_rank": 0.5555555555555556,
+      "liquidity_rank": 0.9259259259259259,
+      "spread_rank": 0.7777777777777778
+    },
+    "AUD_JPY": {
+      "volatility_rank": 0.9259259259259259,
+      "liquidity_rank": 0.8888888888888888,
+      "spread_rank": 1.0
+    },
+    "AUD_NZD": {
+      "volatility_rank": 0.2222222222222222,
+      "liquidity_rank": 0.8518518518518519,
+      "spread_rank": 0.037037037037037035
+    },
+    "AUD_USD": {
+      "volatility_rank": 0.8888888888888888,
+      "liquidity_rank": 0.8148148148148148,
+      "spread_rank": 0.8888888888888888
+    },
+    "CAD_CHF": {
+      "volatility_rank": 0.25925925925925924,
+      "liquidity_rank": 0.7777777777777778,
+      "spread_rank": 0.3333333333333333
+    },
+    "CAD_JPY": {
+      "volatility_rank": 0.8148148148148148,
+      "liquidity_rank": 0.7407407407407407,
+      "spread_rank": 0.8518518518518519
+    },
+    "CHF_JPY": {
+      "volatility_rank": 0.7037037037037037,
+      "liquidity_rank": 0.7037037037037037,
+      "spread_rank": 0.6296296296296297
+    },
+    "EUR_AUD": {
+      "volatility_rank": 0.4074074074074074,
+      "liquidity_rank": 0.6666666666666666,
+      "spread_rank": 0.5925925925925926
+    },
+    "EUR_CAD": {
+      "volatility_rank": 0.1111111111111111,
+      "liquidity_rank": 0.6296296296296297,
+      "spread_rank": 0.14814814814814814
+    },
+    "EUR_CHF": {
+      "volatility_rank": 0.0,
+      "liquidity_rank": 0.5925925925925926,
+      "spread_rank": 0.1111111111111111
+    },
+    "EUR_GBP": {
+      "volatility_rank": 0.037037037037037035,
+      "liquidity_rank": 0.5555555555555556,
+      "spread_rank": 0.0
+    },
+    "EUR_JPY": {
+      "volatility_rank": 0.5185185185185185,
+      "liquidity_rank": 0.5185185185185185,
+      "spread_rank": 0.6666666666666666
+    },
+    "EUR_NZD": {
+      "volatility_rank": 0.6296296296296297,
+      "liquidity_rank": 0.48148148148148145,
+      "spread_rank": 0.5185185185185185
+    },
+    "EUR_USD": {
+      "volatility_rank": 0.14814814814814814,
+      "liquidity_rank": 0.4444444444444444,
+      "spread_rank": 0.2222222222222222
+    },
+    "GBP_AUD": {
+      "volatility_rank": 0.4444444444444444,
+      "liquidity_rank": 0.4074074074074074,
+      "spread_rank": 0.4444444444444444
+    },
+    "GBP_CAD": {
+      "volatility_rank": 0.18518518518518517,
+      "liquidity_rank": 0.37037037037037035,
+      "spread_rank": 0.18518518518518517
+    },
+    "GBP_CHF": {
+      "volatility_rank": 0.2962962962962963,
+      "liquidity_rank": 0.3333333333333333,
+      "spread_rank": 0.25925925925925924
+    },
+    "GBP_JPY": {
+      "volatility_rank": 0.7407407407407407,
+      "liquidity_rank": 0.2962962962962963,
+      "spread_rank": 0.8148148148148148
+    },
+    "GBP_NZD": {
+      "volatility_rank": 0.5925925925925926,
+      "liquidity_rank": 0.25925925925925924,
+      "spread_rank": 0.48148148148148145
+    },
+    "GBP_USD": {
+      "volatility_rank": 0.48148148148148145,
+      "liquidity_rank": 0.2222222222222222,
+      "spread_rank": 0.2962962962962963
+    },
+    "NZD_CAD": {
+      "volatility_rank": 0.6666666666666666,
+      "liquidity_rank": 0.18518518518518517,
+      "spread_rank": 0.5555555555555556
+    },
+    "NZD_CHF": {
+      "volatility_rank": 0.7777777777777778,
+      "liquidity_rank": 0.14814814814814814,
+      "spread_rank": 0.7037037037037037
+    },
+    "NZD_JPY": {
+      "volatility_rank": 0.9629629629629629,
+      "liquidity_rank": 0.1111111111111111,
+      "spread_rank": 0.9629629629629629
+    },
+    "NZD_USD": {
+      "volatility_rank": 1.0,
+      "liquidity_rank": 0.07407407407407407,
+      "spread_rank": 0.9259259259259259
+    },
+    "USD_CAD": {
+      "volatility_rank": 0.07407407407407407,
+      "liquidity_rank": 0.037037037037037035,
+      "spread_rank": 0.07407407407407407
+    },
+    "USD_CHF": {
+      "volatility_rank": 0.3333333333333333,
+      "liquidity_rank": 0.9629629629629629,
+      "spread_rank": 0.4074074074074074
+    },
+    "USD_JPY": {
+      "volatility_rank": 0.8518518518518519,
+      "liquidity_rank": 1.0,
+      "spread_rank": 0.7407407407407407
+    }
+  },
+  "stocks": {
+    "AAPL": {
+      "volatility_rank": 0.7551020408163265,
+      "liquidity_rank": 0.9387755102040817,
+      "spread_rank": 0.7959183673469388
+    },
+    "ABBV": {
+      "volatility_rank": 0.24489795918367346,
+      "liquidity_rank": 0.3673469387755102,
+      "spread_rank": 0.3877551020408163
+    },
+    "ABT": {
+      "volatility_rank": 0.22448979591836735,
+      "liquidity_rank": 0.04081632653061224,
+      "spread_rank": 0.30612244897959184
+    },
+    "ACN": {
+      "volatility_rank": 0.42857142857142855,
+      "liquidity_rank": 0.40816326530612246,
+      "spread_rank": 0.32653061224489793
+    },
+    "ADBE": {
+      "volatility_rank": 0.673469387755102,
+      "liquidity_rank": 0.7346938775510204,
+      "spread_rank": 0.5306122448979592
+    },
+    "AMD": {
+      "volatility_rank": 0.9795918367346939,
+      "liquidity_rank": 0.8163265306122449,
+      "spread_rank": 0.9795918367346939
+    },
+    "AMGN": {
+      "volatility_rank": 0.1836734693877551,
+      "liquidity_rank": 0.20408163265306123,
+      "spread_rank": 0.14285714285714285
+    },
+    "AMZN": {
+      "volatility_rank": 0.9387755102040817,
+      "liquidity_rank": 0.9183673469387755,
+      "spread_rank": 0.8979591836734694
+    },
+    "AVGO": {
+      "volatility_rank": 0.4489795918367347,
+      "liquidity_rank": 0.7755102040816326,
+      "spread_rank": 0.9183673469387755
+    },
+    "BAC": {
+      "volatility_rank": 0.7959183673469388,
+      "liquidity_rank": 0.6530612244897959,
+      "spread_rank": 0.7551020408163265
+    },
+    "BRK_B": {
+      "volatility_rank": 0.16326530612244897,
+      "liquidity_rank": 0.4897959183673469,
+      "spread_rank": 0.0
+    },
+    "CMCSA": {
+      "volatility_rank": 0.6326530612244898,
+      "liquidity_rank": 0.1836734693877551,
+      "spread_rank": 0.7142857142857143
+    },
+    "COST": {
+      "volatility_rank": 0.20408163265306123,
+      "liquidity_rank": 0.5306122448979592,
+      "spread_rank": 0.02040816326530612
+    },
+    "CRM": {
+      "volatility_rank": 0.8163265306122449,
+      "liquidity_rank": 0.7959183673469388,
+      "spread_rank": 0.7755102040816326
+    },
+    "CSCO": {
+      "volatility_rank": 0.3877551020408163,
+      "liquidity_rank": 0.16326530612244897,
+      "spread_rank": 0.4897959183673469
+    },
+    "CVX": {
+      "volatility_rank": 0.6122448979591837,
+      "liquidity_rank": 0.7142857142857143,
+      "spread_rank": 0.40816326530612246
+    },
+    "DHR": {
+      "volatility_rank": 0.5306122448979592,
+      "liquidity_rank": 0.5510204081632653,
+      "spread_rank": 0.42857142857142855
+    },
+    "DIS": {
+      "volatility_rank": 0.6530612244897959,
+      "liquidity_rank": 0.14285714285714285,
+      "spread_rank": 0.5918367346938775
+    },
+    "GE": {
+      "volatility_rank": 0.7142857142857143,
+      "liquidity_rank": 0.24489795918367346,
+      "spread_rank": 0.6530612244897959
+    },
+    "GOOGL": {
+      "volatility_rank": 0.8571428571428571,
+      "liquidity_rank": 0.8775510204081632,
+      "spread_rank": 0.8367346938775511
+    },
+    "HD": {
+      "volatility_rank": 0.5102040816326531,
+      "liquidity_rank": 0.6938775510204082,
+      "spread_rank": 0.22448979591836735
+    },
+    "IBM": {
+      "volatility_rank": 0.12244897959183673,
+      "liquidity_rank": 0.02040816326530612,
+      "spread_rank": 0.2857142857142857
+    },
+    "INTC": {
+      "volatility_rank": 0.8979591836734694,
+      "liquidity_rank": 0.46938775510204084,
+      "spread_rank": 0.9591836734693877
+    },
+    "INTU": {
+      "volatility_rank": 0.7755102040816326,
+      "liquidity_rank": 0.5102040816326531,
+      "spread_rank": 0.3469387755102041
+    },
+    "JNJ": {
+      "volatility_rank": 0.04081632653061224,
+      "liquidity_rank": 0.42857142857142855,
+      "spread_rank": 0.1836734693877551
+    },
+    "JPM": {
+      "volatility_rank": 0.5510204081632653,
+      "liquidity_rank": 0.5918367346938775,
+      "spread_rank": 0.4489795918367347
+    },
+    "KO": {
+      "volatility_rank": 0.061224489795918366,
+      "liquidity_rank": 0.061224489795918366,
+      "spread_rank": 0.20408163265306123
+    },
+    "LIN": {
+      "volatility_rank": 0.30612244897959184,
+      "liquidity_rank": 0.6122448979591837,
+      "spread_rank": 0.04081632653061224
+    },
+    "LLY": {
+      "volatility_rank": 0.4897959183673469,
+      "liquidity_rank": 0.673469387755102,
+      "spread_rank": 0.5102040816326531
+    },
+    "MA": {
+      "volatility_rank": 0.32653061224489793,
+      "liquidity_rank": 0.7551020408163265,
+      "spread_rank": 0.08163265306122448
+    },
+    "MCD": {
+      "volatility_rank": 0.0,
+      "liquidity_rank": 0.2653061224489796,
+      "spread_rank": 0.061224489795918366
+    },
+    "META": {
+      "volatility_rank": 0.9183673469387755,
+      "liquidity_rank": 0.8979591836734694,
+      "spread_rank": 0.8775510204081632
+    },
+    "MRK": {
+      "volatility_rank": 0.2653061224489796,
+      "liquidity_rank": 0.32653061224489793,
+      "spread_rank": 0.5714285714285714
+    },
+    "MSFT": {
+      "volatility_rank": 0.7346938775510204,
+      "liquidity_rank": 0.9795918367346939,
+      "spread_rank": 0.6326530612244898
+    },
+    "NEE": {
+      "volatility_rank": 0.5714285714285714,
+      "liquidity_rank": 0.10204081632653061,
+      "spread_rank": 0.7346938775510204
+    },
+    "NFLX": {
+      "volatility_rank": 0.8775510204081632,
+      "liquidity_rank": 0.8367346938775511,
+      "spread_rank": 0.6938775510204082
+    },
+    "NVDA": {
+      "volatility_rank": 0.9591836734693877,
+      "liquidity_rank": 0.9591836734693877,
+      "spread_rank": 0.9387755102040817
+    },
+    "ORCL": {
+      "volatility_rank": 0.3673469387755102,
+      "liquidity_rank": 0.08163265306122448,
+      "spread_rank": 0.8571428571428571
+    },
+    "PEP": {
+      "volatility_rank": 0.02040816326530612,
+      "liquidity_rank": 0.22448979591836735,
+      "spread_rank": 0.12244897959183673
+    },
+    "PG": {
+      "volatility_rank": 0.08163265306122448,
+      "liquidity_rank": 0.2857142857142857,
+      "spread_rank": 0.10204081632653061
+    },
+    "PM": {
+      "volatility_rank": 0.10204081632653061,
+      "liquidity_rank": 0.0,
+      "spread_rank": 0.16326530612244897
+    },
+    "QCOM": {
+      "volatility_rank": 0.8367346938775511,
+      "liquidity_rank": 0.30612244897959184,
+      "spread_rank": 0.8163265306122449
+    },
+    "TMO": {
+      "volatility_rank": 0.3469387755102041,
+      "liquidity_rank": 0.5714285714285714,
+      "spread_rank": 0.24489795918367346
+    },
+    "TSLA": {
+      "volatility_rank": 1.0,
+      "liquidity_rank": 1.0,
+      "spread_rank": 1.0
+    },
+    "TXN": {
+      "volatility_rank": 0.5918367346938775,
+      "liquidity_rank": 0.3877551020408163,
+      "spread_rank": 0.6122448979591837
+    },
+    "UNH": {
+      "volatility_rank": 0.40816326530612246,
+      "liquidity_rank": 0.8571428571428571,
+      "spread_rank": 0.5510204081632653
+    },
+    "VZ": {
+      "volatility_rank": 0.46938775510204084,
+      "liquidity_rank": 0.12244897959183673,
+      "spread_rank": 0.46938775510204084
+    },
+    "V": {
+      "volatility_rank": 0.2857142857142857,
+      "liquidity_rank": 0.6326530612244898,
+      "spread_rank": 0.2653061224489796
+    },
+    "WMT": {
+      "volatility_rank": 0.14285714285714285,
+      "liquidity_rank": 0.3469387755102041,
+      "spread_rank": 0.3673469387755102
+    },
+    "XOM": {
+      "volatility_rank": 0.6938775510204082,
+      "liquidity_rank": 0.4489795918367347,
+      "spread_rank": 0.673469387755102
+    }
+  },
+  "commodities": {
+    "BCO_USD": {
+      "volatility_rank": 0.6666666666666666,
+      "liquidity_rank": 0.0,
+      "spread_rank": 0.3333333333333333
+    },
+    "WTICO_USD": {
+      "volatility_rank": 1.0,
+      "liquidity_rank": 0.3333333333333333,
+      "spread_rank": 0.6666666666666666
+    },
+    "XAG_USD": {
+      "volatility_rank": 0.3333333333333333,
+      "liquidity_rank": 0.6666666666666666,
+      "spread_rank": 1.0
+    },
+    "XAU_USD": {
+      "volatility_rank": 0.0,
+      "liquidity_rank": 1.0,
+      "spread_rank": 0.0
+    }
+  }
+}
