@@ -5291,6 +5291,7 @@ class LiveMultiBotRunner:
                                 fallback_label,
                                 exit_price,
                             )
+                            trade["_exit_reason_override"] = "ghost_exit"
                             await _record_close(bot, trade, exit_price)
                             continue
 
