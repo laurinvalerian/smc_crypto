@@ -7,7 +7,6 @@ Usage:
     from exchanges import BinanceAdapter, OandaAdapter, AlpacaAdapter
 """
 from exchanges.base import ExchangeAdapter
-from exchanges.binance_adapter import BinanceAdapter
 from exchanges.models import (
     BalanceInfo,
     InstrumentMeta,
@@ -15,7 +14,16 @@ from exchanges.models import (
     PositionInfo,
 )
 
-# Lazy imports for optional adapters (avoid ImportError if v20/alpaca-py not installed)
+# Lazy imports for adapters (avoid ImportError if ccxt/v20/alpaca-py not installed)
+try:
+    from exchanges.binance_adapter import BinanceAdapter
+except ImportError:
+    BinanceAdapter = None  # type: ignore[assignment,misc]
+
+
+def _get_binance_adapter():
+    from exchanges.binance_adapter import BinanceAdapter
+    return BinanceAdapter
 
 
 def _get_oanda_adapter():
@@ -30,7 +38,6 @@ def _get_alpaca_adapter():
 
 __all__ = [
     "ExchangeAdapter",
-    "BinanceAdapter",
     "InstrumentMeta",
     "OrderResult",
     "PositionInfo",

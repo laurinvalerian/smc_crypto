@@ -217,7 +217,7 @@ rl_brain:
   enabled: true              # Master switch for all RL models
   entry_filter:
     enabled: true            # Filter entries by predicted win probability
-    confidence_threshold: 0.6
+    confidence_threshold: 0.55     # Backtest C optimal (was 0.6)
     model_path: "models/rl_entry_filter.pkl"
   position_sizer:
     enabled: false           # Disabled: always outputs mult=0.33, tier risk allocation is better
@@ -232,7 +232,7 @@ rl_brain:
     max_tp_extension: 0.5    # Max 50% TP extension from planned
     min_tp_rr: 0.5           # Never set TP below 0.5R
   be_manager:
-    enabled: true             # Enabled for paper trading (DD -29%, PF +30% in backtest)
+    enabled: false            # Disabled: BE analysis shows negligible impact at 83% WR (was true)
     model_path: "models/rl_be_manager.pkl"
     min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
     fee_buffer: true         # Add fee buffer when moving to BE
