@@ -2398,8 +2398,8 @@ function updateActiveTrades(trades){
           // Parse Swiss time string "YYYY-MM-DD HH:MM:SS" to find nearest candle
           var parts = trade.entry_time.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
           if(parts){
-            var entryDate = new Date(parts[1],parts[2]-1,parts[3],parts[4],parts[5],parts[6]);
-            var entryUnix = Math.floor(entryDate.getTime()/1000);
+            // Treat Swiss time as-if-UTC to match the shifted candle timestamps
+            var entryUnix = Math.floor(Date.UTC(parts[1],parts[2]-1,parts[3],parts[4],parts[5],parts[6])/1000);
             // Find nearest candle to entry time
             var nearestIdx = 0;
             var minDiff = Math.abs(candles[0].time - entryUnix);
