@@ -1210,6 +1210,12 @@ def api_candles(symbol: str):
             with open(live_candle_path) as f:
                 candles = _json.load(f)
             if candles:
+                # Shift timestamps to Swiss time for display
+                _now_swiss = datetime.now(SWISS_TZ)
+                _offset_s = int(_now_swiss.utcoffset().total_seconds())
+                for c in candles:
+                    if "time" in c:
+                        c["time"] = c["time"] + _offset_s
                 return jsonify(candles[-limit:])
         except Exception:
             pass
@@ -1237,9 +1243,12 @@ def api_candles(symbol: str):
             if ts is None:
                 continue
             if hasattr(ts, "timestamp"):
-                unix_ts = int(ts.timestamp())
+                utc_dt = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+                swiss_dt = utc_dt.astimezone(SWISS_TZ)
+                unix_ts = int(utc_dt.timestamp()) + swiss_dt.utcoffset().total_seconds()
             else:
-                unix_ts = int(ts)
+                unix_ts = int(ts) + 7200  # fallback: assume CEST +2h
+            unix_ts = int(unix_ts)
             candles_list.append({
                 "time": unix_ts,
                 "open": float(row.get("open", 0)),
@@ -1768,17 +1777,6 @@ function updateEquity(data){
   var eqVals = data.map(function(p){ return p.equity; });
   var pnlVals = data.map(function(p){ return p.pnl; });
 
-  // Entry marker styles: triangle up=long, down=short; green=win, red=loss
-  var pointStyles = data.map(function(p){
-    if(!p.direction) return 'circle';
-    return p.direction === 'long' ? 'triangle' : 'rectRot';
-  });
-  var pointRadii = data.map(function(p){ return p.symbol ? 6 : 3; });
-  var eqPointColors = data.map(function(p){
-    if(!p.outcome) return '#58a6ff';
-    return p.outcome === 'win' ? '#3fb950' : '#f85149';
-  });
-
   // Tight equity Y-axis
   var eqMin = Math.min.apply(null, eqVals);
   var eqMax = Math.max.apply(null, eqVals);
@@ -1792,26 +1790,10 @@ function updateEquity(data){
   var pnlSegmentColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
   var pnlPointColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
 
-  // ── Tooltip with entry info ──
-  var entryTooltip = {
-    callbacks:{
-      afterLabel:function(ctx){
-        var p = data[ctx.dataIndex];
-        if(!p || !p.symbol) return '';
-        var dir = (p.direction||'').toUpperCase();
-        var arrow = p.direction==='long' ? '\u25B2' : '\u25BC';
-        return arrow+' '+dir+' '+p.symbol+' | Entry: '+(p.entry_time||'--').substring(5,16);
-      }
-    }
-  };
-
   // ── Equity Chart ──
   if(eqChart){
     eqChart.data.labels = labels;
     eqChart.data.datasets[0].data = eqVals;
-    eqChart.data.datasets[0].pointStyle = pointStyles;
-    eqChart.data.datasets[0].pointRadius = pointRadii;
-    eqChart.data.datasets[0].pointBackgroundColor = eqPointColors;
     eqChart.options.scales.y.suggestedMin = eqMin - eqPad;
     eqChart.options.scales.y.suggestedMax = eqMax + eqPad;
     eqChart.update('none');
@@ -1821,12 +1803,11 @@ function updateEquity(data){
       data:{labels:labels, datasets:[{
         label:'Portfolio Equity', data:eqVals,
         borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.08)',
-        fill:true, tension:0.3, pointRadius:pointRadii, pointStyle:pointStyles,
-        pointBackgroundColor:eqPointColors, pointBorderColor:eqPointColors, borderWidth:2
+        fill:true, tension:0.3, pointRadius:3, pointBackgroundColor:'#58a6ff', borderWidth:2
       }]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}},tooltip:entryTooltip},
+        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
           y:{suggestedMin:eqMin-eqPad,suggestedMax:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},maxTicksLimit:6,callback:function(v){return '$'+Math.round(v).toLocaleString()}},grid:{color:'#21262d'}}
@@ -1839,8 +1820,6 @@ function updateEquity(data){
   if(pnlChart){
     pnlChart.data.labels = labels;
     pnlChart.data.datasets[0].data = pnlVals;
-    pnlChart.data.datasets[0].pointStyle = pointStyles;
-    pnlChart.data.datasets[0].pointRadius = pointRadii.map(function(r){return r+1;});
     pnlChart.data.datasets[1].data = pnlVals;
     pnlChart.update('none');
   } else {
@@ -1851,8 +1830,7 @@ function updateEquity(data){
          borderColor:'#3fb950', backgroundColor:'rgba(63,185,80,0.12)',
          fill:{target:'origin',above:'rgba(63,185,80,0.12)',below:'transparent'},
          segment:{borderColor:function(ctx){return ctx.p0.parsed.y>=0&&ctx.p1.parsed.y>=0?'#3fb950':'#f85149'}},
-         tension:0.3, pointRadius:pointRadii.map(function(r){return r+1;}), pointBorderWidth:2,
-         pointStyle:pointStyles,
+         tension:0.3, pointRadius:5, pointBorderWidth:2,
          pointBackgroundColor:pnlPointColors, pointBorderColor:pnlPointColors, borderWidth:2},
         {label:'_neg', data:pnlVals,
          borderColor:'transparent', backgroundColor:'rgba(248,81,73,0.12)',
@@ -1861,7 +1839,7 @@ function updateEquity(data){
       ]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}},tooltip:entryTooltip},
+        plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}}},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
           y:{ticks:{color:function(ctx){return ctx.tick.value>=0?'#3fb950':'#f85149'},font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
@@ -2413,6 +2391,35 @@ function updateActiveTrades(trades){
             price: trade.tp, color: '#3fb950',
             lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP'
           });
+        }
+
+        // Entry time vertical marker on candle chart
+        if(trade.entry_time && candles.length > 0){
+          // Parse Swiss time string "YYYY-MM-DD HH:MM:SS" to find nearest candle
+          var parts = trade.entry_time.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+          if(parts){
+            var entryDate = new Date(parts[1],parts[2]-1,parts[3],parts[4],parts[5],parts[6]);
+            var entryUnix = Math.floor(entryDate.getTime()/1000);
+            // Find nearest candle to entry time
+            var nearestIdx = 0;
+            var minDiff = Math.abs(candles[0].time - entryUnix);
+            for(var ci=1; ci<candles.length; ci++){
+              var diff = Math.abs(candles[ci].time - entryUnix);
+              if(diff < minDiff){ minDiff = diff; nearestIdx = ci; }
+            }
+            // Add marker at entry candle
+            var dir = (trade.direction||'').toLowerCase();
+            var markerColor = dir === 'long' ? '#58a6ff' : '#da6dff';
+            var markerShape = dir === 'long' ? 'arrowUp' : 'arrowDown';
+            var markerPos = dir === 'long' ? 'belowBar' : 'aboveBar';
+            series.setMarkers([{
+              time: candles[nearestIdx].time,
+              position: markerPos,
+              color: markerColor,
+              shape: markerShape,
+              text: 'ENTRY ' + (dir==='long'?'\u25B2':'\u25BC'),
+            }]);
+          }
         }
         chart.timeScale().fitContent();
       });
