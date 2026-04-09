@@ -411,12 +411,11 @@ def _get_rl_stats() -> dict:
         if (MODEL_DIR / "dqn_exit_manager.zip").exists():
             stats["models_loaded"].append("dqn_exit_manager.zip")
 
-    # Parse BOTH log files for XGB ACCEPT/REJECT, TP adjusted, BE TRIGGERED
-    for log_path in (LOG_PATH, LIVE_LOG_PATH):
-        if not log_path.exists():
-            continue
+    # Parse primary log for XGB ACCEPT/REJECT, TP adjusted, BE TRIGGERED
+    # (live_multi.log mirrors the same events — reading both would double-count)
+    if LOG_PATH.exists():
         try:
-            with open(log_path) as f:
+            with open(LOG_PATH) as f:
                 for line in f:
                     if "XGB ACCEPT" in line:
                         stats["entry_filter"]["accepted"] += 1
