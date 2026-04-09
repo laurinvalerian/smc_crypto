@@ -1220,13 +1220,19 @@ def api_candles(symbol: str):
                 for c in candles:
                     if "time" in c:
                         c["time"] = c["time"] + _offset_s
-                # Aggregate to higher TF if needed
+                # Aggregate to higher TF using time-aligned boundaries
                 if agg_n > 1:
+                    interval_s = agg_n * 300  # 15m=900, 1h=3600, 4h=14400
+                    buckets: dict[int, list] = {}
+                    for c in candles:
+                        t = c.get("time", 0)
+                        bucket = t - (t % interval_s)
+                        buckets.setdefault(bucket, []).append(c)
                     agg = []
-                    for i in range(0, len(candles) - agg_n + 1, agg_n):
-                        chunk = candles[i:i + agg_n]
+                    for bk in sorted(buckets):
+                        chunk = buckets[bk]
                         agg.append({
-                            "time": chunk[0]["time"],
+                            "time": bk,
                             "open": chunk[0]["open"],
                             "high": max(c["high"] for c in chunk),
                             "low": min(c["low"] for c in chunk),
