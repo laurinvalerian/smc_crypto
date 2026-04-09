@@ -2360,7 +2360,7 @@ function updateActiveTrades(trades){
       _atSeries[symId] = series;
 
       // Fetch candles — sanitize URL to match bot export (replace / and : with _)
-      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_').replace(/:/g, '_') + '?tf=5m&limit=100';
+      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_').replace(/:/g, '_') + '?tf=15m&limit=100';
       fetchJ(candleUrl, function(candles){
         if(!candles || !candles.length){
           console.warn('No candle data for ' + sym);
