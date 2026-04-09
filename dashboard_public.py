@@ -23,6 +23,9 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+SWISS_TZ = ZoneInfo("Europe/Zurich")
 
 from flask import Flask, jsonify, render_template_string, request
 
@@ -43,6 +46,21 @@ try:
     }
 except Exception:
     DISPLAY_MULTIPLIERS = {}
+
+
+def _to_swiss(dt_or_str) -> str:
+    """Convert a UTC datetime or ISO string to Swiss time string (YYYY-MM-DD HH:MM:SS)."""
+    if isinstance(dt_or_str, str):
+        if not dt_or_str:
+            return ""
+        try:
+            dt_or_str = datetime.fromisoformat(dt_or_str)
+        except Exception:
+            return dt_or_str  # return as-is if unparseable
+    if dt_or_str.tzinfo is None:
+        dt_or_str = dt_or_str.replace(tzinfo=timezone.utc)
+    return dt_or_str.astimezone(SWISS_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _apply_display_mult(ac: str, value: float) -> float:
     """Multiply value by display multiplier for the asset class (if configured)."""
@@ -172,7 +190,15 @@ def _read_log_tail(n: int = 50) -> list[str]:
                 f.seek(0)
                 data = f.read().decode("utf-8", errors="replace")
         lines = data.strip().split("\n")
-        return lines[-n:]
+        # Convert UTC timestamps in log lines to Swiss time for display
+        _ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+        converted = []
+        for line in lines[-n:]:
+            m = _ts_re.match(line)
+            if m:
+                line = _to_swiss(m.group(1)) + line[len(m.group(1)):]
+            converted.append(line)
+        return converted
     except Exception:
         return []
 
@@ -204,7 +230,7 @@ def _get_near_misses(n: int = 50) -> list[dict]:
                     score_val = float(m.group(4))
                     thresh_val = float(m.group(5))
                     hits.append({
-                        "time": m.group(1),
+                        "time": _to_swiss(m.group(1)),
                         "symbol": m.group(2),
                         "type": "ALIGNMENT",
                         "score": round(score_val, 3),
@@ -220,7 +246,7 @@ def _get_near_misses(n: int = 50) -> list[dict]:
                     conf_val = float(m.group(3))
                     thresh_val = float(m.group(5))
                     hits.append({
-                        "time": m.group(1),
+                        "time": _to_swiss(m.group(1)),
                         "symbol": m.group(2),
                         "type": "XGB",
                         "score": round(conf_val, 3),
@@ -235,7 +261,7 @@ def _get_near_misses(n: int = 50) -> list[dict]:
                 m = _PAT_NEUTRAL.search(line)
                 if m:
                     hits.append({
-                        "time": m.group(1),
+                        "time": _to_swiss(m.group(1)),
                         "symbol": m.group(2),
                         "type": "NEUTRAL_BIAS",
                         "score": 0.0,
@@ -249,7 +275,7 @@ def _get_near_misses(n: int = 50) -> list[dict]:
                 # Fallback for unrecognized near-miss formats
                 ts_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
                 hits.append({
-                    "time": ts_match.group(1) if ts_match else "",
+                    "time": _to_swiss(ts_match.group(1)) if ts_match else "",
                     "symbol": "",
                     "type": "OTHER",
                     "score": 0.0,
@@ -448,8 +474,8 @@ def _get_equity_curve() -> list[dict]:
         return [{"timestamp": "", "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
 
     rows = _query_journal(
-        "SELECT exit_time, pnl_pct, asset_class FROM trades "
-        "WHERE exit_time IS NOT NULL ORDER BY exit_time ASC"
+        "SELECT entry_time, exit_time, pnl_pct, asset_class, symbol, direction, outcome "
+        "FROM trades WHERE exit_time IS NOT NULL ORDER BY exit_time ASC"
     )
 
     if not rows:
@@ -457,15 +483,19 @@ def _get_equity_curve() -> list[dict]:
 
     # Each trade's $ PnL = pnl_pct × 100K (all accounts normalized to 100K display)
     cumulative_pnl = 0.0
-    points = [{"timestamp": rows[0].get("exit_time", "")[:16], "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
+    points = [{"timestamp": _to_swiss(rows[0].get("exit_time", ""))[:16], "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
 
     for r in rows:
         pnl_dollar = (r.get("pnl_pct") or 0.0) * 100_000.0
         cumulative_pnl += pnl_dollar
         points.append({
-            "timestamp": (r.get("exit_time") or "")[:16],
+            "timestamp": _to_swiss(r.get("exit_time") or "")[:16],
+            "entry_time": _to_swiss(r.get("entry_time") or "")[:16],
             "equity": round(_INITIAL_PORTFOLIO + cumulative_pnl, 2),
             "pnl": round(cumulative_pnl, 2),
+            "symbol": r.get("symbol", ""),
+            "direction": r.get("direction", ""),
+            "outcome": r.get("outcome", ""),
         })
 
     return points[-500:]
@@ -658,7 +688,7 @@ def api_status():
         "pid": pid,
         "uptime": _get_bot_uptime(),
         "session": _current_session(),
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "timestamp": datetime.now(SWISS_TZ).strftime("%Y-%m-%d %H:%M:%S CET"),
     })
 
 
@@ -997,9 +1027,9 @@ def api_connections():
     }
     next_open = {
         "crypto": None,
-        "forex": "Sun 22:00 UTC" if not market_open["forex"] else None,
-        "stocks": "Mon-Fri 13:30 UTC" if not market_open["stocks"] else None,
-        "commodities": "Sun 23:00 UTC" if not market_open["commodities"] else None,
+        "forex": "So 00:00 CET" if not market_open["forex"] else None,
+        "stocks": "Mo-Fr 15:30 CET" if not market_open["stocks"] else None,
+        "commodities": "So 01:00 CET" if not market_open["commodities"] else None,
     }
 
     # Override with heartbeat.json (real candle timestamps, written by bot on each candle)
@@ -1148,7 +1178,7 @@ def api_active_trades():
                 "entry_price": float(entry_p),
                 "sl": float(trade.get("sl", 0.0)),
                 "tp": float(trade.get("tp", 0.0)),
-                "entry_time": entry_time_str,
+                "entry_time": _to_swiss(entry_time_str),
                 "style": trade.get("style", ""),
                 "confidence": float(trade.get("rl_confidence") or trade.get("confidence") or 0.0),
                 "asset_class": ac,
@@ -1304,7 +1334,10 @@ def api_trade_history():
     for row in rows:
         entry: dict = {}
         for col in desired:
-            entry[col] = row.get(col)
+            val = row.get(col)
+            if col in ("exit_time", "entry_time") and val:
+                val = _to_swiss(val)
+            entry[col] = val
         result.append(entry)
     return jsonify(result)
 
@@ -1735,6 +1768,17 @@ function updateEquity(data){
   var eqVals = data.map(function(p){ return p.equity; });
   var pnlVals = data.map(function(p){ return p.pnl; });
 
+  // Entry marker styles: triangle up=long, down=short; green=win, red=loss
+  var pointStyles = data.map(function(p){
+    if(!p.direction) return 'circle';
+    return p.direction === 'long' ? 'triangle' : 'rectRot';
+  });
+  var pointRadii = data.map(function(p){ return p.symbol ? 6 : 3; });
+  var eqPointColors = data.map(function(p){
+    if(!p.outcome) return '#58a6ff';
+    return p.outcome === 'win' ? '#3fb950' : '#f85149';
+  });
+
   // Tight equity Y-axis
   var eqMin = Math.min.apply(null, eqVals);
   var eqMax = Math.max.apply(null, eqVals);
@@ -1748,10 +1792,26 @@ function updateEquity(data){
   var pnlSegmentColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
   var pnlPointColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
 
+  // ── Tooltip with entry info ──
+  var entryTooltip = {
+    callbacks:{
+      afterLabel:function(ctx){
+        var p = data[ctx.dataIndex];
+        if(!p || !p.symbol) return '';
+        var dir = (p.direction||'').toUpperCase();
+        var arrow = p.direction==='long' ? '\u25B2' : '\u25BC';
+        return arrow+' '+dir+' '+p.symbol+' | Entry: '+(p.entry_time||'--').substring(5,16);
+      }
+    }
+  };
+
   // ── Equity Chart ──
   if(eqChart){
     eqChart.data.labels = labels;
     eqChart.data.datasets[0].data = eqVals;
+    eqChart.data.datasets[0].pointStyle = pointStyles;
+    eqChart.data.datasets[0].pointRadius = pointRadii;
+    eqChart.data.datasets[0].pointBackgroundColor = eqPointColors;
     eqChart.options.scales.y.suggestedMin = eqMin - eqPad;
     eqChart.options.scales.y.suggestedMax = eqMax + eqPad;
     eqChart.update('none');
@@ -1761,11 +1821,12 @@ function updateEquity(data){
       data:{labels:labels, datasets:[{
         label:'Portfolio Equity', data:eqVals,
         borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,0.08)',
-        fill:true, tension:0.3, pointRadius:3, pointBackgroundColor:'#58a6ff', borderWidth:2
+        fill:true, tension:0.3, pointRadius:pointRadii, pointStyle:pointStyles,
+        pointBackgroundColor:eqPointColors, pointBorderColor:eqPointColors, borderWidth:2
       }]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}}},
+        plugins:{legend:{labels:{color:'#8b949e',font:{size:11}}},tooltip:entryTooltip},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
           y:{suggestedMin:eqMin-eqPad,suggestedMax:eqMax+eqPad,ticks:{color:'#58a6ff',font:{size:10},maxTicksLimit:6,callback:function(v){return '$'+Math.round(v).toLocaleString()}},grid:{color:'#21262d'}}
@@ -1778,6 +1839,8 @@ function updateEquity(data){
   if(pnlChart){
     pnlChart.data.labels = labels;
     pnlChart.data.datasets[0].data = pnlVals;
+    pnlChart.data.datasets[0].pointStyle = pointStyles;
+    pnlChart.data.datasets[0].pointRadius = pointRadii.map(function(r){return r+1;});
     pnlChart.data.datasets[1].data = pnlVals;
     pnlChart.update('none');
   } else {
@@ -1788,7 +1851,8 @@ function updateEquity(data){
          borderColor:'#3fb950', backgroundColor:'rgba(63,185,80,0.12)',
          fill:{target:'origin',above:'rgba(63,185,80,0.12)',below:'transparent'},
          segment:{borderColor:function(ctx){return ctx.p0.parsed.y>=0&&ctx.p1.parsed.y>=0?'#3fb950':'#f85149'}},
-         tension:0.3, pointRadius:5, pointBorderWidth:2,
+         tension:0.3, pointRadius:pointRadii.map(function(r){return r+1;}), pointBorderWidth:2,
+         pointStyle:pointStyles,
          pointBackgroundColor:pnlPointColors, pointBorderColor:pnlPointColors, borderWidth:2},
         {label:'_neg', data:pnlVals,
          borderColor:'transparent', backgroundColor:'rgba(248,81,73,0.12)',
@@ -1797,7 +1861,7 @@ function updateEquity(data){
       ]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}}},
+        plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}},tooltip:entryTooltip},
         scales:{
           x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
           y:{ticks:{color:function(ctx){return ctx.tick.value>=0?'#3fb950':'#f85149'},font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
