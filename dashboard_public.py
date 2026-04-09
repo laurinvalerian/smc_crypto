@@ -1200,8 +1200,12 @@ def api_candles(symbol: str):
     except (ValueError, TypeError):
         limit = 100
 
+    tf = request.args.get("tf", "5m")
+    _TF_MULT = {"5m": 1, "15m": 3, "1h": 12, "4h": 48}
+    agg_n = _TF_MULT.get(tf, 1)
+
     # Priority 1: Live candle buffer from bot (live_results/candles/{symbol}.json)
-    # These are written every 60s by the bot from its in-memory 5m buffer.
+    # Buffer is always 5m — aggregate on the fly for higher TFs.
     sym_key = symbol.replace("/", "_").replace(":", "_")
     live_candle_path = RESULTS_DIR / "candles" / f"{sym_key}.json"
     if live_candle_path.exists():
@@ -1216,12 +1220,25 @@ def api_candles(symbol: str):
                 for c in candles:
                     if "time" in c:
                         c["time"] = c["time"] + _offset_s
+                # Aggregate to higher TF if needed
+                if agg_n > 1:
+                    agg = []
+                    for i in range(0, len(candles) - agg_n + 1, agg_n):
+                        chunk = candles[i:i + agg_n]
+                        agg.append({
+                            "time": chunk[0]["time"],
+                            "open": chunk[0]["open"],
+                            "high": max(c["high"] for c in chunk),
+                            "low": min(c["low"] for c in chunk),
+                            "close": chunk[-1]["close"],
+                            "volume": sum(c.get("volume", 0) for c in chunk),
+                        })
+                    candles = agg
                 return jsonify(candles[-limit:])
         except Exception:
             pass
 
     # Priority 2: Historical data files (data/{class}/{symbol}_{tf}.parquet)
-    tf = request.args.get("tf", "5m")
     subdir = _resolve_data_subdir(symbol)
     if subdir is None:
         return jsonify([])
