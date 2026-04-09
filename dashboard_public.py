@@ -2409,15 +2409,14 @@ function updateActiveTrades(trades){
             }
             // Add marker at entry candle
             var dir = (trade.direction||'').toLowerCase();
-            var markerColor = dir === 'long' ? '#58a6ff' : '#da6dff';
             var markerShape = dir === 'long' ? 'arrowUp' : 'arrowDown';
             var markerPos = dir === 'long' ? 'belowBar' : 'aboveBar';
             series.setMarkers([{
               time: candles[nearestIdx].time,
               position: markerPos,
-              color: markerColor,
+              color: '#58a6ff',
               shape: markerShape,
-              text: 'ENTRY ' + (dir==='long'?'\u25B2':'\u25BC'),
+              text: 'ENTRY',
             }]);
           }
         }
