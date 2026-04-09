@@ -2619,23 +2619,23 @@ class PaperBot:
         """
         Execute a bracket order with confidence-based risk allocation.
 
-        Risk scales linearly with XGB confidence:
-          conf 0.60 (threshold) → 0.25%
-          conf 0.80             → 0.875%
-          conf 1.00             → 1.50%
+        Risk scales linearly with XGB confidence (granular, no steps):
+          conf at threshold (0.55) → 0.20%
+          conf 0.775              → 0.85%
+          conf 1.00               → 1.50%
 
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
         # === CONFIDENCE-BASED DYNAMIC RISK ===
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
-        conf_threshold = 0.60
-        min_risk = 0.0025   # 0.25%
+        conf_floor = self.rl_suite.confidence_threshold if self.rl_suite else 0.55
+        min_risk = 0.002    # 0.20%
         max_risk = 0.015    # 1.50%
 
-        # Linear scaling: confidence → risk
-        conf_range = max(1.0 - conf_threshold, 0.01)
-        conf_factor = max(0.0, min(1.0, (xgb_confidence - conf_threshold) / conf_range))
+        # Granular linear scaling: conf_floor→1.0 mapped to min_risk→max_risk
+        conf_range = max(1.0 - conf_floor, 0.01)
+        conf_factor = max(0.0, min(1.0, (xgb_confidence - conf_floor) / conf_range))
         dynamic_risk = min_risk + (max_risk - min_risk) * conf_factor
         dynamic_risk = max(min_risk, min(dynamic_risk, max_risk))
 
