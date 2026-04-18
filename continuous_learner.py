@@ -1053,17 +1053,23 @@ def retrain_exit_models_if_ready(config: dict) -> dict[str, bool]:
                 len(train_df), len(test_df))
 
     # ── Retrain each exit model ──────────────────────────────────
+    # Phase 2.5 cleanup (2026-04-18): tp_optimizer + sl_adjuster removed from
+    # the retrain loop. Both were disabled in default_config.yaml after the
+    # 2026-04-17 audit (TP: PF drops -0.03..-0.19 in 4/5 folds; SL: 0/5.3M
+    # WIDEN predictions = Tighten-only classifier). Continuing to retrain
+    # them wasted CPU on a 4-core/8GB server AND silently overwrote pickles
+    # that were never reviewed against the disable rationale (Ultrareview
+    # Bug_019). Only the BE-Manager remains here — and only because BE is
+    # explicitly enabled in config (rl_brain.be_manager.enabled: true).
+    # Phase 2.4 will decide Student-Brain vs Legacy entry-filter; until then,
+    # entry filter retrains stay in retrain_if_ready() above (separate path).
     from rl_brain_v2 import (
-        _tp_labels, _tp_eval,
         derive_optimal_be_label, _be_eval,
-        derive_optimal_sl_label, _sl_eval,
         prepare_features, META_COLS,
     )
 
     for task_name, label_fn, eval_fn, model_filename in [
-        ("tp", _tp_labels, _tp_eval, "rl_tp_optimizer.pkl"),
         ("be", derive_optimal_be_label, _be_eval, "rl_be_manager.pkl"),
-        ("sl", derive_optimal_sl_label, _sl_eval, "rl_sl_adjuster.pkl"),
     ]:
         try:
             logger.info("[exit_retrain] Training %s model...", task_name)
