@@ -69,3 +69,4 @@ project-memory.json
 # CSV results
 *.csv
 !requirements.txt
+.coverage
