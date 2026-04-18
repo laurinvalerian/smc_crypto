@@ -83,21 +83,15 @@ def compute_alignment_score(
     asset_class: str | None = None,
 ) -> float:
     """
-    Granular top-down alignment score (0–1).
+    Granular top-down alignment score in [0, 1].
 
-    Default scoring (crypto/stocks/commodities):
-      • Daily bias (1D) +0.12, strong +0.08, 4H +0.08, 4H POI +0.08,
-        1H +0.08, CHoCH +0.06, entry_zone +0.15, trigger +0.15, volume +0.10
-      Max = 0.90
+    Weights come from CORE_WEIGHTS_CRYPTO (default) or CORE_WEIGHTS_FOREX
+    (when asset_class == "forex"). Both weight tables sum to 0.90 (the
+    pre-style_weight ceiling); the final score is clamped to 1.0.
 
-    Forex scoring (redistributed — entry_zone/trigger unreliable with tick volume):
-      • Daily bias +0.12, strong +0.12, 4H +0.12, 4H POI +0.08,
-        1H +0.10, CHoCH +0.06, entry_zone +0.08, trigger +0.08, volume +0.14
-      Max = 0.90
-
-    Clamped to [0, 1].
+    A legacy 4-arg call site with no keyword flags gets a 1.3x boost so
+    old scoring roughly matches the current scale.
     """
-    # Forex-specific weights: less on entry_zone/trigger, more on HTF structure
     w = CORE_WEIGHTS_FOREX if asset_class == "forex" else CORE_WEIGHTS_CRYPTO
 
     score = 0.0

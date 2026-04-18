@@ -1336,14 +1336,9 @@ def compute_position_size(
     return quantity
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Alignment score (4-step, 0.25 per step)
-# ═══════════════════════════════════════════════════════════════════
-
-# _compute_alignment_score is now imported from core.alignment (Phase 2.1 SSOT).
-# The underscore-prefixed alias is kept so backtest/generate_rl_data.py can
-# still import `_compute_alignment_score` from this module. New code should
-# import `compute_alignment_score` directly from core.alignment.
+# _compute_alignment_score is imported as an alias of core.alignment.
+# compute_alignment_score at the top of this module; the underscore name
+# is preserved so backtest/generate_rl_data.py:50 still resolves.
 
 
 # ═══════════════════════════════════════════════════════════════════
