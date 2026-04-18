@@ -64,6 +64,7 @@ from rich.text import Text
 # Keep import for extract_features (used for obs vector) but CentralRLBrain is no longer needed.
 from rl_brain import extract_features
 from rl_brain_v2 import RLBrainSuite
+from models.student_brain import StudentBrain
 from trade_journal import TradeJournal
 from utils.indicators import compute_rsi_wilders, compute_atr_wilders
 from strategies.smc_multi_style import (
@@ -96,6 +97,13 @@ try:
 except ImportError:
     run_continuous_learner = None  # type: ignore[assignment,misc]
     logging.getLogger(__name__).warning("continuous_learner not found — auto-retrain disabled")
+
+# ── Drift monitor (optional) ────────────────────────────────────
+try:
+    from drift_monitor import run_drift_monitor
+except ImportError:
+    run_drift_monitor = None  # type: ignore[assignment,misc]
+    logging.getLogger(__name__).warning("drift_monitor not found — feature drift monitoring disabled")
 
 # ── ccxt imports (only needed for BinanceAdapter backward-compat) ─
 try:
@@ -499,6 +507,7 @@ class PaperBot:
         adapter: ExchangeAdapter | None = None,
         central_brain: Any | None = None,  # Legacy PPO brain, no longer used
         rl_suite: RLBrainSuite | None = None,
+        student_brain: StudentBrain | None = None,
     ) -> None:
         self.bot_id = bot_id
         self.tag = f"bot_{bot_id:03d}"
@@ -508,7 +517,12 @@ class PaperBot:
         # Backward-compat: raw ccxt.pro exchange (only BinanceAdapter has .raw)
         # Legacy self.exchange removed — all calls go through self.adapter now
 
-        # Use per-symbol optimized params merged on top of per-class defaults
+        # Use per-symbol optimized params merged on top of per-class defaults.
+        # Training samples (data/rl_training/*_samples.parquet) MUST be
+        # regenerated with the same per-cluster optimized params and the
+        # model retrained on them, otherwise train/inference feature
+        # distributions drift apart. See backtest/generate_rl_data.py
+        # _resolve_smc_params() — kept in sync here.
         smc = ASSET_SMC_PARAMS.get(asset_class, ASSET_SMC_PARAMS["crypto"]).copy()
         _opt = _OPTIMIZED_SMC_PARAMS.get(self.symbol)
         if _opt:
@@ -579,6 +593,10 @@ class PaperBot:
         # Legacy PPO brain (superseded by XGBoost rl_brain_v2, kept for compat)
         self.brain = central_brain
         self.rl_suite = rl_suite
+        # Teacher-Student unified brain (replaces entry_filter + sl_adjuster +
+        # tp_optimizer + position_sizer when `student_brain.enabled: true`).
+        # None or disabled → bot falls back to the old rl_suite stack.
+        self.student_brain = student_brain
 
         # ── Load pre-computed symbol ranks for XGB features ──────────
         # Ships from MacBook as models/symbol_ranks.json alongside model pickle.
@@ -1805,6 +1823,109 @@ class PaperBot:
                     return {"type": "ob", "top": float(ob_top), "bottom": float(ob_bottom), "direction": "bearish"}
         return None
 
+    @staticmethod
+    def _training_style_alignment_score(
+        components: dict,
+        asset_class: str,
+    ) -> float:
+        """Compute alignment_score using the SAME formula as generate_rl_data.
+
+        This is a 9-component boolean-weighted sum that matches the training
+        distribution the XGBoost entry filter was trained on. The live
+        13-component score (with ADX/session/momentum/tf/freshness extras
+        and continuous zone_quality weighting) is a DIFFERENT distribution
+        — feeding it as the feature causes train/inference mismatch and
+        breaks the model's confidence calibration.
+
+        Mirrors generate_rl_data.py:793-813 vectorized formula, per-bar.
+        """
+        if asset_class == "forex":
+            w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.12, 0.12, 0.08
+            w_h1, w_choch, w_zone, w_trigger, w_vol = 0.10, 0.06, 0.08, 0.08, 0.14
+        else:
+            w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.08, 0.08, 0.08
+            w_h1, w_choch, w_zone, w_trigger, w_vol = 0.08, 0.06, 0.15, 0.15, 0.10
+
+        has_bias = 1.0 if components.get("bias") else 0.0
+        bias_strong = 1.0 if components.get("bias_strong") else 0.0
+        h4_confirms = 1.0 if components.get("h4_confirms") else 0.0
+        h4_poi = 1.0 if components.get("h4_poi") else 0.0
+        h1_confirms = 1.0 if components.get("h1_confirms") else 0.0
+        h1_choch = 1.0 if components.get("h1_choch") else 0.0
+        # Training uses has_entry_zone boolean (from FVG/OB on 15m). At live
+        # entry time we only reach this code when an entry exists, so set to 1.
+        has_entry_zone = 1.0
+        precision_trigger = 1.0 if components.get("precision_trigger") else 0.0
+        # volume_ok: 0.5 for forex/commodities (tick volume), else 0/1
+        if asset_class in ("forex", "commodities"):
+            volume_ok_val = 0.5
+        else:
+            volume_ok_val = 1.0 if components.get("volume_ok") else 0.0
+
+        alignment = (
+            has_bias * w_bias
+            + has_bias * bias_strong * w_strong
+            + h4_confirms * w_h4
+            + h4_poi * w_h4poi
+            + h1_confirms * w_h1
+            + h1_confirms * h1_choch * w_choch
+            + has_entry_zone * w_zone
+            + precision_trigger * w_trigger
+            + volume_ok_val * w_vol
+        )
+        return min(alignment, 1.0)
+
+    @staticmethod
+    def _training_style_adx_1h(
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+        period: int = 14,
+    ) -> float:
+        """Compute the single-value ADX at the last bar using the EXACT formula
+        from generate_rl_data._compute_adx (which is a custom Wilder variant).
+
+        The canonical Wilder ADX in filters/trend_strength.compute_adx computes
+        slightly different smoothed DI values, causing train/inference mismatch
+        on the adx_1h feature. The XGBoost model was trained on the training
+        parquet's values, so live must match training.
+
+        Mirrors generate_rl_data.py:363-397.
+        """
+        n = len(highs)
+        if n < period * 2 + 1:
+            return 25.0  # default neutral
+        from utils.indicators import compute_atr_wilders
+        atr = compute_atr_wilders(highs, lows, closes, period)
+
+        # +DM / -DM
+        up_move = highs[1:] - highs[:-1]
+        down_move = lows[:-1] - lows[1:]
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+        plus_di = np.zeros(n, dtype=np.float64)
+        minus_di = np.zeros(n, dtype=np.float64)
+        if atr[period] > 0:
+            plus_di[period] = np.mean(plus_dm[:period]) / atr[period] * 100
+            minus_di[period] = np.mean(minus_dm[:period]) / atr[period] * 100
+        for i in range(period + 1, n):
+            if atr[i] > 0:
+                plus_di[i] = min((plus_di[i - 1] * (period - 1) + plus_dm[i - 1]) / period / atr[i] * 100, 100.0)
+                minus_di[i] = min((minus_di[i - 1] * (period - 1) + minus_dm[i - 1]) / period / atr[i] * 100, 100.0)
+
+        dx = np.zeros(n, dtype=np.float64)
+        for i in range(period, n):
+            s = plus_di[i] + minus_di[i]
+            dx[i] = abs(plus_di[i] - minus_di[i]) / s * 100 if s > 0 else 0
+
+        adx_arr = np.full(n, 25.0, dtype=np.float64)
+        if n > period * 2:
+            adx_arr[period * 2] = np.mean(dx[period:period * 2 + 1])
+            for i in range(period * 2 + 1, n):
+                adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
+        return float(adx_arr[-1])
+
     def _build_xgb_features(self, components: dict, score: float) -> dict[str, float]:
         """Build 40-feature dict matching XGBoost model expectations.
 
@@ -1812,6 +1933,11 @@ class PaperBot:
         but only for the current (last) bar.  has_entry_zone and
         alignment_score are kept for TP/BE/sizing models; the entry_quality
         model excludes them via feat_names reindex.
+
+        The `score` parameter is the LIVE 13-component alignment score used
+        for the acceptance gate. It is NOT used for the alignment_score
+        feature — that is recomputed via _training_style_alignment_score to
+        match the training distribution (see method docstring).
         """
         feat: dict[str, float] = {}
 
@@ -1933,12 +2059,34 @@ class PaperBot:
             feat["volume_ratio"] = 1.0
 
         # ── ADX on 1H (normalized by /50, capped at 2.0) ───────────
-        # Training data computes real ADX for ALL classes (default 0.5, real ~0.3-0.8)
-        # Models trained Mar 27 before commit 45ebeb5 — expect real ADX for all classes
-        feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
+        # CRITICAL: must use the SAME formula as generate_rl_data._compute_adx,
+        # which is a custom Wilder variant that produces slightly different
+        # values than filters/trend_strength.compute_adx (used in scoring).
+        # The XGBoost model was trained on the training parquet's ADX values,
+        # so live must compute matching values to avoid feature distribution
+        # drift. Falls back to component value for the SCORING adx_strong flag.
+        if not self.buffer_1h.empty and len(self.buffer_1h) >= 30:
+            try:
+                _h1 = self.buffer_1h["high"].values.astype(np.float64)
+                _l1 = self.buffer_1h["low"].values.astype(np.float64)
+                _c1 = self.buffer_1h["close"].values.astype(np.float64)
+                _adx_train = self._training_style_adx_1h(_h1, _l1, _c1, period=14)
+                feat["adx_1h"] = min(_adx_train / 50.0, 2.0)
+            except Exception:
+                feat["adx_1h"] = min(float(components.get("adx_value", 25.0)) / 50.0, 2.0)
+        else:
+            feat["adx_1h"] = 0.5  # matches training's default
 
         # ── Alignment score ─────────────────────────────────────────
-        feat["alignment_score"] = float(score)
+        # CRITICAL: the `score` parameter is the live 13-component gate score
+        # (with ADX/session/momentum/tf/freshness extras and continuous
+        # zone_quality weighting). The training alignment_score column in
+        # parquet uses a simpler 9-component boolean-weighted sum. Feeding
+        # the 13-component score as the feature causes train/inference
+        # distribution drift. Use the training-matching formula instead.
+        feat["alignment_score"] = self._training_style_alignment_score(
+            components, self.asset_class,
+        )
 
         # ── Hour encoding (UTC, integer hour from candle timestamp) ──
         if not self.buffer_5m.empty:
@@ -2382,8 +2530,59 @@ class PaperBot:
         take_trade = True
         rl_confidence = 1.0
 
-        # XGBoost entry filter (RLBrainSuite) — always active, no warmup
-        if self.rl_suite is not None and self.rl_suite.entry_filter_enabled and self._check_component_enabled("entry_filter"):
+        # Student-brain overrides populated iff student is enabled.
+        # When `student_used` is True the legacy rl_suite entry/SL/TP/size
+        # blocks below are skipped entirely — the student is authoritative.
+        student_used: bool = False
+        student_sl_rr_mult: float = 1.0  # multiplies strategy sl_dist → final sl_dist
+        student_tp_rr_mult: float = 1.0  # multiplies strategy sl_dist → final tp_dist (NOT tp_dist!)
+        student_size_mult: float = 1.0
+
+        # ── Student Brain (unified Teacher-Student) ──────────────────
+        # Replaces rl_suite entry filter + SL adjuster + TP optimizer +
+        # position sizer when enabled. Runs ONE multi-head inference and
+        # sets SL/TP/size from hindsight-optimal regression heads.
+        if self.student_brain is not None and self.student_brain.enabled:
+            sig_features = sig.get("features", {})
+            pred = self.student_brain.predict(sig_features)
+            rl_confidence = float(pred.entry_prob)
+            if not pred.accept:
+                self._rl_rejected += 1
+                _total_rl = self._rl_accepted + self._rl_rejected
+                _rate = self._rl_accepted / _total_rl * 100 if _total_rl > 0 else 0
+                self.logger.info(
+                    "STUDENT REJECT %s prob=%.3f sl=%.2fR tp=%.2fR | accepted=%d rejected=%d rate=%.0f%%",
+                    symbol, pred.entry_prob, pred.sl_rr, pred.tp_rr,
+                    self._rl_accepted, self._rl_rejected, _rate,
+                )
+                # Log rejected signal for the counterfactual loop (same pipeline as rl_suite)
+                try:
+                    self._record_and_track_rejection(
+                        symbol=symbol, direction=direction,
+                        entry_price=price, sl_price=sl, tp_price=tp,
+                        xgb_confidence=rl_confidence, alignment_score=score,
+                        entry_features=sig_features,
+                    )
+                except Exception as exc:
+                    self.logger.debug("Failed to log rejected signal: %s", exc)
+                self._pending_signal = None
+                return
+
+            # Student accepted the setup — stash its levels for later use and
+            # mark the flag so the legacy rl_suite blocks below are skipped.
+            student_used = True
+            student_sl_rr_mult = pred.sl_rr
+            student_tp_rr_mult = pred.tp_rr
+            student_size_mult = pred.size
+            self._rl_accepted += 1
+            self._recent_signal_bars.append(self._total_bars)
+            self.logger.info(
+                "STUDENT ACCEPT %s prob=%.3f sl=%.2fR tp=%.2fR size=%.2f score=%.2f",
+                symbol, pred.entry_prob, pred.sl_rr, pred.tp_rr, pred.size, score,
+            )
+
+        # XGBoost entry filter (RLBrainSuite) — legacy path, used only when student disabled
+        if not student_used and self.rl_suite is not None and self.rl_suite.entry_filter_enabled and self._check_component_enabled("entry_filter"):
             xgb_take, rl_confidence = self.rl_suite.predict_entry(sig.get("features", {}))
             if not xgb_take:
                 self._rl_rejected += 1
@@ -2394,6 +2593,63 @@ class PaperBot:
                     symbol, rl_confidence, score,
                     self._rl_accepted, self._rl_rejected, _rate,
                 )
+                # ── DEBUG: Feature parity dump ──────────────────────
+                # Write the full feature vector + buffer state for the first
+                # ~10 rejects to /root/bot/debug/. Used to diagnose train/
+                # inference mismatch. Disabled after dumping enough.
+                try:
+                    import json as _json
+                    from pathlib import Path as _Path
+                    _dbg_dir = _Path("debug/feature_parity")
+                    _dbg_dir.mkdir(parents=True, exist_ok=True)
+                    _dbg_count = sum(1 for _ in _dbg_dir.glob("*.json"))
+                    if _dbg_count < 30:
+                        _last_5m_ts = (
+                            str(self.buffer_5m["timestamp"].iloc[-1])
+                            if not self.buffer_5m.empty else None
+                        )
+                        _last_1d_ts = (
+                            str(self.buffer_1d["timestamp"].iloc[-1])
+                            if not self.buffer_1d.empty else None
+                        )
+                        _buf_1d_tail = (
+                            self.buffer_1d.tail(10)[["timestamp","open","high","low","close"]].to_dict(orient="records")
+                            if not self.buffer_1d.empty else []
+                        )
+                        # Convert timestamps to ISO strings
+                        for _r in _buf_1d_tail:
+                            _r["timestamp"] = str(_r["timestamp"])
+                        _dump = {
+                            "symbol": symbol,
+                            "asset_class": self.asset_class,
+                            "log_ts": _last_5m_ts,
+                            "score_live_13comp": float(score),
+                            "rl_confidence": float(rl_confidence),
+                            "features": {
+                                k: float(v) if isinstance(v, (int, float, np.floating, np.integer))
+                                else None
+                                for k, v in sig.get("features", {}).items()
+                            },
+                            "components_flags": {
+                                k: bool(v) if isinstance(v, (bool,))
+                                else (float(v) if isinstance(v, (int, float, np.floating, np.integer)) else None)
+                                for k, v in sig.get("components", {}).items()
+                                if not k.startswith("_") and not isinstance(v, (dict, list, pd.DataFrame))
+                            },
+                            "buffer_1d_len": int(len(self.buffer_1d)),
+                            "buffer_1d_tail": _buf_1d_tail,
+                            "buffer_4h_len": int(len(self.buffer_4h)),
+                            "buffer_1h_len": int(len(self.buffer_1h)),
+                            "buffer_5m_len": int(len(self.buffer_5m)),
+                            "buffer_5m_last_ts": _last_5m_ts,
+                            "buffer_1d_last_ts": _last_1d_ts,
+                        }
+                        _fname = _dbg_dir / f"{symbol}_{int(pd.Timestamp.utcnow().timestamp())}.json"
+                        with open(_fname, "w") as _f:
+                            _json.dump(_dump, _f, indent=2, default=str)
+                        self.logger.debug("Feature parity dump: %s", _fname)
+                except Exception as _exc:
+                    self.logger.debug("Feature dump failed: %s", _exc)
                 # Alert: abnormal acceptance rate after 20+ decisions
                 if _total_rl >= 20 and (_rate < 10 or _rate > 95):
                     self.logger.debug(
@@ -2472,28 +2728,84 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # ── RL TP adjustment ───────────────────────────────────────────
+        # ── Student-brain SL/TP override (unified Teacher-Student) ────
         rl_be_level = 0.0
-        if self.rl_suite is not None:
+        sl_dist_for_tp = sl_dist  # preserve original for TP model (trained on unadjusted SL)
+        # Track ORIGINAL (pre-adjustment) SL for journal + SL-model label derivation.
+        # bug_008 fix: without this, sl_original stored the ADJUSTED value, and the SL
+        # model computed label_mae_rr against a too-small denominator → self-caused stops
+        # got mislabeled as KEEP instead of WIDEN (DOT 2026-04-17 case).
+        sl_pre_adjustment = sl
+        sl_dist_pre_adjustment = sl_dist
+        sl_was_adjusted = False
+
+        if student_used:
+            # Student's sl_rr and tp_rr are MULTIPLES of the strategy's
+            # original sl_dist (the R-unit anchor). This matches the Teacher v2
+            # label formula: optimal_sl_rr = clip(MAE × 1.10 / strategy_sl_dist).
+            if student_sl_rr_mult != 1.0:
+                new_sl_dist = sl_dist * student_sl_rr_mult
+                old_sl = sl
+                sl = price - new_sl_dist if direction == "long" else price + new_sl_dist
+                sl_dist = new_sl_dist
+                sl_was_adjusted = True
+                self.logger.info(
+                    "STUDENT SL %s: %.6f → %.6f (%.2fR × base %.4f = %.4f)",
+                    symbol, old_sl, sl, student_sl_rr_mult,
+                    sl_dist_pre_adjustment, new_sl_dist,
+                )
+            # TP from student is also a multiple of the strategy sl_dist.
+            new_tp_dist = sl_dist_pre_adjustment * student_tp_rr_mult
+            old_tp = tp
+            tp = price + new_tp_dist if direction == "long" else price - new_tp_dist
+            tp_dist = new_tp_dist
+            self.logger.info(
+                "STUDENT TP %s: %.6f → %.6f (%.2fR × base %.4f = %.4f)",
+                symbol, old_tp, tp, student_tp_rr_mult,
+                sl_dist_pre_adjustment, new_tp_dist,
+            )
+
+        # ── RL SL adjustment (legacy path — used only when student disabled) ──
+        if not student_used and self.rl_suite is not None:
+            if self.rl_suite.sl_enabled and sl_dist > 0 and self._check_component_enabled("sl_adjuster"):
+                sl_dist_orig = sl_dist
+                adjusted_sl_dist = self.rl_suite.predict_sl_adjustment(
+                    sig.get("features", {}), sl_dist, price,
+                )
+                if abs(adjusted_sl_dist - sl_dist) > 0.01 * sl_dist:
+                    old_sl = sl
+                    sl = price - adjusted_sl_dist if direction == "long" else price + adjusted_sl_dist
+                    sl_dist = adjusted_sl_dist
+                    sl_was_adjusted = True
+                    self.logger.info(
+                        "RL SL adjusted %s: %.6f -> %.6f (dist %.4f -> %.4f)",
+                        symbol, old_sl, sl, sl_dist_orig, adjusted_sl_dist,
+                    )
+
+        # ── RL TP adjustment (legacy path — used only when student disabled) ──
+        if not student_used and self.rl_suite is not None:
             if self.rl_suite.tp_enabled and sl_dist > 0 and self._check_component_enabled("tp_optimizer"):
-                planned_tp_rr = tp_dist / sl_dist
+                planned_tp_rr = tp_dist / sl_dist_for_tp  # use original SL (model trained on unadjusted)
                 adjusted_tp_rr = self.rl_suite.predict_tp_adjustment(
                     sig.get("features", {}), planned_tp_rr,
                 )
                 if abs(adjusted_tp_rr - planned_tp_rr) > 0.01:
                     old_tp = tp
-                    tp = price + adjusted_tp_rr * sl_dist if direction == "long" else price - adjusted_tp_rr * sl_dist
+                    tp = price + adjusted_tp_rr * sl_dist_for_tp if direction == "long" else price - adjusted_tp_rr * sl_dist_for_tp
                     tp_dist = abs(tp - price)
                     self.logger.info(
                         "RL TP adjusted %s: %.6f -> %.6f (RR %.1f -> %.1f)",
                         symbol, old_tp, tp, planned_tp_rr, adjusted_tp_rr,
                     )
 
+        # BE manager runs regardless of student/rl_suite choice — it's orthogonal
+        # (dynamic SL-to-BE ratchet triggered by running PnL in R, not by entry-time features).
+        if self.rl_suite is not None:
             if self.rl_suite.be_enabled and sl_dist > 0 and self._check_component_enabled("be_manager"):
                 # Match training formula: cost_rr in R-multiples
                 _tc = _TRAIN_COMMISSION.get(self.asset_class, 0.0004)
                 _ts = _TRAIN_SLIPPAGE.get(self.asset_class, 0.0002)
-                cost_rr = (price * (_tc + _ts) * 2) / sl_dist
+                cost_rr = (price * (_tc + _ts) * 2) / sl_dist_for_tp  # use original SL (model trained on unadjusted)
                 rl_be_level = self.rl_suite.predict_be_level(
                     sig.get("features", {}), cost_rr,
                 )
@@ -2512,6 +2824,7 @@ class PaperBot:
                 style=style,
                 features=sig.get("features", {}),
                 xgb_confidence=rl_confidence,
+                size_multiplier=student_size_mult,  # 1.0 when student disabled
             )
         )
         # Unpack — oanda_trade_id is optional (7th element, None for non-OANDA)
@@ -2541,8 +2854,10 @@ class PaperBot:
             "symbol": symbol,
             "direction": direction,
             "entry": price,
-            "sl": sl,
-            "original_sl": sl,
+            "sl": sl,                               # actually-used SL (possibly adjusted)
+            "original_sl": sl_pre_adjustment,       # pre-RL-adjustment SL (planned by strategy)
+            "original_sl_dist": sl_dist_pre_adjustment,
+            "sl_was_adjusted": sl_was_adjusted,
             "tp": tp,
             "qty": qty,
             "leverage": used_leverage,
@@ -2570,7 +2885,8 @@ class PaperBot:
         self._active_trades[-1]["rl_trade_id"] = trade_id_for_journal
         if self.journal is not None:
             try:
-                rr_target = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 3.0
+                # RR target measured against the strategy-planned SL (pre-adjustment).
+                rr_target = abs(tp - price) / abs(price - sl_pre_adjustment) if abs(price - sl_pre_adjustment) > 0 else 3.0
                 self.journal.open_trade(
                     trade_id=trade_id_for_journal,
                     symbol=symbol,
@@ -2580,7 +2896,8 @@ class PaperBot:
                     tier="",
                     entry_time=datetime.now(timezone.utc),
                     entry_price=price,
-                    sl_original=sl,
+                    sl_original=sl_pre_adjustment,   # TRUE pre-adjustment SL — needed for correct SL-label R-units
+                    sl_used=sl if sl_was_adjusted else None,
                     tp=tp,
                     score=score,
                     rr_target=rr_target,
@@ -2615,6 +2932,7 @@ class PaperBot:
         style: str = STYLE_DAY,
         features: dict[str, Any] | None = None,
         xgb_confidence: float = 0.6,
+        size_multiplier: float = 1.0,
     ) -> tuple[str | None, str | None, str | None, float, float, int]:
         """
         Execute a bracket order with confidence-based risk allocation.
@@ -2623,6 +2941,10 @@ class PaperBot:
           conf at threshold (0.55) → 0.20%
           conf 0.775              → 0.85%
           conf 1.00               → 1.50%
+
+        ``size_multiplier`` (default 1.0) multiplies the confidence-derived risk,
+        clamped back into [min_risk, max_risk]. Used by the Student brain to
+        up/down-scale position size based on its ``optimal_size`` head.
 
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
@@ -2637,6 +2959,9 @@ class PaperBot:
         conf_range = max(1.0 - conf_floor, 0.01)
         conf_factor = max(0.0, min(1.0, (xgb_confidence - conf_floor) / conf_range))
         dynamic_risk = min_risk + (max_risk - min_risk) * conf_factor
+        # Apply Student's size multiplier (1.0 when disabled), then clamp.
+        if size_multiplier != 1.0:
+            dynamic_risk = dynamic_risk * float(size_multiplier)
         dynamic_risk = max(min_risk, min(dynamic_risk, max_risk))
 
         self.logger.info(
@@ -2880,13 +3205,27 @@ class PaperBot:
                     order_id, sl_order_id, tp_order_id, oanda_trade_id = await self._place_bracket_order(
                         symbol, direction, price, sl, tp, qty,
                     )
+                    # _place_bracket_order returns order_id=None on silent
+                    # rejection (e.g. OANDA precision exceeded). Don't claim
+                    # success in that case — treat as failure.
+                    if order_id is None:
+                        self.logger.error(
+                            "[ORDER_FAILED] %s %s | qty=%.6f notional=%.2f — "
+                            "broker rejected order silently",
+                            direction.upper(), symbol, qty, notional,
+                        )
+                        return (
+                            None, None, None,
+                            qty, risk_pct, planned_leverage,
+                            None,
+                        )
                     self.logger.info(
                         "[ORDER_SUCCESS] %s %s | risk_used=%.2f%% leverage=%dx (%s) "
                         "qty=%.6f notional=%.2f expected_margin=%.2f order=%s",
                         direction.upper(), symbol,
                         risk_pct * 100, planned_leverage, leverage_source,
                         qty, notional, expected_margin,
-                        order_id or "no-exchange",
+                        order_id,
                     )
                     return (
                         order_id, sl_order_id, tp_order_id,
@@ -3034,6 +3373,16 @@ class PaperBot:
             )
             entry_id = entry.order_id
             oanda_trade_id = entry.trade_id  # None for non-OANDA
+            # Detect silent rejection (OANDA returns a valid OrderResult with
+            # None id when rejected, e.g. PRICE_PRECISION_EXCEEDED).
+            if entry_id is None:
+                entry_status = getattr(entry, "status", "unknown")
+                self.logger.error(
+                    "ENTRY REJECTED %s %s qty=%.6f | status=%s (no order placed)",
+                    side.upper(), symbol, qty, entry_status,
+                )
+                # Return None to signal failure to the caller
+                return None, None, None, None
             self.logger.info(
                 "ENTRY %s %s qty=%.6f | id=%s trade_id=%s",
                 side.upper(), symbol, qty, entry_id, oanda_trade_id or "n/a",
@@ -4160,7 +4509,14 @@ class LiveMultiBotRunner:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                bot.logger.error("REST candle poll %s: %s", bot.symbol, exc)
+                # Transient OANDA/Alpaca read timeouts are auto-recovered on the
+                # next 10s poll cycle (fetch_ohlcv uses limit=2 so a missed candle
+                # is picked up on retry). Log these as WARNING so ERROR remains
+                # reserved for issues that need attention.
+                if "timed out" in str(exc).lower():
+                    bot.logger.warning("REST candle poll %s: %s", bot.symbol, exc)
+                else:
+                    bot.logger.error("REST candle poll %s: %s", bot.symbol, exc)
             try:
                 interval = REST_POLL_INTERVAL_STOCKS_CANDLE if bot.asset_class == "stocks" else REST_POLL_INTERVAL_SEC
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
@@ -4960,6 +5316,9 @@ class LiveMultiBotRunner:
             qty = trade["qty"]
             direction = trade["direction"]
             sl = trade["sl"]
+            # Pre-seed so teacher block + any early-return paths always have a value
+            exit_reason = "unknown"
+            outcome_str = "unknown"
 
             if direction == "long":
                 raw_pnl = (exit_price - entry_price) * qty
@@ -5053,8 +5412,25 @@ class LiveMultiBotRunner:
                                 else:
                                     exit_reason = "sl_hit"
 
-                        # MFE/MAE from journal's running tracker
-                        max_fav = bot.journal._max_favorable.get(trade_id_j, abs(pnl_pct / 100))
+                        # MFE/MAE from journal's running tracker.
+                        # bug_012 fix (2026-04-17): previous fallback used `abs(pnl_pct/100)`
+                        # which is (a) net-of-commission, (b) equity-relative — while
+                        # _max_favorable stores gross, entry-price-relative fractions
+                        # (unrealized_pnl_pct in record_bar: (close-entry)/entry).
+                        # Mixing those units silently poisons MFE/MAE labels. The fallback
+                        # now uses the same formula as the tracker (gross, entry-relative)
+                        # for wins; for losses the MAE fallback uses the same absolute price
+                        # move. If the tracker has a value, use it — else this consistent
+                        # fallback keeps labels on the same scale.
+                        _exit_move = abs(exit_price - entry_price_j) / entry_price_j if entry_price_j > 0 else 0.0
+                        max_fav = bot.journal._max_favorable.get(
+                            trade_id_j,
+                            _exit_move if net_pnl > 0 else 0.0,
+                        )
+                        max_adv = bot.journal._max_adverse.get(
+                            trade_id_j,
+                            _exit_move if net_pnl <= 0 else 0.0,
+                        )
                         bars_held_j = trade.get("bars_held", 0)
 
                         bot.journal.close_trade(
@@ -5067,7 +5443,7 @@ class LiveMultiBotRunner:
                             pnl_pct=pnl_pct / 100.0,
                             rr_actual=rr_actual if net_pnl > 0 else -rr_actual,
                             max_favorable_pct=max_fav,
-                            max_adverse_pct=min(pnl_pct / 100.0, 0.0),
+                            max_adverse_pct=max_adv,
                             be_triggered=bool(trade.get("be_triggered", False)),
                         )
                     except Exception as exc:
@@ -5075,7 +5451,11 @@ class LiveMultiBotRunner:
 
             # ── Teacher analysis (non-blocking, retroactive) ────────
             if self._teacher_enabled:
+                # Mirror live fields into teacher-expected keys so the
+                # feedback JSONL gets real values, not defaults.
                 trade["_exit_reason"] = exit_reason
+                trade["outcome"] = outcome_str if outcome_str != "unknown" else ("win" if net_pnl > 0 else "loss")
+                trade["pnl_pct"] = (net_pnl / bot.equity) if bot.equity > 0 else 0.0
                 asyncio.create_task(self._run_teacher_analysis(bot, trade, exit_price))
 
             # === CLEANUP ===
@@ -5669,13 +6049,13 @@ class LiveMultiBotRunner:
                         bot._save_state()
                     except Exception:
                         pass
-                    # Export last 200 candles for dashboard (lightweight JSON)
+                    # Export last 300 candles for dashboard (max API limit)
                     try:
                         buf = bot._buffer_5m_deque
                         if buf and len(buf) > 0:
                             sym_key = bot.symbol.replace("/", "_").replace(":", "_")
                             candles_out = []
-                            for c in list(buf)[-200:]:
+                            for c in list(buf)[-300:]:
                                 ts = c.get("timestamp")
                                 if hasattr(ts, "timestamp"):
                                     t = int(ts.timestamp())
@@ -5893,6 +6273,11 @@ class LiveMultiBotRunner:
         if run_continuous_learner is not None:
             learner_task = asyncio.create_task(run_continuous_learner(self.config, self._shutdown))
 
+        # Drift monitor (feature distribution drift alerts)
+        drift_task = None
+        if run_drift_monitor is not None:
+            drift_task = asyncio.create_task(run_drift_monitor(self.config, self._shutdown))
+
         # Wait until shutdown
         await self._shutdown.wait()
         logger.info("Shutdown signal received – stopping …")
@@ -5959,6 +6344,7 @@ class LiveMultiBotRunner:
                 pass
 
         # Final summary to console
+        final_equity = sum(final_broker_eq.values())
         self._print_final_summary(final_equity)
 
     def _print_final_summary(self, total_equity: float = 0.0) -> None:
@@ -6028,6 +6414,12 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     # ── Create RL Brain Suite (XGBoost models) ────────────────────
     rl_suite = RLBrainSuite(config)
 
+    # ── Create Student Brain (unified Teacher-Student) ────────────
+    # When `student_brain.enabled: true`, replaces rl_suite's entry/SL/TP/size
+    # stack with one multi-head model trained on hindsight-optimal targets.
+    # Initialised here so all 112 bots share one loaded instance (saves RAM).
+    student_brain = StudentBrain(config)
+
     # ── Create bots ───────────────────────────────────────────────
     bots: list[PaperBot] = []
     for idx, (sym, ac) in enumerate(active):
@@ -6039,6 +6431,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
             asset_class=ac,
             adapter=adapters[ac],
             rl_suite=rl_suite,
+            student_brain=student_brain,
         )
         # Display multiplier for dashboard (does NOT affect trading)
         disp_mult = config.get("equity_display_multipliers", {}).get(ac, 1)

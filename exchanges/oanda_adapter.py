@@ -155,6 +155,17 @@ class OandaAdapter(ExchangeAdapter):
             self._account_id, self._environment,
         )
 
+        # Eagerly load instrument metadata so price_to_precision() has
+        # correct tick_size for every symbol from the first call. Without
+        # this, the first few orders fall back to a default precision
+        # which causes PRICE_PRECISION_EXCEEDED rejections on JPY pairs
+        # and commodities. Non-fatal if it fails — the fallback will kick
+        # in and the next call will try again.
+        try:
+            await self.load_markets()
+        except Exception as exc:
+            logger.warning("Eager load_markets failed (will retry lazily): %s", exc)
+
     async def close(self) -> None:
         """OANDA v20 uses REST — no persistent connection to close."""
         self._api = None
@@ -416,7 +427,26 @@ class OandaAdapter(ExchangeAdapter):
     # ── Instrument Info ─────────────────────────────────────────────
 
     def get_instrument(self, symbol: str) -> InstrumentMeta | None:
-        return self._instruments.get(symbol)
+        """Look up instrument by unified or OANDA-native symbol.
+
+        Dict is keyed by unified format (e.g. 'AUD/JPY'), but callers may
+        pass OANDA-native ('AUD_JPY'). Accept both to avoid silent fallback
+        to default precision which causes PRICE_PRECISION_EXCEEDED on
+        JPY pairs.
+        """
+        meta = self._instruments.get(symbol)
+        if meta is not None:
+            return meta
+        # Try unified form from OANDA-native
+        if "_" in symbol and "/" not in symbol:
+            unified = symbol.replace("_", "/")
+            return self._instruments.get(unified)
+        # Try OANDA-native from unified
+        if "/" in symbol:
+            oanda_native = symbol.replace("/", "_")
+            if oanda_native in self._oanda_to_unified:
+                return self._instruments.get(self._oanda_to_unified[oanda_native])
+        return None
 
     def normalize_symbol(self, symbol: str) -> str:
         """Convert unified to OANDA format: 'EUR/USD' → 'EUR_USD'."""
@@ -425,11 +455,21 @@ class OandaAdapter(ExchangeAdapter):
     # ── Precision Helpers ───────────────────────────────────────────
 
     def price_to_precision(self, symbol: str, price: float) -> float:
+        """Round price to the instrument's tick size precision.
+
+        Critical for OANDA orders: JPY pairs use 3 decimals, EUR/USD uses 5,
+        BCO_USD/WTICO_USD use 2. Wrong precision → PRICE_PRECISION_EXCEEDED
+        rejection at order placement. Falls back to 3 decimals (safer than 5)
+        for unknown symbols since JPY pairs are the most common precision
+        edge case.
+        """
         meta = self.get_instrument(symbol)
         if meta and meta.tick_size > 0:
             decimals = max(0, -int(math.log10(meta.tick_size)))
             return round(price, decimals)
-        return round(price, 5)
+        # Safer default than 5: JPY pairs use 3, commodities use 2-3.
+        # 5 decimals on a JPY pair causes PRICE_PRECISION_EXCEEDED.
+        return round(price, 3)
 
     def amount_to_precision(self, symbol: str, amount: float) -> float:
         """OANDA uses integer units for forex, round to whole number."""

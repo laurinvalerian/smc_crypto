@@ -61,19 +61,17 @@ Vollständige Flag-Liste: siehe `@agents/smc-strategist.md`
 
 ### Nächste Schritte
 
-1. **V17 Grid-Optimierung**: ⏳ Grid von 3,024→216 Combos (nutzlose Params fixieren), be_ratchet≥1.5
-2. **Paper Grid Varianten generieren**: ⏳ `--generate-paper-grid` (Stocks + Crypto zuerst)
-3. **Paper Trading**: ⏳ 2 Wochen Demo — Stocks (hoch) + Crypto (mittel), Forex/Commodities pausiert
-4. **Live → Funded**: 3× Funded Accounts geplant (erst nach Paper-Validierung)
+1. **Exit Model Suite**: ⏳ TP/SL/BE adaptive Modelle, Post-TP Tracking, 8-Combo Vergleich (Plan: `.omc/plans/exit-model-suite.md`)
+2. **Live → Funded**: 3× Funded Accounts geplant (erst nach Paper-Validierung)
 
-### Paper-Trading Readiness (V16)
+### Paper-Trading Status
 
-| Klasse | Ready? | Vertrauen | Begründung |
-|--------|--------|-----------|------------|
-| **Stocks** | JA | HOCH | PF 3.45, WR 40-70%, konservative Params (lev=1), sinkendes PF über Windows |
-| **Crypto** | JA (vorsichtig) | MITTEL | PF 11.7+, konsistente Trades (25-31/W), niedrige DD |
-| **Forex** | NEIN | NIEDRIG | 0 Evergreen Combos. SMC funktioniert nicht mit Tick-Volume |
-| **Commodities** | TEILWEISE | MITTEL | PF 6.74, aber nur 4 Instrumente auf OANDA |
+| Klasse | Status | Begründung |
+|--------|--------|------------|
+| **Stocks** | ✅ AKTIV | PF 3.45, WR 40-70%, konservative Params (lev=1) |
+| **Crypto** | ✅ AKTIV | PF 11.7+, konsistente Trades (25-31/W), niedrige DD |
+| **Forex** | ✅ AKTIV | volume_ok Fix (2026-04-08): train/inference Mismatch behoben, neutral 0.5 für tick-vol |
+| **Commodities** | ✅ AKTIV | PF 6.74, 4 Instrumente auf OANDA |
 
 Detaillierte Backtest-Ergebnisse und Version-History (V6→V16): siehe `@agents/backtester.md`
 

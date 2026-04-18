@@ -52,14 +52,21 @@ RESULTS_DIR = Path("backtest/results/rl")
 ALL_CLASSES = ["crypto", "forex", "stocks", "commodities"]
 
 # Features that should NOT be used as model input
-META_COLS = {"timestamp", "symbol", "asset_class", "window",
+META_COLS = {"timestamp", "symbol", "asset_class", "window", "sample_weight",
              "label_action", "label_rr", "label_outcome", "label_profitable",
              "label_exit_mechanism", "label_exit_bar", "label_max_favorable_rr",
              "label_tp_rr", "label_cost_rr",
+             # Phase A exit model labels (post-TP + MAE)
+             "label_mae_rr", "label_post_tp_max_rr", "label_post_tp_reversal_rr",
              # Exit classifier labels (bar-level episodes)
              "label_hold_better", "bar_unrealized_rr", "final_net_rr",
              "outcome", "exit_mechanism", "max_favorable_rr", "entry_price",
-             "tp_rr", "direction"}
+             "tp_rr", "direction",
+             # Teacher v2 targets (Student brain training) — these are labels,
+             # NOT inputs. Without this exclusion the Student would learn to
+             # read the answer from its own target columns (val_auc=1.0 leak
+             # observed 2026-04-17). Keep in sync with teacher/teacher_v2.py.
+             "optimal_entry", "optimal_sl_rr", "optimal_tp_rr", "optimal_size"}
 
 # Features to exclude from entry_quality task (true data leaks only)
 ENTRY_QUALITY_EXCLUDE = {"has_entry_zone"}  # alignment_score moved to FEATURES in schema v3
@@ -1047,7 +1054,18 @@ def run_walk_forward_sizing(classes: list[str] | None = None) -> list[dict]:
 # ===================================================================
 
 def _tp_labels(df: pd.DataFrame) -> np.ndarray:
-    """Label = MFE (max favorable excursion) — what TP was achievable."""
+    """Label = true MFE including post-TP continuation (what TP was actually achievable).
+
+    Uses label_post_tp_max_rr for TP-hit trades (shows how far price went AFTER TP),
+    falls back to label_max_favorable_rr for non-TP exits.
+    This fixes the prior TP model failure where MFE was capped at TP hit,
+    causing the model to learn "MFE <= TP" and shorten TPs (PF 1.74→1.44).
+    """
+    if "label_post_tp_max_rr" in df.columns:
+        post_tp = df["label_post_tp_max_rr"].values.astype(np.float32)
+        original = df["label_max_favorable_rr"].values.astype(np.float32)
+        labels = np.where(np.isnan(post_tp), original, post_tp)
+        return np.clip(labels, 0.0, 20.0)
     return np.clip(df["label_max_favorable_rr"].values.astype(np.float32), 0.0, 20.0)
 
 
@@ -1055,7 +1073,15 @@ def _tp_eval(model, X_test, df_test, feat_names) -> dict[str, Any]:
     """Simulate TP adjustment on OOS data. Compare adjusted vs original outcomes."""
     predicted_mfe = model.predict(X_test).astype(np.float64)
     planned_tp = df_test["label_tp_rr"].values.astype(np.float64)
-    actual_mfe = df_test["label_max_favorable_rr"].values.astype(np.float64)
+    # Use post-TP MFE when available (shows true price potential beyond TP hit).
+    # Without this, TP extensions can never be credited as successful because
+    # actual_mfe is capped at the original TP level.
+    if "label_post_tp_max_rr" in df_test.columns:
+        post_tp = df_test["label_post_tp_max_rr"].values.astype(np.float64)
+        original_mfe = df_test["label_max_favorable_rr"].values.astype(np.float64)
+        actual_mfe = np.where(np.isnan(post_tp), original_mfe, post_tp)
+    else:
+        actual_mfe = df_test["label_max_favorable_rr"].values.astype(np.float64)
     actual_rr = np.clip(df_test["label_rr"].values.astype(np.float64), -1.0, 20.0)
     cost_rr = df_test["label_cost_rr"].values.astype(np.float64)
 
@@ -1287,6 +1313,185 @@ def run_walk_forward_be(classes: list[str] | None = None) -> list[dict]:
 
 
 # ===================================================================
+#  SL Adjustment Model (Phase B)
+# ===================================================================
+
+def derive_optimal_sl_label(df: pd.DataFrame) -> np.ndarray:
+    """
+    Derive optimal SL adjustment category from outcome + MAE + MFE data.
+
+    Categorical buckets (float-encoded for regression skeleton):
+      1.0 = TIGHTEN_SIGNIFICANTLY: win with very small MAE (<0.3R)
+      0.5 = TIGHTEN_SLIGHTLY: win with small MAE (0.3-0.6R)
+      0.0 = KEEP: default (MAE appropriate for the outcome)
+     -0.5 = WIDEN_SLIGHTLY: loss with moderate MFE (>=0.5R) — partial good entry
+     -1.0 = WIDEN_SIGNIFICANTLY: loss with high MFE (>=1.0R) — strong reversal case
+
+    IMPORTANT: MAE/MFE must be expressed in R-units of the ORIGINAL
+    planned SL distance (pre-RL-adjustment), otherwise labels are
+    self-reinforcing: tightened SL shrinks R-units → MFE rarely reaches
+    1.0R → WIDEN labels never generated → model stays Tighten-biased.
+    (Audit 2026-04-17: previous labels produced 0/5.3M WIDEN predictions
+    across 5 folds.)
+
+    Changes 2026-04-17:
+    - WIDEN threshold lowered from 1.0R to 0.5R (was too strict)
+    - New WIDEN_SIGNIFICANTLY bucket at -1.0 for strong reversal cases
+      (widens the label-space symmetrically vs TIGHTEN, gives XGB more
+      gradient signal on the widen side)
+    """
+    outcome = df["label_outcome"].values       # 1=win, 2=loss, 3=be
+    mae = df["label_mae_rr"].values.astype(np.float32) if "label_mae_rr" in df.columns else np.zeros(len(df), dtype=np.float32)
+    mfe = df["label_max_favorable_rr"].values.astype(np.float32)
+
+    sl_label = np.zeros(len(df), dtype=np.float32)  # default: KEEP
+
+    # WINS where MAE was small → SL was too wide, could tighten
+    win_mask = outcome == 1
+    sl_label[win_mask & (mae < 0.3)] = 1.0      # very small MAE → tighten significantly
+    sl_label[win_mask & (mae >= 0.3) & (mae < 0.6)] = 0.5  # moderate MAE → tighten slightly
+    # win_mask & mae >= 0.6: price came close to SL → keep SL distance
+
+    # LOSSES where MFE reached profit then reversed → widen SL
+    # Lowered threshold from 1.0 to 0.5 to produce actual WIDEN labels.
+    loss_mask = outcome == 2
+    sl_label[loss_mask & (mfe >= 0.5) & (mfe < 1.0)] = -0.5   # moderate reversal → widen slightly
+    sl_label[loss_mask & (mfe >= 1.0)] = -1.0                   # strong reversal → widen significantly
+
+    # BE exits: SL was fine
+    # be_mask = outcome == 3 → stays 0.0 (KEEP)
+
+    return sl_label
+
+
+def _sl_eval(model, X_test, df_test, feat_names) -> dict[str, Any]:
+    """Simulate SL adjustment on OOS data. Compare adjusted vs original outcomes.
+
+    IMPORTANT (2026-04-17 fix): Previous version rescaled winning RRs
+    algebraically by `actual_rr[i] / mult`, which inflated PF purely by
+    changing the R-unit basis (tighter SL → smaller R → same $ profit
+    reads as bigger R-multiple). That produced +8 % PF claims that were
+    not driven by better SL placement. Fixed here: only change a trade's
+    outcome if the adjustment would have materially changed what happened
+    (stopped earlier / survived). RR stays in the original R-units.
+
+    Threshold mapping matches new label set
+    (TIGHTEN_SIG 1.0, TIGHTEN_SLI 0.5, KEEP 0, WIDEN_SLI -0.5, WIDEN_SIG -1.0).
+    """
+    predicted_sl = model.predict(X_test).astype(np.float64)
+
+    actual_rr = np.clip(df_test["label_rr"].values.astype(np.float64), -1.0, 20.0)
+    actual_mfe = df_test["label_max_favorable_rr"].values.astype(np.float64)
+    mae = df_test["label_mae_rr"].values.astype(np.float64) if "label_mae_rr" in df_test.columns else np.zeros(len(df_test), dtype=np.float64)
+    cost_rr = df_test["label_cost_rr"].values.astype(np.float64)
+    outcome = df_test["label_outcome"].values
+
+    n_trades = len(actual_rr)
+    if n_trades < 10:
+        return {"n_trades": n_trades, "original_pf": 0.0, "adjusted_pf": 0.0}
+
+    # Map predicted category to SL multiplier.
+    # Label set: TIGHTEN_SIG 1.0, TIGHTEN_SLI 0.5, KEEP 0, WIDEN_SLI -0.5, WIDEN_SIG -1.0
+    # Multipliers match the default runtime config (max_sl_tighten=0.5, max_sl_widen=0.3).
+    sl_mult = np.ones(n_trades, dtype=np.float64)
+    sl_mult[predicted_sl > 0.75]                              = 0.5   # TIGHTEN_SIG → SL × 0.5
+    sl_mult[(predicted_sl > 0.25) & (predicted_sl <= 0.75)]   = 0.7   # TIGHTEN_SLI → SL × 0.7
+    sl_mult[(predicted_sl < -0.25) & (predicted_sl >= -0.75)] = 1.15  # WIDEN_SLI   → SL × 1.15
+    sl_mult[predicted_sl < -0.75]                             = 1.3   # WIDEN_SIG   → SL × 1.3
+    # else: KEEP → SL × 1.0
+
+    # Simulate adjusted outcomes — outcome-changing only, NO algebraic rescaling.
+    adjusted_rr = actual_rr.copy()
+    for i in range(n_trades):
+        mult = sl_mult[i]
+        if abs(mult - 1.0) < 0.01:
+            continue  # KEEP — no change
+
+        if mult < 1.0:  # TIGHTEN
+            # New SL distance (in original-R units) = mult.
+            # If MAE reached/exceeded that, the trade would have been stopped out earlier.
+            if mae[i] > mult:
+                # Stopped out at tighter SL. Loss = -mult in original-R units (plus fees).
+                adjusted_rr[i] = -mult - cost_rr[i]
+            # else: trade survived the tighter SL; outcome stands unchanged.
+        else:  # WIDEN (mult > 1.0)
+            if outcome[i] == 2 and mae[i] < mult:
+                # Original was SL-hit at 1.0R, but MAE was below the wider SL.
+                # Trade would have survived — conservative estimate: exit at breakeven
+                # (minus fees). Don't fabricate wins; it reversed, we just delayed exit.
+                adjusted_rr[i] = -cost_rr[i]
+            # else: outcome unchanged (win stays a win, loss that breached wider SL still lost).
+
+    adjusted_rr = np.clip(adjusted_rr, -2.0, 20.0)
+
+    # Metrics
+    def _calc(rr):
+        sharpe = float(np.mean(rr) / max(np.std(rr), 1e-6))
+        wins = rr[rr > 0].sum()
+        losses = abs(rr[rr < 0].sum())
+        pf = float(wins / max(losses, 0.001))
+        wr = float((rr > 0).mean())
+        cumsum = np.cumsum(rr)
+        peak = np.maximum.accumulate(cumsum)
+        dd = float((cumsum - peak).min()) if len(cumsum) > 0 else 0.0
+        return sharpe, pf, wr, dd
+
+    o_sharpe, o_pf, o_wr, o_dd = _calc(actual_rr)
+    a_sharpe, a_pf, a_wr, a_dd = _calc(adjusted_rr)
+
+    n_tighten_sig = int((predicted_sl > 0.75).sum())
+    n_tighten_sli = int(((predicted_sl > 0.25) & (predicted_sl <= 0.75)).sum())
+    n_keep = int((np.abs(predicted_sl) <= 0.25).sum())
+    n_widen = int((predicted_sl < -0.25).sum())
+
+    logger.info("  [sl] Original: Sharpe=%.3f PF=%.2f WR=%.1f%% DD=%.1f | "
+                "Adjusted: Sharpe=%.3f PF=%.2f WR=%.1f%% DD=%.1f",
+                o_sharpe, o_pf, 100 * o_wr, o_dd,
+                a_sharpe, a_pf, 100 * a_wr, a_dd)
+    logger.info("  [sl] Predictions: %d tighten_sig, %d tighten_sli, %d keep, %d widen",
+                n_tighten_sig, n_tighten_sli, n_keep, n_widen)
+
+    return {
+        "n_trades": n_trades,
+        "original_sharpe": o_sharpe, "original_pf": o_pf, "original_wr": o_wr, "original_dd": o_dd,
+        "adjusted_sharpe": a_sharpe, "adjusted_pf": a_pf, "adjusted_wr": a_wr, "adjusted_dd": a_dd,
+        "sharpe_improvement": a_sharpe - o_sharpe,
+        "pf_improvement": a_pf - o_pf,
+        "n_tighten_sig": n_tighten_sig, "n_tighten_sli": n_tighten_sli,
+        "n_keep": n_keep, "n_widen": n_widen,
+    }
+
+
+def run_walk_forward_sl(classes: list[str] | None = None) -> list[dict]:
+    """Walk-forward validation for SL adjustment model."""
+    logger.info("=" * 70)
+    logger.info("SL ADJUSTMENT MODEL — Walk-Forward Validation")
+    logger.info("=" * 70)
+
+    results = _regression_walk_forward_skeleton(
+        classes, derive_optimal_sl_label, _sl_eval,
+        task_name="sl",
+        model_filename="rl_sl_adjuster.pkl",
+        results_filename="sl_results.json",
+    )
+
+    if results:
+        orig_pfs = [r.get("original_pf", 0) for r in results]
+        adj_pfs = [r.get("adjusted_pf", 0) for r in results]
+        orig_dds = [r.get("original_dd", 0) for r in results]
+        adj_dds = [r.get("adjusted_dd", 0) for r in results]
+        logger.info("=" * 70)
+        logger.info("[sl] AGGREGATE: Original PF=%.2f DD=%.1f | Adjusted PF=%.2f DD=%.1f",
+                    np.mean(orig_pfs), np.mean(orig_dds),
+                    np.mean(adj_pfs), np.mean(adj_dds))
+        pf_gate = np.mean(adj_pfs) > np.mean(orig_pfs)
+        dd_gate = np.mean(adj_dds) >= np.mean(orig_dds) * 1.20  # DD not >20% worse (less negative = better)
+        logger.info("[sl] GATE %s: adjusted_pf > original_pf AND dd not >20%% worse",
+                    "PASSED" if (pf_gate and dd_gate) else "FAILED")
+    return results
+
+
+# ===================================================================
 #  Exit Classifier Walk-Forward
 # ===================================================================
 
@@ -1338,6 +1543,26 @@ def run_walk_forward_exit(
         return {}
 
     episodes = pd.concat(all_frames, ignore_index=True)
+    del all_frames
+    gc.collect()
+
+    # Subsample if too large (>20M rows) to avoid OOM on 16GB MacBook
+    # Per-window proportional sampling to preserve temporal integrity
+    MAX_EXIT_ROWS = 20_000_000
+    if len(episodes) > MAX_EXIT_ROWS:
+        ratio = MAX_EXIT_ROWS / len(episodes)
+        logger.info("[exit] Subsampling %.0f%% (%d -> ~%d rows) per window to fit in memory",
+                    ratio * 100, len(episodes), MAX_EXIT_ROWS)
+        if "window" in episodes.columns:
+            sampled = []
+            for w, grp in episodes.groupby("window"):
+                n_sample = max(1, int(len(grp) * ratio))
+                sampled.append(grp.sample(n=min(n_sample, len(grp)), random_state=42))
+            episodes = pd.concat(sampled, ignore_index=True)
+            del sampled
+        else:
+            episodes = episodes.sample(frac=ratio, random_state=42).reset_index(drop=True)
+        gc.collect()
 
     # Require label_hold_better to be present and binary
     if "label_hold_better" not in episodes.columns:
@@ -1402,6 +1627,12 @@ def run_walk_forward_exit(
         ).astype(np.float32)
     else:
         trade_weights = np.ones(len(train_df), dtype=np.float32)
+
+    # Drop non-numeric columns before feature prep
+    _drop_cols = [c for c in ("_trade_group", "symbol", "asset_class", "direction", "outcome") if c in train_df.columns]
+    if _drop_cols:
+        train_df = train_df.drop(columns=_drop_cols)
+        test_df = test_df.drop(columns=[c for c in _drop_cols if c in test_df.columns])
 
     # Prepare features and labels
     X_train, feat_cols = prepare_features(train_df, task="early_exit")
@@ -1755,6 +1986,15 @@ class RLBrainSuite:
             exit_cfg.get("model_path", "models/rl_exit_classifier.pkl")
         ) if self.exit_enabled else None
 
+        # SL adjuster
+        sl_cfg = rl_cfg.get("sl_adjuster", {})
+        self.sl_enabled = sl_cfg.get("enabled", False)
+        self._sl_max_tighten = sl_cfg.get("max_sl_tighten", 0.5)
+        self._sl_max_widen = sl_cfg.get("max_sl_widen", 0.3)
+        self._sl_model = self._load_model(
+            sl_cfg.get("model_path", "models/rl_sl_adjuster.pkl")
+        ) if self.sl_enabled else None
+
         # Position sizer
         ps_cfg = rl_cfg.get("position_sizer", {})
         self.sizing_enabled = ps_cfg.get("enabled", False)
@@ -1769,6 +2009,7 @@ class RLBrainSuite:
         if self._entry_filter: active.append("entry_filter")
         if self._tp_model: active.append("tp_optimizer")
         if self._be_model: active.append("be_manager")
+        if self._sl_model: active.append("sl_adjuster")
         if self._exit_model: active.append("exit_classifier")
         if self._sizing_model: active.append("position_sizer")
         logger.info("RLBrainSuite initialized: %s", active if active else "no models loaded")
@@ -1778,6 +2019,7 @@ class RLBrainSuite:
             "entry_filter": ef_cfg.get("model_path", "models/rl_entry_filter.pkl"),
             "tp_optimizer": tp_cfg.get("model_path", "models/rl_tp_optimizer.pkl"),
             "be_manager": be_cfg.get("model_path", "models/rl_be_manager.pkl"),
+            "sl_adjuster": sl_cfg.get("model_path", "models/rl_sl_adjuster.pkl"),
             "exit_classifier": exit_cfg.get("model_path", "models/rl_exit_classifier.pkl"),
             "position_sizer": ps_cfg.get("model_path", "models/rl_position_sizer.pkl"),
         }
@@ -1827,6 +2069,7 @@ class RLBrainSuite:
             "entry_filter": "_entry_filter",
             "tp_optimizer": "_tp_model",
             "be_manager": "_be_model",
+            "sl_adjuster": "_sl_model",
             "exit_classifier": "_exit_model",
             "position_sizer": "_sizing_model",
         }
@@ -2037,6 +2280,42 @@ class RLBrainSuite:
 
         return min(predicted_be, 3.0)  # cap at 3R
 
+    def predict_sl_adjustment(
+        self, features: dict[str, float], planned_sl_dist: float, entry_price: float,
+    ) -> float:
+        """Predict adjusted SL distance. Returns adjusted distance (not price).
+
+        Label set (after 2026-04-17 fix): TIGHTEN_SIG / TIGHTEN_SLI / KEEP /
+        WIDEN_SLI / WIDEN_SIG. Buckets decoded from the regressor output.
+
+        Runtime multipliers derived from config (max_sl_tighten, max_sl_widen)
+        so that bug_019 ("hardcoded 0.5/0.7/1.3") stays fixed even if the label
+        set changes.
+        """
+        if not self.enabled or self._sl_model is None:
+            return planned_sl_dist
+        if planned_sl_dist <= 0 or entry_price <= 0:
+            return planned_sl_dist
+
+        x = self._build_features(features, self._sl_model)
+        predicted = float(self._sl_model["model"].predict(x)[0])
+
+        if predicted > 0.75:
+            mult = 1.0 - self._sl_max_tighten                 # TIGHTEN_SIG (default 0.5)
+        elif predicted > 0.25:
+            mult = 1.0 - self._sl_max_tighten * 0.6           # TIGHTEN_SLI (default 0.7)
+        elif predicted < -0.75:
+            mult = 1.0 + self._sl_max_widen                   # WIDEN_SIG  (default 1.3)
+        elif predicted < -0.25:
+            mult = 1.0 + self._sl_max_widen * 0.5             # WIDEN_SLI  (default 1.15)
+        else:
+            return planned_sl_dist  # KEEP
+
+        adjusted = planned_sl_dist * mult
+        # Safety: never tighter than 0.1% of entry price
+        min_sl = entry_price * 0.001
+        return max(adjusted, min_sl)
+
     def predict_sizing_multiplier(self, features: dict[str, float]) -> float:
         """Predict risk multiplier for position sizing.
 
@@ -2109,7 +2388,7 @@ def main():
                         choices=ALL_CLASSES,
                         help="Asset class to hold out (default: commodities)")
     parser.add_argument("--task", choices=["binary", "direction", "entry_quality",
-                                          "sizing", "tp", "be", "all_regression",
+                                          "sizing", "tp", "be", "sl", "all_regression",
                                           "exit"],
                         default="entry_quality",
                         help="Prediction task (default: entry_quality)")
@@ -2130,6 +2409,8 @@ def main():
             run_walk_forward_tp(classes=args.classes)
         elif args.task == "be":
             run_walk_forward_be(classes=args.classes)
+        elif args.task == "sl":
+            run_walk_forward_sl(classes=args.classes)
         elif args.task == "exit":
             run_walk_forward_exit(classes=args.classes)
         elif args.task == "all_regression":

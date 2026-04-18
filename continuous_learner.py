@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import math
@@ -58,7 +59,17 @@ ALL_CLASSES = ["crypto", "forex", "stocks", "commodities"]
 FEEDBACK_PATH = Path("live_results/teacher_feedback.jsonl")
 
 DEFAULT_GRADE_WEIGHTS: dict[str, float] = {
-    "A+": 1.5, "A": 1.5, "B+": 1.0, "B": 1.0, "C": 1.0, "D": 1.5,
+    # Base grade trust level. Combined with outcome multipliers + D-loss boost
+    # downstream to produce the final sample weight.
+    # Design rationale (2026-04-17 tuning):
+    #   Old design used D=1.5 (same as A+) to "learn from bad trades harder".
+    #   Problem: that boosted D+WIN samples too — lucky wins on poor setups
+    #   got the same weight as confirmed A+ wins. The model then learned to
+    #   chase bad patterns.
+    #   New design: D base is LOW (0.5), but D+LOSS gets a post-hoc boost
+    #   in the weight loop so "reject bad-grade mistakes" intent is preserved
+    #   without "chase lucky bad-grade wins."
+    "A+": 1.5, "A": 1.5, "B+": 1.0, "B": 1.0, "C": 0.8, "D": 0.5,
 }
 
 
@@ -95,9 +106,15 @@ def collect_live_data(
                     try:
                         rec = json.loads(line)
                         tid = rec.get("trade_id", "")
-                        grade = rec.get("analysis", {}).get("grade", "")
-                        if tid and grade:
-                            grade_lookup[tid] = grade
+                        # live_teacher writes under "teacher" key; legacy records
+                        # may still use "analysis" — check both.
+                        grade = (
+                            rec.get("teacher", {}).get("grade")
+                            or rec.get("analysis", {}).get("grade")
+                            or ""
+                        )
+                        if tid and grade and grade != "N/A":
+                            grade_lookup[str(tid)] = grade
                     except json.JSONDecodeError:
                         continue
             logger.info("Loaded %d teacher grades from %s", len(grade_lookup), feedback_path)
@@ -174,11 +191,13 @@ def collect_live_data(
     # ── Sample weights ───────────────────────────────────────────
     weights = np.full(len(df), 2.0, dtype=np.float64)  # live 2x base
 
-    for i, tid in enumerate(df["trade_id"]):
-        grade = grade_lookup.get(tid, "")
+    # Track per-row grade (needed for outcome-conditional boost below)
+    trade_grades = [grade_lookup.get(tid, "") for tid in df["trade_id"]]
+
+    for i, grade in enumerate(trade_grades):
         weights[i] *= grade_weights.get(grade, 1.0)
 
-    # tp_achievement-based weighting (MFE / TP_distance)
+    # tp_achievement-based weighting (MFE / TP_distance) + grade×outcome conditional
     if "rr_actual" in df.columns and "max_favorable_pct" in df.columns:
         rr_actual = df["rr_actual"].abs().values
         mfe = df["max_favorable_pct"].abs().values
@@ -193,6 +212,7 @@ def collect_live_data(
             er = exit_reason[i] if i < len(exit_reason) else ""
             tpa = tp_achievement[i]
             rr = rr_actual[i]
+            grade = trade_grades[i]
 
             # Sanity: tp_hit must be win, sl_hit must be loss — fix mislabeled journal rows
             if er == "tp_hit" and outcome[i] == 0:
@@ -219,8 +239,15 @@ def collect_live_data(
             elif "be" in str(er):
                 weights[i] *= 0.3 if tpa >= 0.30 else 0.1
 
-    # Cap combined weights
-    weights = np.clip(weights, 0.1, 6.0)
+            # D-grade loss boost: recover the "learn from bad-grade mistakes" intent
+            # without boosting D-grade lucky wins. Multiplier 3.0 ≈ restoring the old
+            # D=1.5 base weight for this specific slice (new D=0.5 × 3.0 = 1.5).
+            if grade == "D" and outcome[i] == 0:
+                weights[i] *= 3.0
+
+    # Cap combined weights — raised from 6.0 to 10.0 so large RR winners keep their
+    # signal strength. With grade=1.5 × base=2.0 × rr=3.3 already hits old cap.
+    weights = np.clip(weights, 0.1, 10.0)
 
     df["sample_weight"] = weights
 
@@ -355,6 +382,153 @@ def collect_counterfactual_data(
     return df
 
 
+# ───────────────────────────────────────────────────────────────────
+#  Focal counterfactual collector (missed-wins only, style-matched)
+# ───────────────────────────────────────────────────────────────────
+
+# style_id mapping in entry_features (see live_multi_bot.py:2428)
+_STYLE_ID_TO_HORIZON = {
+    0.0: ("scalp", "outcome_scalp"),
+    0.5: ("day",   "outcome_day"),
+    1.0: ("swing", "outcome_swing"),
+}
+
+
+def collect_counterfactual_focal_wins(db_path: str) -> pd.DataFrame:
+    """Focal-loss counterfactual collector: ONLY missed wins, style-matched.
+
+    Philosophy: the entry model only learns from its mistakes. Rejected
+    signals that turned into real TP hits ARE mistakes — the model should
+    have accepted them. Losses and timeouts are confirmations or noise and
+    don't teach the model anything new.
+
+    Design choices:
+      1. Query the journal ONCE for all rejected signals with populated features
+      2. For each row, parse style_id from entry_features (0.0=scalp, 0.5=day, 1.0=swing)
+      3. Look up the style-matching outcome column (avoids multi-horizon duplication)
+      4. Keep only rows where outcome == "win" (real TP hit, no MFE heuristic)
+      5. Label = 1, weight = 1.0 (same as live trades — missed wins are as important)
+      6. Dedup by (symbol, direction, 30-min window) to prevent repeat-signal bias
+
+    Why not also include losses/timeouts?
+      - Losses: model was right to reject, confirmation has low info value
+      - Timeouts: neither TP nor SL hit, ambiguous — MFE heuristic was noisy
+      - Backtest + live trades already cover these directions
+      - Focal loss says: weight mistakes, ignore confirmations
+
+    Returns a DataFrame with label=1 on all rows, weight=1.0, matching
+    ENTRY_QUALITY_FEATURES schema.
+    """
+    if not Path(db_path).exists():
+        return pd.DataFrame()
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT id, timestamp, symbol, direction, entry_price, sl_price, tp_price, "
+            "entry_features, xgb_confidence, "
+            "outcome_scalp, outcome_day, outcome_swing "
+            "FROM rejected_signals "
+            "WHERE entry_features IS NOT NULL "
+            "  AND entry_features != '{}' "
+            "ORDER BY timestamp ASC"
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error as exc:
+        logger.error("Focal counterfactual query failed: %s", exc)
+        return pd.DataFrame()
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not rows:
+        logger.info("focal_cf: no rejected_signals with features")
+        return pd.DataFrame()
+
+    # ── Per-row: parse style, look up matching outcome, keep only wins ──
+    feat_names = list(ENTRY_QUALITY_FEATURES)
+    candidates: list[dict[str, Any]] = []
+    n_scanned = 0
+    n_wins_by_style = {"scalp": 0, "day": 0, "swing": 0, "unknown": 0}
+    for row in rows:
+        n_scanned += 1
+        try:
+            feats = json.loads(row["entry_features"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Determine style from features (fallback: day if missing/unknown)
+        style_id_raw = feats.get("style_id", 0.5)
+        try:
+            style_id = float(style_id_raw)
+        except (TypeError, ValueError):
+            style_id = 0.5
+        # Round to nearest known style_id to survive float comparisons
+        style_id_nearest = min(
+            _STYLE_ID_TO_HORIZON.keys(),
+            key=lambda k: abs(k - style_id),
+        )
+        style_name, outcome_col = _STYLE_ID_TO_HORIZON[style_id_nearest]
+
+        # Look up the style-matching outcome (only one per signal — no duplication)
+        outcome = row[outcome_col]
+        if outcome != "win":
+            continue  # skip: loss, timeout, or not-yet-filled
+
+        # Verify all features present
+        missing = [f for f in feat_names if f not in feats]
+        if missing:
+            continue
+
+        record: dict[str, Any] = {f: feats[f] for f in feat_names}
+        record["label"] = 1  # missed win → model should have accepted
+        record["sample_weight"] = 1.0  # equal to live trades — critical learning signal
+        record["_style"] = style_name
+        record["_signal_ts"] = row["timestamp"]
+        record["_symbol"] = row["symbol"]
+        record["_direction"] = row["direction"]
+        candidates.append(record)
+        n_wins_by_style[style_name] = n_wins_by_style.get(style_name, 0) + 1
+
+    if not candidates:
+        logger.info("focal_cf: scanned %d rows, 0 missed wins found (model has no acceptance mistakes yet)", n_scanned)
+        return pd.DataFrame()
+
+    # ── Dedup: one sample per (symbol, direction, 30-min window) ──
+    # Prevents the same rejected setup from being counted multiple times
+    # when it keeps triggering over consecutive bars.
+    deduped: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], str] = {}
+    for rec in candidates:
+        key = (rec["_symbol"], rec["_direction"])
+        ts_str = rec["_signal_ts"]
+        last_ts = seen.get(key)
+        if last_ts:
+            try:
+                t_cur = datetime.fromisoformat(ts_str)
+                t_last = datetime.fromisoformat(last_ts)
+                if abs((t_cur - t_last).total_seconds()) < 1800:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        seen[key] = ts_str
+        # Strip metadata columns
+        clean = {k: v for k, v in rec.items() if not k.startswith("_")}
+        deduped.append(clean)
+
+    df = pd.DataFrame(deduped)
+    logger.info(
+        "focal_cf: scanned %d rows → %d missed wins by style %s → %d after dedup",
+        n_scanned,
+        len(candidates),
+        dict((k, v) for k, v in n_wins_by_style.items() if v > 0),
+        len(df),
+    )
+    return df
+
+
 # ===================================================================
 #  2. Load subsampled backtest data
 # ===================================================================
@@ -388,6 +562,22 @@ def load_backtest_data(
             logger.warning("No label_outcome in %s, skipping", parquet_path)
             continue
 
+        # bug_005 fix (2026-04-17): schema version / column-presence check.
+        # Primary gate: the parquet must contain all ENTRY_QUALITY_FEATURES
+        # (41 features). Silent zero-fill is still allowed for a SMALL number
+        # of missing features (graceful handling of minor schema evolution),
+        # but >5 missing columns means the parquet is schema-incompatible and
+        # we refuse to train on it. Metadata SCHEMA_VERSION marker is optional
+        # and only meaningful for parquets regenerated after this version.
+        missing = [f for f in feat_names if f not in raw.columns]
+        if len(missing) > 5:
+            logger.error("%s SCHEMA DRIFT: %d/%d features missing (>%d threshold) — "
+                         "skipping. Regenerate via `python3 -m backtest.generate_rl_data --class %s`. "
+                         "Missing: %s",
+                         parquet_path, len(missing), len(feat_names), 5, cls,
+                         missing[:10] + (["..."] if len(missing) > 10 else []))
+            continue
+
         # Stratified subsample
         if len(raw) > subsample_per_class:
             pos = raw[raw["label_outcome"] == 1]
@@ -400,15 +590,12 @@ def load_backtest_data(
             raw = pd.concat([pos_sample, neg_sample], ignore_index=True)
             logger.info("Subsampled %s to %d rows (stratified)", cls, len(raw))
 
-        # Extract the 41 features
-        available = [f for f in feat_names if f in raw.columns]
-        missing = [f for f in feat_names if f not in raw.columns]
-
         if missing:
-            # Fill missing features with 0
+            # Minor drift (<=5 missing) — fill with 0 + warning
             for m in missing:
                 raw[m] = 0.0
-            logger.warning("%s missing features filled with 0: %s", cls, missing)
+            logger.warning("%s minor schema drift — %d feature(s) filled with 0: %s",
+                           cls, len(missing), missing)
 
         subset = raw[feat_names].copy()
         subset["label"] = (raw["label_outcome"] == 1).astype(np.int32)
@@ -478,15 +665,22 @@ def retrain_if_ready(config: dict) -> bool:
     backtest_df = load_backtest_data(subsample_per_class=subsample_per_class)
 
     # ── Load counterfactual data from rejected signals ───────────
-    # Use all 3 horizons: scalp (6h), day (24h), swing (5d).
-    # Each horizon gives independent signal — a reject might be loss at 6h but win at 24h.
-    # Deduplicated per horizon so same signal appears max 3× with potentially different labels.
-    cf_frames = []
-    for hz in ("scalp", "day", "swing"):
-        cf = collect_counterfactual_data(db_path, horizon=hz)
-        if len(cf) > 0:
-            cf_frames.append(cf)
-    counterfactual_df = pd.concat(cf_frames, ignore_index=True) if cf_frames else pd.DataFrame()
+    # Mode selection:
+    #   "focal" (default): only missed wins, style-matched, weight=1.0
+    #     → model learns "take these, you missed them" — pure correction signal
+    #     → no multi-horizon duplication, no MFE heuristic noise
+    #   "all_horizons": legacy — all 3 horizons concatenated, weight=0.3
+    #     → same signal may appear up to 3×, losses/timeouts included
+    cf_mode = cl_cfg.get("counterfactual_mode", "focal")
+    if cf_mode == "focal":
+        counterfactual_df = collect_counterfactual_focal_wins(db_path)
+    else:
+        cf_frames = []
+        for hz in ("scalp", "day", "swing"):
+            cf = collect_counterfactual_data(db_path, horizon=hz)
+            if len(cf) > 0:
+                cf_frames.append(cf)
+        counterfactual_df = pd.concat(cf_frames, ignore_index=True) if cf_frames else pd.DataFrame()
 
     # ── Walk-forward split: last 30% of live = validation ────────
     feat_names = list(ENTRY_QUALITY_FEATURES)
@@ -666,6 +860,307 @@ def retrain_if_ready(config: dict) -> bool:
 
 
 # ===================================================================
+#  3b. Retrain exit models (TP, SL, BE) from live trade outcomes
+# ===================================================================
+
+def retrain_exit_models_if_ready(config: dict) -> dict[str, bool]:
+    """Retrain TP/SL/BE models from live trade data + backtest data.
+
+    Returns dict of {model_name: retrained_bool}.
+    These models use ENTRY features to predict EXIT outcomes:
+    - TP: predict max favorable excursion (MFE) → optimize TP distance
+    - SL: predict optimal SL category (tighten/keep/widen) from MAE
+    - BE: predict optimal BE trigger level from outcome + MFE
+    """
+    import xgboost as xgb
+
+    cl_cfg = config.get("continuous_learner", {})
+    journal_cfg = config.get("journal", {})
+    db_path = journal_cfg.get("db_path", "trade_journal/journal.db")
+    min_trades = cl_cfg.get("min_trades_for_retrain", 50)
+    subsample_per_class = cl_cfg.get("backtest_subsample_per_class", 50_000)
+
+    results: dict[str, bool] = {"tp": False, "sl": False, "be": False}
+
+    # ── Memory guard ─────────────────────────────────────────────
+    try:
+        import psutil
+        if psutil.virtual_memory().percent > 80:
+            logger.warning("Memory > 80%%, skipping exit model retrain")
+            return results
+    except ImportError:
+        pass
+
+    # ── Collect live trade outcomes from journal ─────────────────
+    if not Path(db_path).exists():
+        return results
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT entry_features, outcome, exit_reason, pnl_pct, rr_actual, rr_target, "
+            "max_favorable_pct, max_adverse_pct, asset_class, entry_price, sl_original "
+            "FROM trades WHERE exit_time IS NOT NULL AND entry_features IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        logger.error("Exit model retrain: DB query failed: %s", exc)
+        return results
+    finally:
+        if conn:
+            conn.close()
+
+    if len(rows) < min_trades:
+        logger.info("Only %d closed trades with features (need %d), skipping exit retrain",
+                    len(rows), min_trades)
+        return results
+
+    # ── Build DataFrame from live trades ─────────────────────────
+    feat_names = list(ENTRY_QUALITY_FEATURES)
+    live_rows = []
+
+    for row in rows:
+        features_json, outcome, exit_reason, pnl_pct, rr_actual, rr_target, mfe_pct, mae_pct, ac, entry_price, sl_original = row
+        try:
+            feats = json.loads(features_json) if isinstance(features_json, str) else {}
+        except json.JSONDecodeError:
+            continue
+
+        # Map outcome to numeric: 1=win, 2=loss, 3=breakeven
+        outcome_num = {"win": 1, "loss": 2, "breakeven": 3}.get(outcome, 0)
+        if outcome_num == 0:
+            continue
+
+        # Map exit_reason to mechanism: 1=tp, 2=sl, 3=be, 4=timeout
+        exit_mech = {"tp_hit": 1, "sl_hit": 2, "be_hit": 3, "timeout": 4}.get(exit_reason, 4)
+
+        planned_tp_rr = rr_target or 3.0
+        actual_rr = rr_actual or 0.0
+
+        # Convert MFE/MAE from pct to R-multiples using exact SL distance from journal
+        sl_pct = abs(sl_original - entry_price) / entry_price if entry_price and sl_original else 0.0
+        if sl_pct > 0.00005:  # minimum viable sl_pct (0.005%)
+            mfe_rr = min((mfe_pct or 0.0) / sl_pct, 20.0)
+            mae_rr = min((mae_pct or 0.0) / sl_pct, 5.0)
+        else:
+            mfe_rr = 0.0
+            mae_rr = 0.0
+
+        entry = {fn: feats.get(fn, 0.0) for fn in feat_names}
+        entry["label_outcome"] = outcome_num
+        entry["label_exit_mechanism"] = exit_mech
+        entry["label_rr"] = actual_rr
+        entry["label_tp_rr"] = planned_tp_rr
+        entry["label_max_favorable_rr"] = max(mfe_rr, 0.0)
+        entry["label_mae_rr"] = max(mae_rr, 0.0)
+        entry["label_cost_rr"] = 0.01  # approximate
+        # bug_004 fix (2026-04-17): live trades have no post-TP tracking yet
+        # (Exit-Model-Suite roadmap). Previously we emitted NaN here which, via
+        # _tp_labels fallback, propagated as MFE-capped values anyway. We now
+        # write the MFE directly so the retrain pipeline doesn't silently swallow
+        # NaN rows.
+        # KNOWN LIMITATION: for live TP-hits, MFE is capped at the TP level, so
+        # the resulting post_tp_max_rr reads as "MFE = TP exactly" while backtest
+        # TP-hits capture the actual post-exit excursion. This biases the TP
+        # model toward treating TP-level as a ceiling for live-like setups. The
+        # full fix requires Post-TP live tracking (see .omc/plans/exit-model-suite.md).
+        entry["label_post_tp_max_rr"] = max(mfe_rr, 0.0)
+        entry["label_post_tp_reversal_rr"] = 0.0  # no reversal observed ≠ NaN
+        entry["sample_weight"] = 2.0  # live trades weighted 2x vs backtest (matches entry filter)
+        entry["asset_class"] = ac or "unknown"
+        live_rows.append(entry)
+
+    if not live_rows:
+        return results
+
+    live_df = pd.DataFrame(live_rows)
+    logger.info("Exit model retrain: %d live trades with features", len(live_df))
+
+    # ── Load backtest data for blending ──────────────────────────
+    # bug_005 fix (2026-04-17): schema-drift check before concat. If a parquet
+    # is missing required label columns (rather than just features), the
+    # downstream label_fn will produce NaN labels and poison training.
+    _required_exit_cols = {
+        "label_outcome", "label_action", "label_mae_rr", "label_max_favorable_rr",
+        "label_rr", "label_tp_rr", "label_cost_rr", "label_exit_mechanism",
+    }
+    backtest_frames = []
+    for ac in ALL_CLASSES:
+        path = DATA_DIR / f"{ac}_samples.parquet"
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            logger.error("Exit retrain: failed to read %s: %s — skipping", path, exc)
+            continue
+        missing_cols = _required_exit_cols - set(df.columns)
+        if missing_cols:
+            logger.error("Exit retrain: %s SCHEMA DRIFT — missing label columns %s, "
+                         "skipping (regenerate with generate_rl_data)",
+                         path, sorted(missing_cols))
+            continue
+        missing_feats = [f for f in ENTRY_QUALITY_FEATURES if f not in df.columns]
+        if len(missing_feats) > 5:
+            logger.error("Exit retrain: %s SCHEMA DRIFT — %d/%d features missing, skipping",
+                         path, len(missing_feats), len(ENTRY_QUALITY_FEATURES))
+            continue
+        entries = df[df["label_action"] > 0]
+        if len(entries) > subsample_per_class:
+            entries = entries.sample(n=subsample_per_class, random_state=42)
+        entries = entries.copy()
+        entries["sample_weight"] = 1.0
+        entries["asset_class"] = ac
+        backtest_frames.append(entries)
+
+    if not backtest_frames:
+        logger.warning("No backtest data for exit model blending")
+        return results
+
+    backtest_df = pd.concat(backtest_frames, ignore_index=True)
+    del backtest_frames
+    gc.collect()
+
+    # ── Stratified 80/20 split BEFORE concat (bug_002 fix) ──────
+    # Old code concatenated then split temporally → live trades (always
+    # "newest") landed entirely in test set, so their sample_weight=2.0
+    # boost never influenced training. Here we split each source
+    # independently so both train + test contain live signal.
+    logger.info("Exit model retrain: backtest=%d, live=%d samples", len(backtest_df), len(live_df))
+
+    # Sort each by its own temporal key
+    if "timestamp" in backtest_df.columns:
+        backtest_df = backtest_df.sort_values("timestamp").reset_index(drop=True)
+    elif "window" in backtest_df.columns:
+        backtest_df = backtest_df.sort_values("window").reset_index(drop=True)
+    # live_df is already appended in journal insertion order
+
+    bt_split = int(len(backtest_df) * 0.8)
+    live_split = int(len(live_df) * 0.8)
+
+    train_df = pd.concat(
+        [backtest_df.iloc[:bt_split], live_df.iloc[:live_split]],
+        ignore_index=True,
+    )
+    test_df = pd.concat(
+        [backtest_df.iloc[bt_split:], live_df.iloc[live_split:]],
+        ignore_index=True,
+    )
+    del backtest_df, live_df
+    gc.collect()
+
+    logger.info("Exit model retrain: train=%d, test=%d samples (live mixed into both)",
+                len(train_df), len(test_df))
+
+    # ── Retrain each exit model ──────────────────────────────────
+    from rl_brain_v2 import (
+        _tp_labels, _tp_eval,
+        derive_optimal_be_label, _be_eval,
+        derive_optimal_sl_label, _sl_eval,
+        prepare_features, META_COLS,
+    )
+
+    for task_name, label_fn, eval_fn, model_filename in [
+        ("tp", _tp_labels, _tp_eval, "rl_tp_optimizer.pkl"),
+        ("be", derive_optimal_be_label, _be_eval, "rl_be_manager.pkl"),
+        ("sl", derive_optimal_sl_label, _sl_eval, "rl_sl_adjuster.pkl"),
+    ]:
+        try:
+            logger.info("[exit_retrain] Training %s model...", task_name)
+
+            # Prepare features using canonical pipeline (clipping, asset_class_id, style_id).
+            # task="entry_quality" excludes `has_entry_zone` (schema v3) — exit models are
+            # trained on the same feature set as the entry filter for consistency (bug_007).
+            X_train, feat_cols = prepare_features(train_df, task="entry_quality")
+            X_test, _ = prepare_features(test_df, task="entry_quality")
+
+            y_train = label_fn(train_df)
+            y_test = label_fn(test_df)
+            w_train = train_df["sample_weight"].values.astype(np.float64)
+
+            model = xgb.XGBRegressor(
+                n_estimators=500, max_depth=6, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8,
+                min_child_weight=10, gamma=0.1,
+                reg_alpha=0.1, reg_lambda=1.0,
+                eval_metric="rmse", early_stopping_rounds=30,
+                n_jobs=2, random_state=42, tree_method="hist",
+            )
+            model.fit(X_train, y_train, eval_set=[(X_test, y_test)],
+                      sample_weight=w_train, verbose=False)
+
+            logger.info("[exit_retrain] %s trained: %d trees", task_name, model.best_iteration + 1)
+
+            # Evaluate
+            eval_result = eval_fn(model, X_test, test_df, feat_cols)
+            logger.info("[exit_retrain] %s eval: %s",
+                        task_name, {k: round(v, 4) if isinstance(v, float) else v
+                                    for k, v in eval_result.items() if not isinstance(v, (dict, list))})
+
+            # Gate check
+            # NOTE: DD values are always <= 0 (sum of negative drawdowns). "greater" means
+            # "less negative" = shallower drawdown = better. Same semantic as BE-Gate below.
+            # bug_001 (2026-04-17): SL gate was PF-only — a model with +0.1 PF but 2× worse
+            # DD could pass. Now SL requires BOTH pf AND dd to improve, analog to BE.
+            # TP gate stays PF-only intentionally: _tp_eval returns no DD metric.
+            gate_passed = False
+            gate_reason = ""
+            if task_name == "tp":
+                pf_ok = eval_result.get("adjusted_pf", 0) > eval_result.get("original_pf", 0)
+                gate_passed = pf_ok
+                gate_reason = f"pf {eval_result.get('adjusted_pf',0):.3f} vs {eval_result.get('original_pf',0):.3f} (PF-only: _tp_eval has no DD)"
+            elif task_name == "be":
+                dd_ok = eval_result.get("model_be_dd", 0) > eval_result.get("no_be_dd", 0)
+                pf_ok = eval_result.get("model_be_pf", 0) >= 0.9 * eval_result.get("no_be_pf", 0)
+                gate_passed = dd_ok and pf_ok
+                gate_reason = f"dd_ok={dd_ok} pf_ok={pf_ok}"
+            elif task_name == "sl":
+                pf_ok = eval_result.get("adjusted_pf", 0) > eval_result.get("original_pf", 0)
+                dd_ok = eval_result.get("adjusted_dd", 0) > eval_result.get("original_dd", 0)
+                gate_passed = pf_ok and dd_ok
+                gate_reason = (
+                    f"pf_ok={pf_ok} (adj={eval_result.get('adjusted_pf',0):.3f} vs "
+                    f"orig={eval_result.get('original_pf',0):.3f}) "
+                    f"dd_ok={dd_ok} (adj={eval_result.get('adjusted_dd',0):.1f} vs "
+                    f"orig={eval_result.get('original_dd',0):.1f})"
+                )
+
+            if not gate_passed:
+                logger.info("[exit_retrain] %s gate FAILED, keeping existing model (%s)",
+                            task_name, gate_reason)
+                continue
+            logger.info("[exit_retrain] %s gate passed: %s", task_name, gate_reason)
+
+            # Save with backup
+            model_path = MODEL_DIR / model_filename
+            backup_path = MODEL_DIR / model_filename.replace(".pkl", "_prev.pkl")
+            if model_path.exists():
+                shutil.copy2(str(model_path), str(backup_path))
+
+            model_data = {
+                "model": model,
+                "feat_names": feat_cols,
+                "task": task_name,
+                "schema_version": SCHEMA_VERSION,
+                "dead_features": list(DEAD_FEATURES),
+                "clip_ranges": CLIP_RANGES,
+                "asset_class_map": ASSET_CLASS_MAP,
+            }
+            tmp = model_path.with_suffix(".pkl.tmp")
+            with open(tmp, "wb") as f:
+                pickle.dump(model_data, f)
+            os.rename(str(tmp), str(model_path))
+
+            results[task_name] = True
+            logger.info("[exit_retrain] %s SAVED: %s (gate passed)", task_name, model_path)
+
+        except Exception:
+            logger.exception("[exit_retrain] %s training failed", task_name)
+
+    return results
+
+
+# ===================================================================
 #  4. Auto-rollback check
 # ===================================================================
 
@@ -762,6 +1257,7 @@ def manual_rollback(slot_name: str = "entry_filter") -> bool:
         "entry_filter": "rl_entry_filter",
         "tp_optimizer": "rl_tp_optimizer",
         "be_manager": "rl_be_manager",
+        "sl_adjuster": "rl_sl_adjuster",
         "exit_classifier": "rl_exit_classifier",
     }
     base_name = slot_map.get(slot_name)
@@ -844,9 +1340,20 @@ async def run_continuous_learner(
         try:
             retrained = await loop.run_in_executor(None, retrain_if_ready, config)
             if retrained:
-                logger.info("Continuous learner: retrain succeeded")
+                logger.info("Continuous learner: entry filter retrain succeeded")
         except Exception:
-            logger.exception("Continuous learner: retrain failed")
+            logger.exception("Continuous learner: entry filter retrain failed")
+
+        # Retrain exit models (TP, SL, BE) from live trade outcomes
+        try:
+            exit_results = await loop.run_in_executor(
+                None, retrain_exit_models_if_ready, config,
+            )
+            retrained_models = [k for k, v in exit_results.items() if v]
+            if retrained_models:
+                logger.info("Continuous learner: exit models retrained: %s", retrained_models)
+        except Exception:
+            logger.exception("Continuous learner: exit model retrain failed")
 
         try:
             rolled_back = await loop.run_in_executor(

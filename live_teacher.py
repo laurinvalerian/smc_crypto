@@ -57,9 +57,11 @@ def analyze_closed_trade(
     dict
         Teacher feedback dict with ``actual`` and ``teacher`` sub-dicts.
     """
-    entry_price = trade.get("entry_price", 0.0)
-    sl_price = trade.get("sl", 0.0)
-    tp_price = trade.get("tp", 0.0)
+    # Live bot's trade dict stores the fill price under "entry";
+    # older/tests may use "entry_price". Accept both.
+    entry_price = float(trade.get("entry_price") or trade.get("entry") or 0.0)
+    sl_price = float(trade.get("sl", 0.0) or 0.0)
+    tp_price = float(trade.get("tp", 0.0) or 0.0)
     direction = trade.get("direction", "long")
 
     # Degraded result returned when analysis cannot complete.
@@ -122,12 +124,25 @@ def analyze_closed_trade(
         n = len(df)
 
         # ── 3. Locate entry candle ────────────────────────────────
+        # DataFrame "timestamp" column is Unix-ms (CCXT/OANDA fetch_ohlcv format).
+        # trade["entry_time"] is a timezone-aware datetime when written by the live runner,
+        # but may be numeric if called from tests or replay. Normalize both to ms.
         entry_time = trade.get("entry_time")
+        entry_idx: int | None = None
         if entry_time is not None and "timestamp" in df.columns:
-            ts_series = pd.to_numeric(df["timestamp"], errors="coerce")
-            entry_ts = float(entry_time) if not isinstance(entry_time, (int, float)) else entry_time
-            entry_idx = int((ts_series - entry_ts).abs().idxmin())
-        else:
+            try:
+                if isinstance(entry_time, datetime):
+                    entry_ts = entry_time.timestamp() * 1000.0
+                elif isinstance(entry_time, (int, float)):
+                    # Auto-detect seconds vs ms (1e11 ≈ year 5138 → anything above is ms)
+                    entry_ts = float(entry_time) if entry_time > 1e11 else float(entry_time) * 1000.0
+                else:
+                    entry_ts = pd.to_datetime(entry_time, utc=True).timestamp() * 1000.0
+                ts_series = pd.to_numeric(df["timestamp"], errors="coerce")
+                entry_idx = int((ts_series - entry_ts).abs().idxmin())
+            except (TypeError, ValueError) as exc:
+                logger.debug("Teacher: entry_time %r not convertible (%s), using price fallback", entry_time, exc)
+        if entry_idx is None:
             # Fallback: find candle closest to entry_price
             entry_idx = int((df["close"] - entry_price).abs().idxmin())
 

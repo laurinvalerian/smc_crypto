@@ -50,6 +50,11 @@ live_results/
 paper_grid_results/
 !paper_grid_results/.gitkeep
 
+# Snapshots and analysis output (large, regenerable)
+snapshots/
+hybrid_results/
+replay_results/
+
 # Logs
 *.log
 

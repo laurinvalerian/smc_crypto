@@ -501,6 +501,34 @@ def _get_equity_curve() -> list[dict]:
     return points[-500:]
 
 
+def _get_daily_pnl() -> list[dict]:
+    """Build daily PnL bars from journal closed trades.
+
+    Each entry = one calendar day with that day's net PnL ($) across all trades
+    closed that day. NOT cumulative. Red/green colouring happens in the frontend
+    based on sign. PnL is pnl_pct × 100K (all brokers normalised to 100K display).
+    """
+    if not _journal_has_table("trades"):
+        return []
+
+    rows = _query_journal(
+        "SELECT DATE(exit_time) AS day, SUM(pnl_pct) AS day_pnl, COUNT(*) AS trades "
+        "FROM trades WHERE exit_time IS NOT NULL AND pnl_pct IS NOT NULL "
+        "GROUP BY DATE(exit_time) ORDER BY day ASC"
+    )
+    if not rows:
+        return []
+
+    return [
+        {
+            "date": r.get("day", ""),
+            "pnl": round((r.get("day_pnl") or 0.0) * 100_000.0, 2),
+            "trades": int(r.get("trades") or 0),
+        }
+        for r in rows
+    ]
+
+
 def _system_stats() -> dict:
     """Gather system stats (CPU, RAM, disk) without psutil."""
     stats: dict = {"cpu_pct": 0.0, "ram_total_mb": 0, "ram_used_mb": 0,
@@ -727,6 +755,11 @@ def api_overview():
 @app.route("/api/public/equity")
 def api_equity():
     return jsonify(_get_equity_curve())
+
+
+@app.route("/api/public/daily-pnl")
+def api_daily_pnl():
+    return jsonify(_get_daily_pnl())
 
 
 @app.route("/api/public/trades")
@@ -1196,7 +1229,7 @@ def api_active_trades():
 def api_candles(symbol: str):
     """Return OHLCV candles for a symbol in Lightweight-Charts format."""
     try:
-        limit = min(int(request.args.get("limit", 100)), 200)
+        limit = min(int(request.args.get("limit", 100)), 300)
     except (ValueError, TypeError):
         limit = 100
 
@@ -1781,37 +1814,22 @@ var pnlChart = null;
 function updateEquity(data){
   var eqCanvas = $('equity-chart');
   var eqEmpty = $('equity-empty');
-  var pnlCanvas = $('pnl-chart');
-  var pnlEmpty = $('pnl-empty');
 
   if(!data || !data.length){
     if(eqCanvas) eqCanvas.style.display='none';
     if(eqEmpty) eqEmpty.style.display='block';
-    if(pnlCanvas) pnlCanvas.style.display='none';
-    if(pnlEmpty) pnlEmpty.style.display='block';
     return;
   }
   if(eqCanvas) eqCanvas.style.display='block';
   if(eqEmpty) eqEmpty.style.display='none';
-  if(pnlCanvas) pnlCanvas.style.display='block';
-  if(pnlEmpty) pnlEmpty.style.display='none';
 
   var labels = data.map(function(p){ return p.timestamp ? p.timestamp.substring(5,16) : ''; });
   var eqVals = data.map(function(p){ return p.equity; });
-  var pnlVals = data.map(function(p){ return p.pnl; });
 
   // Tight equity Y-axis
   var eqMin = Math.min.apply(null, eqVals);
   var eqMax = Math.max.apply(null, eqVals);
   var eqPad = Math.max((eqMax - eqMin) * 0.3, eqMax * 0.005);
-
-  // PnL color: green if positive, red if negative (current value)
-  var lastPnl = pnlVals[pnlVals.length-1] || 0;
-  var pnlColor = lastPnl >= 0 ? '#3fb950' : '#f85149';
-  var pnlBg = lastPnl >= 0 ? 'rgba(63,185,80,0.1)' : 'rgba(248,81,73,0.1)';
-  // Per-point colors for the line
-  var pnlSegmentColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
-  var pnlPointColors = pnlVals.map(function(v){return v>=0?'#3fb950':'#f85149'});
 
   // ── Equity Chart ──
   if(eqChart){
@@ -1838,34 +1856,56 @@ function updateEquity(data){
       }
     });
   }
+}
 
-  // ── PnL Chart (2 datasets: green above 0, red below 0) ──
+// ── Daily PnL Chart (bar chart, green/red per day, NOT cumulative) ──
+function updateDailyPnl(data){
+  var pnlCanvas = $('pnl-chart');
+  var pnlEmpty = $('pnl-empty');
+
+  if(!data || !data.length){
+    if(pnlCanvas) pnlCanvas.style.display='none';
+    if(pnlEmpty) pnlEmpty.style.display='block';
+    return;
+  }
+  if(pnlCanvas) pnlCanvas.style.display='block';
+  if(pnlEmpty) pnlEmpty.style.display='none';
+
+  // Label format: MM-DD
+  var labels = data.map(function(d){ return d.date ? d.date.substring(5) : ''; });
+  var pnlVals = data.map(function(d){ return d.pnl || 0; });
+  var bgColors = pnlVals.map(function(v){ return v >= 0 ? 'rgba(63,185,80,0.75)' : 'rgba(248,81,73,0.75)'; });
+  var borderColors = pnlVals.map(function(v){ return v >= 0 ? '#3fb950' : '#f85149'; });
+
   if(pnlChart){
     pnlChart.data.labels = labels;
     pnlChart.data.datasets[0].data = pnlVals;
-    pnlChart.data.datasets[1].data = pnlVals;
+    pnlChart.data.datasets[0].backgroundColor = bgColors;
+    pnlChart.data.datasets[0].borderColor = borderColors;
     pnlChart.update('none');
   } else {
     pnlChart = new Chart(pnlCanvas, {
-      type:'line',
-      data:{labels:labels, datasets:[
-        {label:'PnL', data:pnlVals,
-         borderColor:'#3fb950', backgroundColor:'rgba(63,185,80,0.12)',
-         fill:{target:'origin',above:'rgba(63,185,80,0.12)',below:'transparent'},
-         segment:{borderColor:function(ctx){return ctx.p0.parsed.y>=0&&ctx.p1.parsed.y>=0?'#3fb950':'#f85149'}},
-         tension:0.3, pointRadius:5, pointBorderWidth:2,
-         pointBackgroundColor:pnlPointColors, pointBorderColor:pnlPointColors, borderWidth:2},
-        {label:'_neg', data:pnlVals,
-         borderColor:'transparent', backgroundColor:'rgba(248,81,73,0.12)',
-         fill:{target:'origin',above:'transparent',below:'rgba(248,81,73,0.12)'},
-         tension:0.3, pointRadius:0, borderWidth:0}
-      ]},
+      type:'bar',
+      data:{labels:labels, datasets:[{
+        label:'Daily PnL', data:pnlVals,
+        backgroundColor:bgColors, borderColor:borderColors, borderWidth:1
+      }]},
       options:{
         responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{legend:{labels:{filter:function(item){return item.text!=='_neg'},color:'#8b949e',font:{size:11}}}},
+        plugins:{
+          legend:{labels:{color:'#8b949e',font:{size:11}}},
+          tooltip:{callbacks:{label:function(ctx){
+            var v = ctx.parsed.y;
+            var trades = (data[ctx.dataIndex]||{}).trades || 0;
+            return (v>=0?'+$':'-$') + Math.abs(v).toLocaleString() + ' (' + trades + ' trades)';
+          }}}
+        },
         scales:{
-          x:{ticks:{color:'#484f58',maxTicksLimit:12,font:{size:10}},grid:{color:'#21262d'}},
-          y:{ticks:{color:function(ctx){return ctx.tick.value>=0?'#3fb950':'#f85149'},font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},grid:{color:'#21262d'}}
+          x:{ticks:{color:'#484f58',maxTicksLimit:14,font:{size:10}},grid:{color:'#21262d'}},
+          y:{
+            ticks:{color:function(ctx){return ctx.tick.value>=0?'#3fb950':'#f85149'},font:{size:10},callback:function(v){return (v>=0?'+$':'-$')+Math.abs(v).toLocaleString()}},
+            grid:{color:'#21262d'}
+          }
         }
       }
     });
@@ -1985,8 +2025,8 @@ function updateRisk(d){
     html += '<span style="font-size:13px;font-weight:600;color:#e6edf3">'+escHtml(bName)+'</span>';
     html += '<span style="font-size:11px;font-weight:600;color:'+statusCol+'">'+escHtml(b.status||'CLEAR')+'</span>';
     html += '</div>';
-    html += renderProgressBar('Daily DD', Math.abs(b.daily_pnl_pct||0), d.daily_loss_limit||3, '#3fb950');
-    html += renderProgressBar('Weekly DD', Math.abs(b.weekly_pnl_pct||0), d.weekly_loss_limit||5, '#58a6ff');
+    html += renderProgressBar('Daily DD', Math.max(0, -(b.daily_pnl_pct||0)), d.daily_loss_limit||3, '#3fb950');
+    html += renderProgressBar('Weekly DD', Math.max(0, -(b.weekly_pnl_pct||0)), d.weekly_loss_limit||5, '#58a6ff');
     html += renderProgressBar('All-Time DD', b.dd_pct||0, d.alltime_dd_limit||8, '#d2a8ff');
     html += renderProgressBar('Open Risk', b.heat_pct||0, 6, '#d29922');
     html += '<div style="font-size:11px;color:#8b949e;margin-top:4px">';
@@ -2066,14 +2106,9 @@ function fetchJ(url, cb, retries){
 }
 
 // ── Shared PnL Card Renderer ─────────────────────────────────────
-
-function _ddColor(dd, limit){
-  if(dd <= 0) return '#3fb950';
-  var ratio = dd / limit;
-  if(ratio < 0.3) return '#3fb950';
-  if(ratio < 0.6) return '#d29922';
-  return '#f85149';
-}
+// DD display removed from PnL cards 2026-04-17 — DD is still shown in the
+// Circuit Breaker progress bars (All-Time DD lives there). The ddId/ddLimit
+// parameters are kept for backwards compatibility but ignored.
 
 function _renderPnlCard(valId, breakdownId, ddId, pct, classMap, dd, ddLimit){
   var el = $(valId);
@@ -2089,13 +2124,9 @@ function _renderPnlCard(valId, breakdownId, ddId, pct, classMap, dd, ddLimit){
   }
   var bkEl = $(breakdownId);
   if(bkEl) bkEl.innerHTML = parts.length > 0 ? '<span style="font-size:11px">'+parts.join('<br>')+'</span>' : '';
-  // DD with color based on proximity to limit
+  // Clear any previously rendered DD element (defensive — DD lives only in CB bars now).
   var ddEl = $(ddId);
-  if(ddEl && dd > 0){
-    ddEl.innerHTML = '<span style="font-size:11px;color:'+_ddColor(dd,ddLimit)+'">DD: '+fmt(dd,2)+'% / '+fmt(ddLimit,0)+'%</span>';
-  } else if(ddEl){
-    ddEl.innerHTML = '';
-  }
+  if(ddEl) ddEl.innerHTML = '';
 }
 
 // ── Period Stats (Daily / Weekly / Monthly) ─────────────────────
@@ -2124,6 +2155,7 @@ function loadAll(){
   fetchJ('/api/public/status', updateStatus);
   fetchJ('/api/public/overview', updateOverview);
   fetchJ('/api/public/equity', updateEquity);
+  fetchJ('/api/public/daily-pnl', updateDailyPnl);
   fetchJ('/api/public/per-class', updatePerClass);
   fetchJ('/api/public/period-stats', updatePeriodStats);
   fetchJ('/api/public/rl-stats', updateRL);
@@ -2140,6 +2172,7 @@ loadAll();
 setInterval(function(){ fetchJ('/api/public/status', updateStatus); }, 10000);
 setInterval(function(){ fetchJ('/api/public/overview', updateOverview); }, 30000);
 setInterval(function(){ fetchJ('/api/public/equity', updateEquity); }, 60000);
+setInterval(function(){ fetchJ('/api/public/daily-pnl', updateDailyPnl); }, 60000);
 setInterval(function(){ fetchJ('/api/public/per-class', updatePerClass); }, 30000);
 setInterval(function(){ fetchJ('/api/public/period-stats', updatePeriodStats); }, 30000);
 setInterval(function(){ fetchJ('/api/public/rl-stats', updateRL); }, 60000);
@@ -2382,8 +2415,11 @@ function updateActiveTrades(trades){
       });
       _atSeries[symId] = series;
 
-      // Fetch candles — sanitize URL to match bot export (replace / and : with _)
-      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_').replace(/:/g, '_') + '?tf=15m&limit=100';
+      // Fetch candles — tf and lookback depend on trade style
+      var style = (trade.style || 'day').toLowerCase();
+      var chartTf = style === 'scalp' ? '5m' : (style === 'swing' ? '1h' : '15m');
+      var chartLimit = style === 'scalp' ? 80 : (style === 'swing' ? 250 : 100);
+      var candleUrl = '/api/public/candles/' + sym.replace(/\//g, '_').replace(/:/g, '_') + '?tf=' + chartTf + '&limit=' + chartLimit;
       fetchJ(candleUrl, function(candles){
         if(!candles || !candles.length){
           console.warn('No candle data for ' + sym);

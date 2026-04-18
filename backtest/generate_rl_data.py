@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import logging
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -84,7 +85,8 @@ WINDOWS = [
     ("2025-04-01", "2025-07-01"),   # W8  — Q2 2025
     ("2025-07-01", "2025-10-01"),   # W9  — Q3 2025
     ("2025-10-01", "2026-01-01"),   # W10 — Q4 2025
-    ("2026-01-01", "2026-03-26"),   # W11 — Q1 2026 (partial)
+    ("2026-01-01", "2026-04-01"),   # W11 — Q1 2026
+    ("2026-04-01", "2026-04-15"),   # W12 — Q2 2026 (partial, for A/B holdout)
 ]
 
 # SMC profiles per asset class (from config)
@@ -94,6 +96,65 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
     "stocks":      {"swing_length": 10, "fvg_threshold": 0.0003, "order_block_lookback": 20, "liquidity_range_percent": 0.005},
     "commodities": {"swing_length": 10, "fvg_threshold": 0.0004, "order_block_lookback": 20, "liquidity_range_percent": 0.005},
 }
+
+
+def _load_optimized_smc_params() -> dict[str, dict]:
+    """Load per-cluster optimized SMC params (mirrors live_multi_bot._load_optimized_smc_params).
+
+    CRITICAL: training MUST use the same per-cluster params as live, otherwise
+    indicators (BOS/CHoCH on daily, etc.) will diverge → wrong daily_bias →
+    wrong h4_confirms/h1_confirms/etc → wrong alignment_score → train/inference
+    distribution mismatch → broken model.
+    """
+    clusters_path = Path("config/instrument_clusters.json")
+    results_dir = Path("backtest/results/smc_optimization")
+
+    if not clusters_path.exists() or not results_dir.exists():
+        return {}
+
+    try:
+        with open(clusters_path) as f:
+            clusters = json.load(f)
+
+        symbol_params: dict[str, dict] = {}
+        for cid, info in clusters.get("clusters", {}).items():
+            params_file = results_dir / f"cluster_{cid}_params.json"
+            if not params_file.exists():
+                continue
+            with open(params_file) as f:
+                opt = json.load(f)
+            optimized = opt.get("optimized_params", {})
+            if not optimized:
+                continue
+            for sym in info.get("instruments", []):
+                symbol_params[sym] = optimized
+                if sym.endswith("USDT") and "_" not in sym:
+                    base = sym[:-4]
+                    symbol_params[f"{base}/USDT:USDT"] = optimized
+        if symbol_params:
+            logger.info("Loaded optimized SMC params for %d symbol keys", len(symbol_params))
+        return symbol_params
+    except Exception as e:
+        logger.warning("Failed loading optimized SMC params: %s", e)
+        return {}
+
+
+# Module-level cache — same as live
+_OPTIMIZED_SMC_PARAMS: dict[str, dict] = _load_optimized_smc_params()
+
+
+def _resolve_smc_params(symbol: str, asset_class: str) -> dict[str, Any]:
+    """Resolve SMC params for (symbol, asset_class) using the same merge logic
+    as live_multi_bot.PaperBot.__init__: asset_class defaults + per-symbol
+    cluster optimized overrides.
+
+    Returns a NEW dict so callers can mutate freely.
+    """
+    base = ASSET_SMC_PARAMS.get(asset_class, ASSET_SMC_PARAMS["crypto"]).copy()
+    overrides = _OPTIMIZED_SMC_PARAMS.get(symbol)
+    if overrides:
+        base.update(overrides)
+    return base
 
 ASSET_COMMISSION: dict[str, float] = {
     "crypto": 0.0004, "forex": 0.0003, "stocks": 0.0001, "commodities": 0.0003,
@@ -105,6 +166,22 @@ ASSET_SLIPPAGE: dict[str, float] = {
 
 # Max bars to simulate forward for outcome (48h of 5m bars)
 MAX_FORWARD_BARS = 576
+# Max bars to continue tracking after TP hit (raw MFE only, ~17h)
+MAX_POST_TP_BARS = 200
+
+
+class SimResult(NamedTuple):
+    """Result of _simulate_forward() — replaces raw tuple."""
+    outcome: str           # "win", "loss", "breakeven", "skip"
+    net_rr: float          # realized RR after costs
+    bars_held: int         # bars from entry to exit
+    max_favorable_rr: float  # MFE in R-multiples (up to exit)
+    exit_mechanism: int    # 0=skip, 1=TP, 2=SL, 3=BE, 4=timeout
+    bar_rows: list         # per-bar dicts (empty if emit_bar_rows=False)
+    mae_rr: float          # max adverse excursion in R-multiples
+    post_tp_max_rr: float  # post-TP MFE (NaN if not TP hit)
+    post_tp_bars: int      # bars tracked after TP (0 if not TP hit)
+    post_tp_reversal_rr: float  # worst R after TP hit (NaN if not TP hit)
 
 # Feature names — sourced from shared schema (features/schema.py)
 FEATURE_NAMES: list[str] = list(_SCHEMA_FEATURES)
@@ -994,29 +1071,27 @@ def _simulate_forward(
     adx_1h_arr: np.ndarray | None = None,
     atr_5m_arr: np.ndarray | None = None,
     asset_class_id: float = 0.0,
-) -> tuple[str, float, int, float, int] | tuple[str, float, int, float, int, list[dict]]:
+) -> SimResult:
     """
     Simulate a trade forward from entry_idx.
 
-    Returns (outcome, net_rr, exit_bar_offset, max_favorable_rr, exit_mechanism)
-    when emit_bar_rows=False (default, backward compatible).
-
-    When emit_bar_rows=True, returns a 6-tuple with an additional list of
-    per-bar dicts.  Each dict represents one 5m bar during the trade with
-    causal features only (no future data).  After the simulation loop, the
-    label ``label_hold_better`` is backfilled on every bar using the known
-    final net_rr (two-pass: forward to exit, backward to fill labels).
-
-      exit_mechanism: 0=skip, 1=TP, 2=SL, 3=BE, 4=timeout
+    Returns SimResult NamedTuple with:
+      outcome: "win"/"loss"/"breakeven"/"skip"
       net_rr: realized RR after commission + slippage + funding
-      label_hold_better: 1 if continuing to hold from this bar improved outcome
+      bars_held: bars from entry to exit
+      max_favorable_rr: MFE in R-multiples (up to exit)
+      exit_mechanism: 0=skip, 1=TP, 2=SL, 3=BE, 4=timeout
+      bar_rows: per-bar dicts (empty if emit_bar_rows=False)
+      mae_rr: max adverse excursion in R-multiples
+      post_tp_max_rr: post-TP MFE (NaN if not TP hit)
+      post_tp_bars: bars tracked after TP (0 if not TP hit)
+      post_tp_reversal_rr: worst R after TP hit (NaN if not TP hit)
     """
+    _nan = float("nan")
     is_long = direction == "long"
     sl_dist = abs(entry_price - stop_loss)
     if sl_dist == 0:
-        if emit_bar_rows:
-            return "skip", 0.0, 0, 0.0, 0, []
-        return "skip", 0.0, 0, 0.0, 0
+        return SimResult("skip", 0.0, 0, 0.0, 0, [], 0.0, _nan, 0, _nan)
 
     high = df_5m["high"].values.astype(float)
     low = df_5m["low"].values.astype(float)
@@ -1031,9 +1106,17 @@ def _simulate_forward(
     be_triggered = False
     fee_buffer = entry_price * (commission_pct * 2 + slippage_pct * 2)
     best_favorable_rr = 0.0
+    worst_adverse_rr = 0.0  # MAE: max adverse excursion in R-multiples
 
     # Per-bar state for exit episode emission (populated when emit_bar_rows=True)
     bar_rows: list[dict] = []
+
+    # --- Helper to build the final SimResult for non-TP exits ---
+    def _result(outcome: str, net_rr: float, bars_held: int, mech: int) -> SimResult:
+        if emit_bar_rows:
+            _backfill_hold_labels(bar_rows, net_rr)
+        return SimResult(outcome, net_rr, bars_held, best_favorable_rr, mech,
+                         bar_rows, worst_adverse_rr, _nan, 0, _nan)
 
     for i in range(entry_idx + 2, min(entry_idx + MAX_FORWARD_BARS + 1, n)):
         bar_high = high[i]
@@ -1041,17 +1124,21 @@ def _simulate_forward(
         bar_close = close[i]
         bars_held = i - entry_idx
 
-        # Track max favorable excursion (in R-multiples)
+        # Track max favorable excursion (MFE) and max adverse excursion (MAE)
         if is_long:
             fav = (bar_high - entry_price) / sl_dist
+            adv = (entry_price - bar_low) / sl_dist
             unrealized_rr = (bar_close - entry_price) / sl_dist
             sl_dist_pct = (bar_close - current_sl) / bar_close if bar_close > 0 else 0.0
         else:
             fav = (entry_price - bar_low) / sl_dist
+            adv = (bar_high - entry_price) / sl_dist
             unrealized_rr = (entry_price - bar_close) / sl_dist
             sl_dist_pct = (current_sl - bar_close) / bar_close if bar_close > 0 else 0.0
         if fav > best_favorable_rr:
             best_favorable_rr = fav
+        if adv > worst_adverse_rr:
+            worst_adverse_rr = adv
 
         # Collect bar state for exit episodes (causal: only data known at this bar)
         if emit_bar_rows:
@@ -1106,42 +1193,70 @@ def _simulate_forward(
             raw_rr = (current_sl - entry_price) / sl_dist
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
             if be_triggered and abs(raw_rr) < 0.5:
-                outcome, mech = "breakeven", 3
-            else:
-                outcome, mech = ("win" if net_rr > 0 else "loss"), 2
-            if emit_bar_rows:
-                _backfill_hold_labels(bar_rows, net_rr)
-                return outcome, net_rr, bars_held, best_favorable_rr, mech, bar_rows
-            return outcome, net_rr, bars_held, best_favorable_rr, mech
+                return _result("breakeven", net_rr, bars_held, 3)
+            return _result("win" if net_rr > 0 else "loss", net_rr, bars_held, 2)
 
         if not is_long and bar_high >= current_sl:
             raw_rr = (entry_price - current_sl) / sl_dist
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
             if be_triggered and abs(raw_rr) < 0.5:
-                outcome, mech = "breakeven", 3
-            else:
-                outcome, mech = ("win" if net_rr > 0 else "loss"), 2
-            if emit_bar_rows:
-                _backfill_hold_labels(bar_rows, net_rr)
-                return outcome, net_rr, bars_held, best_favorable_rr, mech, bar_rows
-            return outcome, net_rr, bars_held, best_favorable_rr, mech
+                return _result("breakeven", net_rr, bars_held, 3)
+            return _result("win" if net_rr > 0 else "loss", net_rr, bars_held, 2)
 
-        # Check TP hit
+        # Check TP hit → enter post-TP continuation tracking
+        tp_hit = False
         if is_long and bar_high >= take_profit:
             raw_rr = (take_profit - entry_price) / sl_dist
-            net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
-            if emit_bar_rows:
-                _backfill_hold_labels(bar_rows, net_rr)
-                return "win", net_rr, bars_held, best_favorable_rr, 1, bar_rows
-            return "win", net_rr, bars_held, best_favorable_rr, 1
-
-        if not is_long and bar_low <= take_profit:
+            tp_hit = True
+        elif not is_long and bar_low <= take_profit:
             raw_rr = (entry_price - take_profit) / sl_dist
+            tp_hit = True
+
+        if tp_hit:
             net_rr = raw_rr - cost_rr - _funding_cost_rr(asset_class, bars_held, entry_price, sl_dist)
+            tp_bars_held = bars_held
             if emit_bar_rows:
                 _backfill_hold_labels(bar_rows, net_rr)
-                return "win", net_rr, bars_held, best_favorable_rr, 1, bar_rows
-            return "win", net_rr, bars_held, best_favorable_rr, 1
+
+            # --- Post-TP continuation: raw price tracking only ---
+            # Skip all BE/SL logic, just track how far price goes after TP
+            tp_rr = raw_rr  # TP price in R-multiples (planned TP level)
+            # bug_007 fix: include the TP-bar MFE so wick/spike TP fills get captured.
+            # Previously: post_tp_max_rr = tp_rr ignored the bar_high overshoot that
+            # actually triggered TP. For spike-then-reverse rows (common on thin liquidity,
+            # news-driven moves), label_post_tp_max_rr was strictly < label_max_favorable_rr,
+            # silently re-introducing the MFE-cap-at-TP that this feature was added to fix.
+            post_tp_max_rr = max(tp_rr, fav)  # `fav` is the MFE of the TP-hitting bar
+            post_tp_worst_rr = tp_rr  # track worst R after TP
+            post_tp_bars_count = 0
+            post_tp_end = min(i + MAX_POST_TP_BARS + 1, n)
+
+            for j in range(i + 1, post_tp_end):
+                jh = high[j]
+                jl = low[j]
+                jc = close[j]
+                post_tp_bars_count += 1
+
+                # Track MFE continuation (raw, no SL/BE)
+                if is_long:
+                    fav_j = (jh - entry_price) / sl_dist
+                    rr_j = (jc - entry_price) / sl_dist
+                else:
+                    fav_j = (entry_price - jl) / sl_dist
+                    rr_j = (entry_price - jc) / sl_dist
+
+                if fav_j > post_tp_max_rr:
+                    post_tp_max_rr = fav_j
+                if rr_j < post_tp_worst_rr:
+                    post_tp_worst_rr = rr_j
+
+                # Stop if price reverses back through entry (using close)
+                if (is_long and jc < entry_price) or (not is_long and jc > entry_price):
+                    break
+
+            return SimResult("win", net_rr, tp_bars_held, best_favorable_rr, 1,
+                             bar_rows, worst_adverse_rr,
+                             post_tp_max_rr, post_tp_bars_count, post_tp_worst_rr)
 
     # Timeout — classify by current position
     bars_held = min(MAX_FORWARD_BARS, n - 1 - entry_idx)
@@ -1159,10 +1274,7 @@ def _simulate_forward(
     else:
         outcome, mech = "breakeven", 4
 
-    if emit_bar_rows:
-        _backfill_hold_labels(bar_rows, net_rr)
-        return outcome, net_rr, bars_held, best_favorable_rr, mech, bar_rows
-    return outcome, net_rr, bars_held, best_favorable_rr, mech
+    return _result(outcome, net_rr, bars_held, mech)
 
 
 def _backfill_hold_labels(bar_rows: list[dict], final_net_rr: float) -> None:
@@ -1257,6 +1369,10 @@ def generate_teacher_labels(
     label_max_favorable_rr = np.zeros(n, dtype=np.float32)  # best unrealized RR
     label_tp_rr = np.zeros(n, dtype=np.float32)          # planned TP in R-multiples
     label_cost_rr = np.zeros(n, dtype=np.float32)        # total fees+slippage in R
+    # Phase A exit model labels (MAE + post-TP tracking)
+    label_mae_rr = np.zeros(n, dtype=np.float32)         # max adverse excursion in R
+    label_post_tp_max_rr = np.full(n, np.nan, dtype=np.float32)  # post-TP MFE (NaN if not TP)
+    label_post_tp_reversal_rr = np.full(n, np.nan, dtype=np.float32)  # worst R after TP
 
     min_start = swing_len * 2
     commission = ASSET_COMMISSION.get(asset_class, 0.0004)
@@ -1365,39 +1481,51 @@ def generate_teacher_labels(
 
         # ── Simulate forward ─────────────────────────────────────
         planned_tp_rr = abs(tp_price - entry_price) / sl_dist
-        outcome, realized_rr, exit_bars, max_fav_rr, exit_mech = _simulate_forward(
+        sim = _simulate_forward(
             df_5m, i, entry_price, stop_loss, tp_price,
             direction, commission_pct=commission, slippage_pct=slippage,
             asset_class=asset_class,
         )
-        if outcome == "skip":
+        if sim.outcome == "skip":
             continue
 
         # Cost in R-multiples (for reference)
         _cost_pct = (commission + slippage) * 2
         _cost_rr = (entry_price * _cost_pct) / sl_dist
-        _fund_rr = _funding_cost_rr(asset_class, exit_bars, entry_price, sl_dist)
+        _fund_rr = _funding_cost_rr(asset_class, sim.bars_held, entry_price, sl_dist)
 
         # ── Label ────────────────────────────────────────────────
         label_action[i] = 1 if direction == "long" else 2
-        label_rr[i] = realized_rr
-        if outcome == "win":
+        label_rr[i] = sim.net_rr
+        if sim.outcome == "win":
             label_outcome[i] = 1
             label_profitable[i] = 1
-        elif outcome == "loss":
+        elif sim.outcome == "loss":
             label_outcome[i] = 2
-        elif outcome == "breakeven":
+        elif sim.outcome == "breakeven":
             label_outcome[i] = 3
         # Extended labels
-        label_exit_mechanism[i] = exit_mech
-        label_exit_bar[i] = exit_bars
-        label_max_favorable_rr[i] = max_fav_rr
+        label_exit_mechanism[i] = sim.exit_mechanism
+        label_exit_bar[i] = sim.bars_held
+        label_max_favorable_rr[i] = sim.max_favorable_rr
         label_tp_rr[i] = planned_tp_rr
         label_cost_rr[i] = _cost_rr + _fund_rr
+        # Phase A labels (MAE + post-TP)
+        label_mae_rr[i] = sim.mae_rr
+        label_post_tp_max_rr[i] = sim.post_tp_max_rr
+        label_post_tp_reversal_rr[i] = sim.post_tp_reversal_rr
         n_entries += 1
 
     logger.info("  Teacher labels: %d entries out of %d bars (%.1f%%)",
                 n_entries, n, 100 * n_entries / max(n, 1))
+
+    # ── Teacher v2 hindsight-optimal labels (2026-04-17) ──
+    # These 4 columns are what the Student brain learns to predict. They
+    # are pure derivations of MFE/MAE/outcome — see teacher/teacher_v2.py.
+    from teacher.teacher_v2 import compute_teacher_labels
+    _t_labels = compute_teacher_labels(
+        label_max_favorable_rr, label_mae_rr, outcome=label_outcome,
+    )
 
     result = pd.DataFrame({
         "timestamp": ts_5m,
@@ -1410,6 +1538,14 @@ def generate_teacher_labels(
         "label_max_favorable_rr": label_max_favorable_rr,
         "label_tp_rr": label_tp_rr,
         "label_cost_rr": label_cost_rr,
+        "label_mae_rr": label_mae_rr,
+        "label_post_tp_max_rr": label_post_tp_max_rr,
+        "label_post_tp_reversal_rr": label_post_tp_reversal_rr,
+        # Teacher v2 targets (Student training)
+        "optimal_entry": _t_labels["optimal_entry"],
+        "optimal_sl_rr": _t_labels["optimal_sl_rr"],
+        "optimal_tp_rr": _t_labels["optimal_tp_rr"],
+        "optimal_size": _t_labels["optimal_size"],
     })
 
     if signal_window_start is not None:
@@ -1436,9 +1572,17 @@ def process_instrument(
     window_end: str,
 ) -> pd.DataFrame | None:
     """Process one instrument: extract features + generate labels."""
-    smc_params = ASSET_SMC_PARAMS.get(asset_class, ASSET_SMC_PARAMS["crypto"])
+    # Use per-symbol optimized params merged on top of asset-class defaults
+    # — matches live_multi_bot.PaperBot.__init__ behavior. CRITICAL for
+    # train/inference parity.
+    smc_params = _resolve_smc_params(symbol, asset_class)
 
-    # Load data with lookback buffer (6 months for EMA200 warmup on daily)
+    # Load data with lookback buffer (180 days — matches the original
+    # training setup that the OLD live model was trained on).
+    # Note: for symbols with limited parquet history (crypto starting
+    # 2023-01-01), W0/W1 may have insufficient bars for EMA200 fallback
+    # in _precompute_running_bias, resulting in 0 entries for some
+    # symbols in early windows. This is acceptable — later windows compensate.
     history_start = (pd.Timestamp(window_start, tz="UTC") - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
     frames = load_multi_tf_data(symbol, asset_class, start=history_start, end=window_end)
 
@@ -1565,16 +1709,27 @@ def run_data_generation(
 
         logger.info("  Total work items: %d (parallel with %d workers)", len(work_items), n_workers)
 
-        # Process in parallel
+        # Process items — sequentially when n_workers=1 (avoids Pool IPC issues),
+        # otherwise via multiprocessing Pool.
         completed = 0
-        with Pool(processes=n_workers) as pool:
-            for result in pool.imap_unordered(_process_instrument_worker, work_items, chunksize=1):
+        if n_workers <= 1:
+            for item in work_items:
+                result = _process_instrument_worker(item)
                 completed += 1
                 if completed % 20 == 0 or completed == len(work_items):
                     logger.info("  Progress: %d/%d (%.0f%%)", completed, len(work_items),
                                 100 * completed / len(work_items))
                 if result is not None and len(result) > 0:
                     all_data.append(result)
+        else:
+            with Pool(processes=n_workers) as pool:
+                for result in pool.imap_unordered(_process_instrument_worker, work_items, chunksize=1):
+                    completed += 1
+                    if completed % 20 == 0 or completed == len(work_items):
+                        logger.info("  Progress: %d/%d (%.0f%%)", completed, len(work_items),
+                                    100 * completed / len(work_items))
+                    if result is not None and len(result) > 0:
+                        all_data.append(result)
 
         # Log per-window stats
         if all_data:
@@ -1758,32 +1913,30 @@ def _process_exit_episodes_worker(args: tuple) -> "pd.DataFrame | None":
                 stop_loss = entry_price + atr_est
                 take_profit = entry_price - atr_est * tp_rr
 
-            result = _simulate_forward(
+            sim = _simulate_forward(
                 df_5m, entry_idx, entry_price, stop_loss, take_profit,
                 direction, commission_pct=commission, slippage_pct=slippage,
                 asset_class=ac, emit_bar_rows=True,
                 rsi_5m_arr=rsi_5m_arr, adx_1h_arr=adx_1h_arr,
                 atr_5m_arr=atr_5m_arr, asset_class_id=ac_id,
             )
-            if len(result) != 6:
-                continue
-            outcome, net_rr, exit_bars, max_fav_rr, exit_mech, bar_rows = result
 
-            if outcome == "skip" or not bar_rows:
+            if sim.outcome == "skip" or not sim.bar_rows:
                 continue
 
             # Attach trade-level metadata to every bar row
-            for row in bar_rows:
+            # (do NOT emit post-TP bars — exit classifier trains on pre-exit bars only)
+            for row in sim.bar_rows:
                 row.update({
                     "symbol": sym,
                     "asset_class": ac,
                     "direction": direction,
                     "window": wi,
                     "entry_price": entry_price,
-                    "final_net_rr": net_rr,
-                    "outcome": outcome,
-                    "exit_mechanism": exit_mech,
-                    "max_favorable_rr": max_fav_rr,
+                    "final_net_rr": sim.net_rr,
+                    "outcome": sim.outcome,
+                    "exit_mechanism": sim.exit_mechanism,
+                    "max_favorable_rr": sim.max_favorable_rr,
                     "tp_rr": tp_rr,
                 })
                 all_episode_rows.append(row)
@@ -1901,7 +2054,7 @@ def main():
     elif args.classes:
         classes = args.classes
     else:
-        classes = ["crypto", "stocks"]  # default: most reliable
+        classes = ["crypto", "stocks", "forex", "commodities"]  # all 4 asset classes
 
     if args.exit_episodes:
         generate_exit_training_data(classes, symbols_override=args.symbols,

@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_time        TEXT,
     exit_time         TEXT,
     entry_price       REAL,
-    sl_original       REAL,
+    sl_original       REAL,       -- strategy-planned SL (pre-RL-adjustment)
+    sl_used           REAL,       -- actually-used SL if RL adjuster modified it; NULL if = sl_original
     tp                REAL,
     exit_price        REAL,
     bars_held         INTEGER,
@@ -61,6 +62,11 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_features    TEXT
 )
 """
+
+# Migration for existing DBs that predate the sl_used column (added 2026-04-17).
+_MIGRATE_ADD_SL_USED = (
+    "ALTER TABLE trades ADD COLUMN sl_used REAL"
+)
 
 _CREATE_TRADE_BARS = """
 CREATE TABLE IF NOT EXISTS trade_bars (
@@ -161,10 +167,18 @@ class TradeJournal:
         self._conn.execute(_CREATE_REJECTED_SIGNALS)
         for idx_sql in _CREATE_INDEXES:
             self._conn.execute(idx_sql)
+
+        # Idempotent migrations — ALTER TABLE fails harmlessly if column exists
+        try:
+            self._conn.execute(_MIGRATE_ADD_SL_USED)
+            logger.info("Migrated trades table: added sl_used column")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         self._conn.commit()
 
-        # Track running max_favorable per open trade (in-memory, avoids reads)
+        # Track running max_favorable and max_adverse per open trade (in-memory)
         self._max_favorable: dict[str, float] = {}
+        self._max_adverse: dict[str, float] = {}  # MAE: max adverse excursion (positive = deeper drawdown)
 
         logger.info("TradeJournal initialised: %s", db_path)
 
@@ -184,6 +198,7 @@ class TradeJournal:
         *,
         tier: str = "",
         sl_original: float,
+        sl_used: float | None = None,
         tp: float,
         score: float,
         rr_target: float,
@@ -192,23 +207,34 @@ class TradeJournal:
         entry_features: dict[str, float] | None = None,
         xgb_confidence: float = 0.0,
     ) -> None:
-        """Record trade open.  Call after bracket order is confirmed filled."""
+        """Record trade open.  Call after bracket order is confirmed filled.
+
+        `sl_original` is the strategy-planned SL (pre RL adjuster).
+        `sl_used` is the actually-used SL if the adjuster modified it; leave as
+        None/omit when the adjuster did nothing. Needed so SL-model labels can
+        be computed in correct R-units (bug_008 / DOT 2026-04-17 case).
+        """
         try:
             self._conn.execute(
                 """INSERT OR IGNORE INTO trades
                    (trade_id, symbol, asset_class, direction, style, tier,
-                    entry_time, entry_price, sl_original, tp, score,
+                    entry_time, entry_price, sl_original, sl_used, tp, score,
                     xgb_confidence, rr_target, leverage, risk_pct, entry_features)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     trade_id, symbol, asset_class, direction, style, tier,
-                    _ts(entry_time), entry_price, sl_original, tp, score,
+                    _ts(entry_time), entry_price, sl_original, sl_used, tp, score,
                     xgb_confidence, rr_target, leverage, risk_pct,
                     json.dumps(entry_features or {}),
                 ),
             )
             self._conn.commit()
-            self._max_favorable[trade_id] = 0.0
+            # bug_006 fix: do NOT pre-populate MFE/MAE dicts with 0.0.
+            # Pre-population defeated the .get(trade_id, fallback) call in close_trade —
+            # the key always existed so the fallback was unreachable, and trades that
+            # closed before record_bar fired (fast TP fills, missed 5m polls) wrote
+            # max_fav=0.0 to the journal even when the realized exit move was positive.
+            # record_bar uses .get(..., 0.0) defensively, so it works without pre-pop.
         except Exception as exc:
             logger.error("journal.open_trade failed for %s: %s", trade_id, exc)
 
@@ -232,12 +258,17 @@ class TradeJournal:
         """Record one closed 5m bar while trade is active.
         Must be called only on confirmed closed candles (not poll ticks)."""
         try:
-            # Track running max favorable
+            # Track running max favorable (MFE) and max adverse (MAE)
             current_max = self._max_favorable.get(trade_id, 0.0)
             favorable = max(unrealized_pnl_pct, 0.0)
             if favorable > current_max:
                 current_max = favorable
                 self._max_favorable[trade_id] = current_max
+
+            current_adverse = self._max_adverse.get(trade_id, 0.0)
+            adverse = abs(min(unrealized_pnl_pct, 0.0))  # positive value = deeper drawdown
+            if adverse > current_adverse:
+                self._max_adverse[trade_id] = adverse
 
             self._conn.execute(
                 """INSERT OR IGNORE INTO trade_bars
@@ -293,6 +324,7 @@ class TradeJournal:
             )
             self._conn.commit()
             self._max_favorable.pop(trade_id, None)
+            self._max_adverse.pop(trade_id, None)
         except Exception as exc:
             logger.error("journal.close_trade failed for %s: %s", trade_id, exc)
 

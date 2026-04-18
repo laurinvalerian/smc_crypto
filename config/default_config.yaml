@@ -226,16 +226,28 @@ rl_brain:
     min_multiplier: 0.33     # Minimum risk multiplier
     max_multiplier: 1.5      # Maximum risk multiplier
   tp_optimizer:
-    enabled: false            # Disabled: v2 retrain FAILED gate (PF 1.74→1.44, actively harmful)
+    enabled: false            # DISABLED 2026-04-17: backtest audit shows PF drops -0.03 to -0.19 in 4/5 folds.
+                              # Sharpe rise was WR-driven (smaller wins, more often), mfe_pred_corr only 0.31-0.38.
+                              # Current model is a pauschal-reducer. Re-enable after retrain with proper PF gate.
     model_path: "models/rl_tp_optimizer.pkl"
     max_tp_reduction: 0.3    # Max 30% TP reduction from planned
     max_tp_extension: 0.5    # Max 50% TP extension from planned
     min_tp_rr: 0.5           # Never set TP below 0.5R
   be_manager:
-    enabled: false            # Disabled: BE analysis shows negligible impact at 83% WR (was true)
+    enabled: true             # GATE PASSED: PF +33%, DD -35% — only exit-model with verified positive evidence
     model_path: "models/rl_be_manager.pkl"
     min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
     fee_buffer: true         # Add fee buffer when moving to BE
+  sl_adjuster:
+    enabled: false            # DISABLED 2026-04-17: audit found 0/5.3M WIDEN predictions across 5 folds —
+                              # model is a Tighten-only classifier. _sl_eval PF gain (+8%) was algebraic
+                              # (adjusted_rr = actual_rr / mult mechanical scaling), not from better placement.
+                              # Live evidence: DOT 2026-04-17 SHORT stopped at tightened 1.76% while original
+                              # 2.51% would have held (max_adverse 1.52%). Re-enable only after labels fixed
+                              # (R-units vs original SL, not adjusted) + class balancing + shadow-mode validation.
+    model_path: "models/rl_sl_adjuster.pkl"
+    max_sl_tighten: 0.5      # Max 50% tighter than SMC zone
+    max_sl_widen: 0.3         # Max 30% wider
   exit_classifier:
     enabled: false                  # Disabled: AUC 0.685 too low, cuts winners short (SL+TP+BE suffice)
     confidence_threshold: 0.65      # Optimal balance at 46% exit rate, +82% Sharpe
@@ -244,6 +256,25 @@ rl_brain:
     min_bars_held: 6                # Minimum 30 minutes before ML exit
     shadow_log: true                # Log predictions even when disabled
     be_ratchet_priority: true       # Suppress between 0.5R and BE trigger level
+
+# ═══════════════════════════════════════════════════════
+# Student Brain — unified Teacher-Student inference (2026-04-17)
+# Replaces the entry_filter + tp_optimizer + sl_adjuster + position_sizer
+# stack with ONE multi-head model trained on hindsight-optimal targets
+# (see teacher/teacher_v2.py). BE manager stays active — orthogonal.
+# ═══════════════════════════════════════════════════════
+student_brain:
+  enabled: true                     # ACTIVATED 2026-04-17: training done, test AUC 0.74 stable over 5 folds (vs old 0.66).
+                                    # Replaces entry_filter + tp_optimizer + sl_adjuster + position_sizer.
+  models_dir: "models"              # Looks for student_entry.pkl / _sl / _tp / _size
+  accept_threshold: 0.55            # P(worth_taking) gate — tune per-class if needed
+  min_rr: 1.5                       # Reject if predicted TP/SL < 1.5R (replaces hardcoded MIN_RR=3.0)
+  sl_floor: 1.0                     # min optimal SL distance in R
+  sl_cap: 3.0                       # max optimal SL distance in R
+  tp_floor: 0.5
+  tp_cap: 10.0
+  size_floor: 0.5                   # position-size multiplier lower bound
+  size_cap: 2.0                     # position-size multiplier upper bound
 
 # ═══════════════════════════════════════════════════════
 # DQN Exit Manager Configuration (Phase 2B)
@@ -281,14 +312,27 @@ continuous_learner:
   min_validation_trades: 15          # Minimum trades in validation split (30% of live)
   validation_split: 0.30             # Fraction of live trades for walk-forward validation
   backtest_subsample_per_class: 50000  # Subsample backtest data per asset class (200K total)
-  grade_weights:
-    A+: 1.5
+  grade_weights:                     # Base grade trust (2026-04-17 rebalance)
+    A+: 1.5                          # confirmed good setups → reinforce
     A: 1.5
     B+: 1.0
     B: 1.0
-    C: 1.0
-    D: 1.5
-  timeout_weight: 2.0                # Weight multiplier for timeout exits (informative negatives)
+    C: 0.8                           # slightly lowered — less trust in mediocre-grade signals
+    D: 0.5                           # lowered from 1.5 — don't chase lucky wins on bad setups.
+                                     # D+loss gets a 3× post-hoc boost in collect_live_data so
+                                     # "learn from bad-grade mistakes" is preserved asymmetrically.
+  timeout_weight: 2.0                # Legacy; not consumed by current collect_live_data logic
+  counterfactual_mode: "focal"       # focal = missed-wins only @ weight 1.0 (style-matched, no duplication)
+                                      # "all_horizons" = legacy (all outcomes, 3 horizons concat @ 0.3 weight)
+
+# ═══════════════════════════════════════════════════════
+# Drift Monitor Configuration (feature distribution drift)
+# ═══════════════════════════════════════════════════════
+drift_monitor:
+  enabled: true                      # Monitoring only, no behavior change — safe ON by default
+  interval_hours: 1                  # Run check every hour
+  initial_delay_sec: 60              # Delay first check by 60s after bot startup
+  state_file: "data/drift_state.json"  # Dashboard reads this for drift view
 
 # ═══════════════════════════════════════════════════════
 # Trade Journal Configuration
