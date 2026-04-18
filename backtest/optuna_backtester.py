@@ -1276,30 +1276,10 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
         if crypto_syms:
             result["crypto"] = crypto_syms
 
-    # Forex: data/forex/ → 1m parquets → OANDA format (EUR_USD)
-    forex_dir = Path(data_cfg.get("forex_dir", "data/forex"))
-    if forex_dir.exists():
-        parquets = sorted(forex_dir.glob("*_1m.parquet"))
-        forex_syms = [p.stem.replace("_1m", "") for p in parquets]
-        if forex_syms:
-            result["forex"] = forex_syms
-
-    # Stocks: data/stocks/ → 5m parquets (no 1m!) → plain symbols
-    stocks_dir = Path(data_cfg.get("stocks_dir", "data/stocks"))
-    if stocks_dir.exists():
-        parquets = sorted(stocks_dir.glob("*_5m.parquet"))
-        stock_syms = [p.stem.replace("_5m", "").replace("_", ".") for p in parquets]
-        if stock_syms:
-            result["stocks"] = stock_syms
-
-    # Commodities: data/commodities/ → 1m parquets → OANDA format
-    comm_dir = Path(data_cfg.get("commodities_dir", "data/commodities"))
-    if comm_dir.exists():
-        parquets = sorted(comm_dir.glob("*_1m.parquet"))
-        comm_syms = [p.stem.replace("_1m", "") for p in parquets]
-        if comm_syms:
-            result["commodities"] = comm_syms
-
+    # Phase 1 (2026-04-18): Crypto-Only refocus. Forex/Stocks/Commodities
+    # loaders removed. The data/ subdirectories may still exist on disk with
+    # historical parquets but are no longer scanned — the config has no
+    # forex_dir/stocks_dir/commodities_dir keys after the Phase 1 strip.
     return result
 
 
