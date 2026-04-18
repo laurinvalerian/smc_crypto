@@ -47,6 +47,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.live import Live
 
+from core.alignment import CORE_WEIGHTS_CRYPTO
 from rl_brain_v2 import RLBrainSuite
 from models.student_brain import StudentBrain
 from trade_journal import TradeJournal
@@ -953,19 +954,18 @@ class PaperBot:
         daily_bias = "neutral"
         score = 0.0
 
-        # Core weights MUST match training (_compute_alignment_score in smc_multi_style.py:1375-1376)
-        # The gate threshold (0.50) was calibrated against these training weights.
+        # Core weights imported from core.alignment (Phase 2.1 SSOT).
+        # The gate threshold (0.78) was calibrated against these training weights.
         # Crypto (non-forex) path only.
-        _tick_vol = False  # Crypto uses real volume — no tick-volume override needed
-        _w_bias      = 0.12               # any non-neutral bias (additive base)
-        _w_bias_strong = 0.08             # strong bias bonus (additive on top)
-        _w_h4        = 0.08
-        _w_h4_poi    = 0.08
-        _w_h1        = 0.08
-        _w_h1_choch  = 0.06
-        _w_zone      = 0.15
-        _w_trigger   = 0.15
-        _w_volume    = 0.10
+        _w_bias        = CORE_WEIGHTS_CRYPTO["bias"]         # any non-neutral bias (additive base)
+        _w_bias_strong = CORE_WEIGHTS_CRYPTO["bias_strong"]  # strong bias bonus (additive on top)
+        _w_h4          = CORE_WEIGHTS_CRYPTO["h4"]
+        _w_h4_poi      = CORE_WEIGHTS_CRYPTO["h4_poi"]
+        _w_h1          = CORE_WEIGHTS_CRYPTO["h1"]
+        _w_h1_choch    = CORE_WEIGHTS_CRYPTO["h1_choch"]
+        _w_zone        = CORE_WEIGHTS_CRYPTO["zone"]
+        _w_trigger     = CORE_WEIGHTS_CRYPTO["trigger"]
+        _w_volume      = CORE_WEIGHTS_CRYPTO["volume"]
         # Bonus components (not in training, small weight — never needed for gate)
         _w_adx       = 0.02
         _w_session   = 0.02

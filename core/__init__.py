@@ -8,7 +8,7 @@ together should be replaced by a single import from `core.*`.
 
 Modules:
     constants — COMMISSION, SLIPPAGE, ALIGNMENT_THRESHOLD, asset metadata
-    alignment — compute_alignment_score (planned for TODO 2.1, blocks on 2.2 SHAP)
+    alignment — compute_alignment_score (pure, bit-identical SSOT since 2.1)
 """
 
 from core.constants import (
@@ -24,6 +24,12 @@ from core.constants import (
     MAX_RISK_PER_TRADE,
 )
 
+from core.alignment import (
+    compute_alignment_score,
+    CORE_WEIGHTS_CRYPTO,
+    CORE_WEIGHTS_FOREX,
+)
+
 __all__ = [
     "COMMISSION",
     "SLIPPAGE",
@@ -35,4 +41,7 @@ __all__ = [
     "DEFAULT_RISK_PER_TRADE",
     "MAX_PORTFOLIO_HEAT",
     "MAX_RISK_PER_TRADE",
+    "compute_alignment_score",
+    "CORE_WEIGHTS_CRYPTO",
+    "CORE_WEIGHTS_FOREX",
 ]

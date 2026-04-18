@@ -56,7 +56,7 @@ Vollständiger Signal-Flow: siehe `@agents/smc-strategist.md`. Phase 2.1 wird `c
 |-------|--------|-----|
 | Phase 0: Stabilisierung (Bug_006/007 Fix, Snapshots, Baseline) | ✅ FERTIG | `v1.0-multi-asset` |
 | Phase 1: Asset-Class Strip | ✅ FERTIG | `v1.1-crypto-only-stripped` |
-| Phase 2: Core Simplification (SSOT, ML-Friedhof, Teacher/Student-Decision, Retrain) | 🔄 LÄUFT | `v1.2-core-clean` (geplant) |
+| Phase 2: Core Simplification (SSOT, ML-Friedhof, Teacher/Student-Decision, Retrain) | 🔄 LÄUFT (2.1 ✅, 2.2 ✅, 2.4 ⏳) | `v1.2-core-clean` (geplant), `v1.3-ssot-alignment` (2026-04-18) |
 | Phase 3: Code Restructuring (live_multi_bot Aufspaltung) | ⏳ TODO | `v1.3-restructured` |
 | Phase 4: ML-Konsolidierung + Funded-Compliance (Calendar-Day Fix) | ⏳ TODO | `v1.4-funded-ready` |
 | Phase 5: Validation (Walk-Forward + 4 Wochen Paper) | ⏳ TODO | `v1.5-validated` |

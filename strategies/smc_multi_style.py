@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 from smartmoneyconcepts.smc import smc as smc_lib
 
+from core.alignment import compute_alignment_score as _compute_alignment_score
+
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1338,75 +1340,10 @@ def compute_position_size(
 #  Alignment score (4-step, 0.25 per step)
 # ═══════════════════════════════════════════════════════════════════
 
-def _compute_alignment_score(
-    daily_bias: str,
-    h1_confirms: bool,
-    entry_zone: dict | None,
-    precision_trigger: bool,
-    style_weight: float = 1.0,
-    *,
-    bias_strong: bool = False,
-    h4_confirms: bool = False,
-    h4_poi: bool = False,
-    h1_choch: bool = False,
-    volume_ok: bool = False,
-    asset_class: str | None = None,
-) -> float:
-    """
-    Granular top-down alignment score (0–1).
-
-    Default scoring (crypto/stocks/commodities):
-      • Daily bias (1D) +0.12, strong +0.08, 4H +0.08, 4H POI +0.08,
-        1H +0.08, CHoCH +0.06, entry_zone +0.15, trigger +0.15, volume +0.10
-      Max = 0.90
-
-    Forex scoring (redistributed — entry_zone/trigger unreliable with tick volume):
-      • Daily bias +0.12, strong +0.12, 4H +0.12, 4H POI +0.08,
-        1H +0.10, CHoCH +0.06, entry_zone +0.08, trigger +0.08, volume +0.14
-      Max = 0.90
-
-    Clamped to [0, 1].
-    """
-    # Forex-specific weights: less on entry_zone/trigger, more on HTF structure
-    if asset_class == "forex":
-        w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.12, 0.12, 0.08
-        w_h1, w_choch, w_zone, w_trigger, w_vol = 0.10, 0.06, 0.08, 0.08, 0.14
-    else:
-        w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.08, 0.08, 0.08
-        w_h1, w_choch, w_zone, w_trigger, w_vol = 0.08, 0.06, 0.15, 0.15, 0.10
-
-    score = 0.0
-
-    if daily_bias in ("bullish", "bearish"):
-        score += w_bias
-        if bias_strong:
-            score += w_strong
-    if h4_confirms:
-        score += w_h4
-    if h4_poi:
-        score += w_h4poi
-    if h1_confirms:
-        score += w_h1
-        if h1_choch:
-            score += w_choch
-    if entry_zone is not None:
-        score += w_zone
-    if precision_trigger:
-        score += w_trigger
-    if volume_ok:
-        score += w_vol
-
-    # Backward compat: if using old 4-arg call and no new flags,
-    # fall back to roughly equivalent old scoring
-    old_style = (
-        not bias_strong and not h4_confirms and not h4_poi
-        and not h1_choch and not volume_ok
-    )
-    if old_style and score > 0:
-        # Boost to roughly match old 0.25-per-step scale
-        score = min(score * 1.3, 1.0)
-
-    return min(score * style_weight, 1.0)
+# _compute_alignment_score is now imported from core.alignment (Phase 2.1 SSOT).
+# The underscore-prefixed alias is kept so backtest/generate_rl_data.py can
+# still import `_compute_alignment_score` from this module. New code should
+# import `compute_alignment_score` directly from core.alignment.
 
 
 # ═══════════════════════════════════════════════════════════════════
