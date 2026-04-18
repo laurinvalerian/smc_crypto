@@ -1303,20 +1303,11 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
     return result
 
 
-# Asset-class specific commission rates
-ASSET_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004,       # 0.04% taker (Binance Futures)
-    "forex": 0.0003,        # ~3 pips round-trip spread (crosses average)
-    "stocks": 0.0001,       # ~$0.01/share implicit spread
-    "commodities": 0.0003,  # ~3 pips round-trip spread (Gold/Oil)
-}
-
-ASSET_SLIPPAGE: dict[str, float] = {
-    "crypto": 0.0002,       # 0.02% (liquid futures)
-    "forex": 0.0001,        # 0.01%
-    "stocks": 0.0001,       # 0.01%
-    "commodities": 0.0002,  # 0.02% (wider spreads)
-}
+# Phase 2.1 SSOT (2026-04-18): values imported from core.constants.
+# Crypto-only after Phase 1 strip — dict form retained for caller compatibility.
+from core.constants import COMMISSION, SLIPPAGE
+ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
+ASSET_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
 
 
 # ═══════════════════════════════════════════════════════════════════

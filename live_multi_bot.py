@@ -149,20 +149,14 @@ NUM_BOTS = len(TOP_30_CRYPTO)  # 30
 # Backward-compat alias
 TOP_100_COINS = TOP_30_CRYPTO
 
-# ── Asset-Class-Specific Commission Rates ────────────────────────
-ASSET_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004,       # 0.04% taker (Binance Futures)
-}
-
-# ── Training-matched cost constants for RL feature computation ───
-# These MUST match generate_rl_data.py ASSET_COMMISSION/ASSET_SLIPPAGE
-# (different from live ASSET_COMMISSION which represents actual broker fees)
-_TRAIN_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004,
-}
-_TRAIN_SLIPPAGE: dict[str, float] = {
-    "crypto": 0.0002,
-}
+# ── Trading costs imported from core SSOT (Phase 2.1, 2026-04-18) ─
+# Values previously duplicated here AND in backtest/generate_rl_data.py +
+# backtest/optuna_backtester.py + paper_grid.py + exchanges/replay_adapter.py.
+# Authoritative source is now core.constants.{COMMISSION, SLIPPAGE}.
+from core.constants import COMMISSION, SLIPPAGE
+ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
+_TRAIN_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
+_TRAIN_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
 
 # ── Asset-Class-Specific SMC Parameters (from config smc_profiles) ─
 ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {

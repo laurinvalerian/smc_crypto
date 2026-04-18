@@ -30,13 +30,11 @@ logger = logging.getLogger("paper_grid")
 #  Asset-class fees (same as backtester ASSET_COMMISSION)
 # ═══════════════════════════════════════════════════════════════════
 
-ASSET_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004,       # 0.04% taker (Binance Futures)
-    "forex": 0.00005,       # ~0.5 pip spread equivalent
-    "stocks": 0.0,          # Commission-free (Alpaca)
-    "commodities": 0.0001,  # ~1 pip spread equivalent
-}
-SLIPPAGE_PCT = 0.0001  # 0.01% per side
+# Phase 2.1 SSOT (2026-04-18): values imported from core.constants.
+# Crypto-only after Phase 1 strip — dict form retained for caller compatibility.
+from core.constants import COMMISSION, SLIPPAGE
+ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
+SLIPPAGE_PCT = SLIPPAGE
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -22,13 +22,10 @@ from exchanges.models import (
 
 logger = logging.getLogger(__name__)
 
-# Commission rates per asset class (one-way, matching live bot)
-DEFAULT_COMMISSION = {
-    "crypto": 0.0004,       # 0.04%
-    "forex": 0.00005,       # ~0.5 pip
-    "stocks": 0.0,          # commission-free
-    "commodities": 0.0001,  # ~1 pip
-}
+# Phase 2.1 SSOT (2026-04-18): value imported from core.constants.
+# Crypto-only after Phase 1 strip — dict form retained for caller compatibility.
+from core.constants import COMMISSION
+DEFAULT_COMMISSION = {"crypto": COMMISSION}
 
 
 class _VirtualOrder:

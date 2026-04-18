@@ -156,13 +156,11 @@ def _resolve_smc_params(symbol: str, asset_class: str) -> dict[str, Any]:
         base.update(overrides)
     return base
 
-ASSET_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004, "forex": 0.0003, "stocks": 0.0001, "commodities": 0.0003,
-}
-
-ASSET_SLIPPAGE: dict[str, float] = {
-    "crypto": 0.0002, "forex": 0.0001, "stocks": 0.0001, "commodities": 0.0002,
-}
+# Phase 2.1 SSOT (2026-04-18): values imported from core.constants.
+# Crypto-only after Phase 1 strip — dict form retained for caller compatibility.
+from core.constants import COMMISSION, SLIPPAGE
+ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
+ASSET_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
 
 # Max bars to simulate forward for outcome (48h of 5m bars)
 MAX_FORWARD_BARS = 576
