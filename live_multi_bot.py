@@ -1093,7 +1093,7 @@ class PaperBot:
                     self.buffer_15m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
                 comp["_ind_15m"] = ind_15m
-                _zone_bars = 12 if _fx else 6
+                _zone_bars = 6  # crypto-only (was `12 if _fx else 6`)
                 entry_zone = _find_entry_zone_at(
                     ind_15m, self.buffer_15m, daily_bias,
                     fvg_thresh, len(self.buffer_15m),
@@ -1152,7 +1152,7 @@ class PaperBot:
                     self.buffer_5m, swing_len, fvg_thresh, ob_lookback, liq_range,
                 )
                 comp["_ind_5m"] = ind_5m
-                _trig_lb = 3 if _fx else 1
+                _trig_lb = 1  # crypto-only (was `3 if _fx else 1`)
                 bull_mask, bear_mask = _precompute_5m_trigger_mask(ind_5m, lookback_bars=_trig_lb)
                 if len(bull_mask) > 0:
                     if daily_bias == "bullish" and bull_mask[-1]:
