@@ -84,12 +84,26 @@ class CircuitBreaker:
         asset_class_dd_limit: float = ASSET_CLASS_DD_LIMIT_PCT,
         alltime_dd_limit: float = ALLTIME_DD_LIMIT_PCT,
         max_portfolio_heat: float = MAX_PORTFOLIO_HEAT_PCT,
+        period_mode: str = "calendar_day",
     ) -> None:
         self._daily_limit = daily_loss_limit
         self._weekly_limit = weekly_loss_limit
         self._asset_dd_limit = asset_class_dd_limit
         self._alltime_dd_limit = alltime_dd_limit
         self._max_heat = max_portfolio_heat
+
+        # Phase 4.4 fix (2026-04-18): rolling-24h vs calendar-day daily-loss
+        # window. Funded accounts (FTMO, MyForexFunds, FundedNext, etc.) reset
+        # daily-loss limits at midnight UTC, NOT on a 24h-rolling basis. The
+        # rolling-24h default would either over-pause (loss at 23:50 UTC blocks
+        # next 24h, but funded resets at 00:00) or under-pause (back-to-back
+        # losses at 00:05 + 23:55 same calendar day breach funded limit but
+        # don't trigger rolling-24h breaker).
+        # mode="calendar_day" uses utc_now.replace(hour=0,...) — funded-compat.
+        # mode="rolling_24h" preserves legacy behaviour for non-funded use.
+        if period_mode not in ("calendar_day", "rolling_24h"):
+            raise ValueError(f"period_mode must be 'calendar_day' or 'rolling_24h', got {period_mode!r}")
+        self._period_mode = period_mode
 
         # PnL history (rolling)
         self._pnl_history: list[PnLRecord] = []
@@ -100,6 +114,23 @@ class CircuitBreaker:
 
         # Dedup log state — only log on state CHANGES, not every check()
         self._last_log_state: dict[str, Any] = {}
+
+    def _day_start(self, utc_now: datetime) -> datetime:
+        """Return the start of the current daily-loss window."""
+        if self._period_mode == "calendar_day":
+            return utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return utc_now - timedelta(hours=24)
+
+    def _week_start(self, utc_now: datetime) -> datetime:
+        """Return the start of the current weekly-loss window.
+
+        calendar_day mode: Monday 00:00 UTC of the current ISO week.
+        rolling_24h mode: 7 days before utc_now (legacy behaviour).
+        """
+        if self._period_mode == "calendar_day":
+            day_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return day_start - timedelta(days=utc_now.weekday())
+        return utc_now - timedelta(days=7)
 
     @property
     def state(self) -> CircuitBreakerState:
@@ -165,7 +196,9 @@ class CircuitBreaker:
             utc_now = datetime.now(timezone.utc)
 
         # ── Daily PnL ──────────────────────────────────────────────
-        day_start = utc_now - timedelta(hours=24)
+        # Phase 4.4 (2026-04-18): use self._day_start() to honour the
+        # configured period_mode (calendar_day vs rolling_24h).
+        day_start = self._day_start(utc_now)
         self._state.daily_pnl_pct = self._compute_period_pnl(day_start)
 
         # If already paused, only check expiry — don't re-trigger
@@ -195,7 +228,10 @@ class CircuitBreaker:
             self._last_log_state.pop("daily", None)
 
         # ── Weekly PnL ─────────────────────────────────────────────
-        week_start = utc_now - timedelta(days=7)
+        # Phase 4.4 (2026-04-18): use self._week_start() to honour the
+        # configured period_mode (calendar_day = Monday 00:00 UTC,
+        # rolling_24h = 7 days before now).
+        week_start = self._week_start(utc_now)
         self._state.weekly_pnl_pct = self._compute_period_pnl(week_start)
 
         if self._state.weekly_pnl_pct <= -self._weekly_limit:
