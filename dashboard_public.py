@@ -342,7 +342,7 @@ def _aggregate_stats() -> dict:
 
     # Per-broker: sum PnL from ALL bots, equity = initial + total PnL
     # OANDA serves both forex AND commodities from one 100K account.
-    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+    _BROKER_MAP = {"crypto": "binance"}
     _INITIAL_EQUITY = 100_000.0  # all brokers normalized to 100K display
     broker_pnl: dict[str, float] = {}  # sum of display PnL per broker
     broker_active: dict[str, int] = {}  # open trades per broker
@@ -811,8 +811,8 @@ def api_period_stats():
     cols = _journal_columns()
     has_ac = "asset_class" in cols
 
-    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
-    _ALL_BROKERS = {"binance", "oanda", "alpaca"}
+    _BROKER_MAP = {"crypto": "binance"}
+    _ALL_BROKERS = {"binance"}
 
     def _period(where_clause: str) -> dict:
         sql = (
@@ -883,7 +883,7 @@ def api_risk():
 @app.route("/api/public/circuit-breaker")
 def api_circuit_breaker():
     """Return per-broker circuit breaker status (each broker = funded account)."""
-    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+    _BROKER_MAP = {"crypto": "binance"}
     _INITIAL_EQUITY = 100_000.0
 
     # Per-broker PnL + heat from bot state files
@@ -977,11 +977,9 @@ def api_connections():
     heartbeat_path = Path("live_results/heartbeat.json")
     exchanges = {
         "Binance": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "crypto"},
-        "OANDA": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "forex"},
-        "Alpaca": {"status": "unknown", "last_data": None, "last_error": None, "asset_class": "stocks"},
     }
     per_class = {}
-    for ac in ["crypto", "forex", "stocks", "commodities"]:
+    for ac in ["crypto"]:
         per_class[ac] = {"last_candle": None, "stale": True, "connected": False}
 
     if not log_path.exists():
@@ -1002,23 +1000,15 @@ def api_connections():
         # Exchange connection status
         if "Binance (crypto): connected" in line:
             exchanges["Binance"]["status"] = "connected"
-        if "OANDA (forex+commodities): connected" in line:
-            exchanges["OANDA"]["status"] = "connected"
-        if "Alpaca (stocks): connected" in line or "AlpacaAdapter connected" in line:
-            exchanges["Alpaca"]["status"] = "connected"
 
         # Track errors per exchange
         if "ERROR" in line and ts_str:
-            if any(fx in line for fx in ["EUR_", "GBP_", "USD_", "AUD_", "NZD_", "CAD_", "CHF_"]):
-                exchanges["OANDA"]["last_error"] = ts_str
-            elif "XAU_" in line or "XAG_" in line or "WTICO_" in line or "BCO_" in line:
-                exchanges["OANDA"]["last_error"] = ts_str
-            elif "USDT" in line:
+            if "USDT" in line:
                 exchanges["Binance"]["last_error"] = ts_str
 
         # Track last candle per class (from NEAR-MISS or Loaded lines)
         if ts_str and ("NEAR-MISS" in line or "Loaded" in line or "on_candle" in line):
-            for ac in ["crypto", "forex", "stocks", "commodities"]:
+            for ac in ["crypto"]:
                 if f"class={ac}" in line:
                     per_class[ac]["last_candle"] = ts_str
                     per_class[ac]["connected"] = True
@@ -1026,25 +1016,19 @@ def api_connections():
             if any(s in line for s in ["USDT", "/USDT"]):
                 per_class["crypto"]["last_candle"] = ts_str
                 per_class["crypto"]["connected"] = True
-            if any(s in line for s in ["EUR_", "GBP_", "USD_J", "AUD_", "NZD_", "CAD_", "CHF_"]):
-                per_class["forex"]["last_candle"] = ts_str
-                per_class["forex"]["connected"] = True
-            if any(s in line for s in ["XAU_", "XAG_", "WTICO_", "BCO_"]):
-                per_class["commodities"]["last_candle"] = ts_str
-                per_class["commodities"]["connected"] = True
 
         # HEARTBEAT entries prove the bot is alive and processing candles
         if ts_str and "HEARTBEAT:" in line:
             # HEARTBEAT updates freshness for ALL classes that report candles > 0
-            # Format: HEARTBEAT: candles_5m=[crypto=X forex=Y ...] ...
-            for ac in ["crypto", "forex", "stocks", "commodities"]:
+            # Format: HEARTBEAT: candles_5m=[crypto=X ...] ...
+            for ac in ["crypto"]:
                 # Check if this class had candles (e.g. "crypto=42" means active)
                 m = re.search(rf"{ac}=(\d+)", line)
                 if m and int(m.group(1)) > 0:
                     per_class[ac]["last_candle"] = ts_str
                     per_class[ac]["connected"] = True
             # Even if no per-class candles, heartbeat proves bot is alive
-            for ac in ["crypto", "forex", "stocks", "commodities"]:
+            for ac in ["crypto"]:
                 if "last_heartbeat" not in per_class[ac]:
                     per_class[ac]["last_heartbeat"] = ts_str
                 per_class[ac]["last_heartbeat"] = ts_str
@@ -1054,15 +1038,9 @@ def api_connections():
     weekday = now.weekday()  # 0=Mon, 6=Sun
     market_open = {
         "crypto": True,  # 24/7
-        "forex": 0 <= weekday <= 4 or (weekday == 6 and hour >= 22),  # Sun 22:00 - Fri 22:00
-        "stocks": 0 <= weekday <= 4 and 13 <= hour < 20,  # Mon-Fri 13:30-20:00 UTC
-        "commodities": 0 <= weekday <= 4 or (weekday == 6 and hour >= 23),  # ~23h/day
     }
     next_open = {
         "crypto": None,
-        "forex": "So 00:00 CET" if not market_open["forex"] else None,
-        "stocks": "Mo-Fr 15:30 CET" if not market_open["stocks"] else None,
-        "commodities": "So 01:00 CET" if not market_open["commodities"] else None,
     }
 
     # Override with heartbeat.json (real candle timestamps, written by bot on each candle)
@@ -1076,7 +1054,7 @@ def api_connections():
             pass
 
     if hb_data and "per_class" in hb_data:
-        for ac in ["crypto", "forex", "stocks", "commodities"]:
+        for ac in ["crypto"]:
             hb_ac = hb_data["per_class"].get(ac, {})
             if hb_ac.get("last_candle_iso"):
                 per_class[ac]["last_candle"] = hb_ac["last_candle_iso"]
@@ -1130,7 +1108,7 @@ def api_connections():
             info["stale"] = False  # No data != stale (could be warming up)
 
     # Set exchange last_data and error age from per_class
-    for exch_name, ac_key in [("Binance", "crypto"), ("OANDA", "forex"), ("Alpaca", "stocks")]:
+    for exch_name, ac_key in [("Binance", "crypto")]:
         if per_class[ac_key]["last_candle"]:
             exchanges[exch_name]["last_data"] = per_class[ac_key]["last_candle"]
         exchanges[exch_name]["market_open"] = market_open.get(ac_key, True)
@@ -1797,7 +1775,7 @@ function updateOverview(d){
   // All-Time PnL card (same format as period cards)
   var pnlPct = d.total_pnl_pct || 0;
   var pb = d.per_broker || {};
-  var brokerLabels = {'binance':'Crypto','oanda':'Forex','alpaca':'Stocks'};
+  var brokerLabels = {'binance':'Crypto'};
   // Build per-asset breakdown from brokers
   var classMap = {};
   for(var bk in pb){ classMap[brokerLabels[bk]||bk] = pb[bk].pnl_pct || 0; }
@@ -1916,7 +1894,7 @@ function updateDailyPnl(data){
 
 function updatePerClass(d){
   var body = $('class-body');
-  var classes = ['crypto','forex','stocks','commodities'];
+  var classes = ['crypto'];
   var html = '';
   var anyData = false;
   for(var i=0; i<classes.length; i++){
@@ -2009,8 +1987,8 @@ function renderProgressBar(label, current, limit, color){
 function updateRisk(d){
   var el = $('risk-content');
   var pb = d.per_broker || {};
-  var brokerNames = {'binance':'Binance (Crypto)','oanda':'OANDA (Forex+Commod.)','alpaca':'Alpaca (Stocks)'};
-  var brokerOrder = ['binance','oanda','alpaca'];
+  var brokerNames = {'binance':'Binance (Crypto)'};
+  var brokerOrder = ['binance'];
   var html = '';
 
   for(var bi=0; bi<brokerOrder.length; bi++){
@@ -2186,12 +2164,9 @@ function updateConnections(d){
   var b = document.getElementById('conn-body');
   if(!b) return;
   var rows = '';
-  var exMap = {'Binance':'crypto','OANDA':'forex','Alpaca':'stocks'};
+  var exMap = {'Binance':'crypto'};
   var allClasses = [
     {name:'Binance', ac:'crypto'},
-    {name:'OANDA', ac:'forex'},
-    {name:'Alpaca', ac:'stocks'},
-    {name:'OANDA', ac:'commodities'},
   ];
   for(var i=0; i<allClasses.length; i++){
     var item = allClasses[i];
@@ -2298,7 +2273,7 @@ function updateActiveTrades(trades){
   }
   // Fetch equity for % calculation
   var eqData = window._lastOverview || {};
-  var totalEq = eqData.total_equity || 300000;
+  var totalEq = eqData.total_equity || 100000;
   var upnlPct = totalEq > 0 ? (totalUpnl / totalEq * 100) : 0;
   if(upnlEl){
     upnlEl.textContent = (upnlPct >= 0 ? '+' : '') + fmt(upnlPct, 2) + '%';
@@ -2307,14 +2282,13 @@ function updateActiveTrades(trades){
   if(upnlCountEl) upnlCountEl.textContent = '';
   // Per-class breakdown in %
   if(upnlBreakdown){
-    var brokerEq = {'binance':'crypto','oanda':'forex','alpaca':'stocks'};
+    var brokerEq = {'binance':'crypto'};
     var pb = eqData.per_broker || {};
     var bk = [];
     for(var cls in classPnl){
       var v = classPnl[cls];
       var clsEq = 100000;
       for(var bkey in pb){ if(brokerEq[bkey]===cls) clsEq = pb[bkey].equity || 100000; }
-      if(cls==='commodities'){ for(var bkey in pb){ if(bkey==='oanda') clsEq = pb[bkey].equity || 100000; } }
       var pct = clsEq > 0 ? (v / clsEq * 100) : 0;
       var prefix = cls.charAt(0).toUpperCase()+cls.slice(1)+': ';
       bk.push('<span class="'+pnlColor(pct)+'">' + prefix + (pct >= 0 ? '+' : '') + fmt(pct, 2) + '%</span>');

@@ -4,7 +4,7 @@ Exchange Adapters Package
 Provides a uniform interface for trading across different exchanges/brokers.
 
 Usage:
-    from exchanges import BinanceAdapter, OandaAdapter, AlpacaAdapter
+    from exchanges import BinanceAdapter
 """
 from exchanges.base import ExchangeAdapter
 from exchanges.models import (
@@ -24,16 +24,6 @@ except ImportError:
 def _get_binance_adapter():
     from exchanges.binance_adapter import BinanceAdapter
     return BinanceAdapter
-
-
-def _get_oanda_adapter():
-    from exchanges.oanda_adapter import OandaAdapter
-    return OandaAdapter
-
-
-def _get_alpaca_adapter():
-    from exchanges.alpaca_adapter import AlpacaAdapter
-    return AlpacaAdapter
 
 
 __all__ = [

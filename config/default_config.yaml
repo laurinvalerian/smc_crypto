@@ -32,9 +32,6 @@ volume_filter:
   min_relative_ratio: 1.5  # Current vol must be >= 1.5x 100-bar avg
   min_dollar_vol_5m:       # Minimum $ volume per 5m bar
     crypto: 50000
-    forex: 100000
-    stocks: 100000
-    commodities: 50000
 
 # ── Trading Styles ────────────────────────────────────────────────
 styles:
@@ -62,7 +59,7 @@ top_down:
   structure_tf: "1h"       # 1H structure confirmation
   entry_zone_tf: "15m"     # 15 m FVG / liquidity entry zone
   decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
-  alignment_threshold: 0.65 # Min alignment score [0-1] to take a trade (raised for AAA++)
+  alignment_threshold: 0.78 # Konsolidiert 2026-04-18: 0.78 ist Live-Wert. Vorher 3-fach Diskrepanz (0.65 config / 0.78 code / 0.88 CLAUDE.md)
 
 # ── AAA++ Filter Settings ───────────────────────────────────────
 aaa_plus_plus:
@@ -95,27 +92,6 @@ smc_profiles:
     liquidity_range_percent: 0.01
     min_daily_atr_pct: 0.008
     min_5m_atr_pct: 0.0015
-  forex:
-    swing_length: 20            # Forex structure develops slower than crypto
-    fvg_threshold: 0.001        # 1 pip — tick volume needs larger gaps to detect real FVGs
-    order_block_lookback: 30    # Wider lookback for slower OB formation
-    liquidity_range_percent: 0.008  # Forex liquidity pools are wider
-    min_daily_atr_pct: 0.004
-    min_5m_atr_pct: 0.0005
-  stocks:
-    swing_length: 10
-    fvg_threshold: 0.0003
-    order_block_lookback: 20
-    liquidity_range_percent: 0.005
-    min_daily_atr_pct: 0.010
-    min_5m_atr_pct: 0.0010
-  commodities:
-    swing_length: 10
-    fvg_threshold: 0.0004
-    order_block_lookback: 20
-    liquidity_range_percent: 0.005
-    min_daily_atr_pct: 0.006
-    min_5m_atr_pct: 0.0008
 
 # ── Per-Class Tier Flag Configuration ──────────────────────────────
 # Flags to SKIP per asset class for AAA++ / AAA+ tier gates.
@@ -124,17 +100,11 @@ smc_profiles:
 tier_flags:
   skip_flags:
     crypto: []                    # Real volume — all flags required
-    forex: [volume_ok]            # Tick volume — skip volume gate
-    stocks: []                    # Real volume — all flags required
-    commodities: [volume_ok]      # Tick volume — skip volume gate
   # Safety throttle: max new signals per SYMBOL per 4-hour window (by asset class).
   # Note: Python module constants (TIER_SKIP_FLAGS, MAX_SIGNALS_PER_SYMBOL_4H) are
   # the runtime source of truth. Edit those in live_multi_bot.py if tuning.
   max_signals_per_symbol_4h:
     crypto: 5
-    forex: 3                      # Conservative until forex signals are validated
-    stocks: 5
-    commodities: 2
 
 # ── Tuning Ranges (Optuna overrides) ─────────────────────────────
 tuning:
@@ -150,15 +120,6 @@ tuning_per_class:
   crypto:
     leverage_min: 3
     leverage_max: 10     # Funded-account-safe (was 20)
-  forex:
-    leverage_min: 5
-    leverage_max: 15     # Conservative (was 20)
-  stocks:
-    leverage_min: 1
-    leverage_max: 4
-  commodities:
-    leverage_min: 3
-    leverage_max: 10     # Funded-account-safe (was 20)
 
 # ── Data ──────────────────────────────────────────────────────────
 data:
@@ -170,9 +131,6 @@ data:
   data_dir: "data"         # Where Parquet files are stored
   # Per-asset-class data directories
   crypto_dir: "data/crypto"
-  forex_dir: "data/forex"
-  stocks_dir: "data/stocks"
-  commodities_dir: "data/commodities"
 
 # ── Backtest / Optuna ────────────────────────────────────────────
 backtest:
@@ -194,17 +152,6 @@ exchanges:
     testnet: true            # Use Binance Futures Testnet
     env_key: "BINANCE_API_KEY"
     env_secret: "BINANCE_SECRET"
-  oanda:
-    enabled: true
-    practice: true           # Use OANDA Practice (demo) account
-    env_token: "OANDA_ACCESS_TOKEN"
-    env_account: "OANDA_ACCOUNT_ID"
-  alpaca:
-    enabled: true
-    paper: true              # Use Alpaca Paper Trading
-    env_key: "ALPACA_API_KEY"
-    env_secret: "ALPACA_API_SECRET"
-    base_url: "https://paper-api.alpaca.markets/v2"
 
 # ── Live / Paper Trading ────────────────────────────────────────
 live:

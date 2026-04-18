@@ -1,31 +1,22 @@
 """
 ═══════════════════════════════════════════════════════════════════
- live_multi_bot.py  –  Multi-Asset SMC Trading Bot
+ live_multi_bot.py  –  Crypto-Only SMC Trading Bot
  ──────────────────────────────────────────────────────────────
- 112 bots across 4 asset classes (30 Crypto + 28 Forex +
- 50 Stocks + 4 Commodities), matching the backtester universe.
-
- Each bot is assigned to one instrument with asset-class-specific
- SMC parameters, commission rates, and leverage caps.
+ 30 Crypto bots (Binance USDT-M Futures), matching the backtester
+ universe.
 
  Features:
-   • 112 bots (30 crypto, 28 forex, 50 stocks, 4 commodities)
-   • 3 exchange adapters: Binance, OANDA, Alpaca
-   • Asset-class-specific SMC params, fees, and leverage
-   • WebSocket for crypto, REST polling for forex/stocks/commodities
-   • Central PPO RL brain shared by all instruments
-   • 20-variant Paper Grid A/B testing
-   • Circuit Breaker per asset class
-   • Trading hours enforcement (forex 24/5, stocks regular hours)
-   • Graceful degradation (missing API keys → skip that class)
-   • Rich Live Dashboard with asset-class grouping
+   • 30 crypto bots (Binance Futures)
+   • WebSocket candle + ticker feeds
+   • Central XGBoost RL brain (RLBrainSuite)
+   • Circuit Breaker for portfolio-level risk management
+   • Rich Live Dashboard
 
  Requirements:
    pip install 'ccxt[pro]' pandas numpy python-dotenv pyyaml rich torch
-   Optional: pip install v20 (OANDA), pip install alpaca-py (Alpaca)
 
  Quick Start:
-   1. Copy .env.example → .env and fill in broker API keys
+   1. Copy .env.example → .env and fill in BINANCE_API_KEY / BINANCE_SECRET
    2. python live_multi_bot.py [--config config/default_config.yaml]
    3. Ctrl+C → graceful shutdown with final summary.
 ═══════════════════════════════════════════════════════════════════
@@ -60,9 +51,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# rl_brain.py (PPO) is superseded by rl_brain_v2.py (XGBoost).
-# Keep import for extract_features (used for obs vector) but CentralRLBrain is no longer needed.
-from rl_brain import extract_features
 from rl_brain_v2 import RLBrainSuite
 from models.student_brain import StudentBrain
 from trade_journal import TradeJournal
@@ -152,37 +140,11 @@ TOP_30_CRYPTO: list[str] = [
     "TIA/USDT:USDT",  "SEI/USDT:USDT",  "WLD/USDT:USDT",
 ]
 
-# ── 28 Forex Pairs (7 Majors + 21 Crosses) — OANDA format ───────
-FOREX_28: list[str] = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "NZD_USD", "USD_CAD",
-    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "EUR_CAD", "EUR_NZD",
-    "GBP_JPY", "GBP_CHF", "GBP_AUD", "GBP_CAD", "GBP_NZD",
-    "AUD_JPY", "AUD_NZD", "AUD_CAD", "AUD_CHF",
-    "NZD_JPY", "NZD_CAD", "NZD_CHF",
-    "CAD_JPY", "CAD_CHF", "CHF_JPY",
-]
-
-# ── Top 50 US Stocks (by market cap) — Alpaca format ────────────
-STOCKS_50: list[str] = [
-    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "AMD", "AMGN", "AMZN", "AVGO",
-    "BAC", "BRK.B", "CMCSA", "COST", "CRM", "CSCO", "CVX",
-    "DHR", "DIS", "GE", "GOOGL", "HD", "IBM", "INTC", "INTU",
-    "JNJ", "JPM", "KO", "LIN", "LLY", "MA", "MCD", "META", "MRK", "MSFT",
-    "NEE", "NFLX", "NVDA", "ORCL", "PEP", "PG", "PM", "QCOM",
-    "TSLA", "TMO", "TXN", "UNH", "V", "VZ", "WMT", "XOM",
-]
-
-# ── 4 Commodities — OANDA format ────────────────────────────────
-COMMODITIES_4: list[str] = ["XAU_USD", "XAG_USD", "WTICO_USD", "BCO_USD"]
-
-# ── Combined instrument universe (112 total, matching backtester) ─
+# ── Combined instrument universe (crypto-only) ────────────────────
 ALL_INSTRUMENTS: dict[str, list[str]] = {
     "crypto": TOP_30_CRYPTO,
-    "forex": FOREX_28,
-    "stocks": STOCKS_50,
-    "commodities": COMMODITIES_4,
 }
-NUM_BOTS = sum(len(v) for v in ALL_INSTRUMENTS.values())  # 112
+NUM_BOTS = len(TOP_30_CRYPTO)  # 30
 
 # Backward-compat alias
 TOP_100_COINS = TOP_30_CRYPTO
@@ -190,19 +152,16 @@ TOP_100_COINS = TOP_30_CRYPTO
 # ── Asset-Class-Specific Commission Rates ────────────────────────
 ASSET_COMMISSION: dict[str, float] = {
     "crypto": 0.0004,       # 0.04% taker (Binance Futures)
-    "forex": 0.00005,       # ~0.5 pip spread equivalent
-    "stocks": 0.0,          # commission-free (Alpaca)
-    "commodities": 0.0001,  # ~1 pip spread equivalent
 }
 
 # ── Training-matched cost constants for RL feature computation ───
 # These MUST match generate_rl_data.py ASSET_COMMISSION/ASSET_SLIPPAGE
 # (different from live ASSET_COMMISSION which represents actual broker fees)
 _TRAIN_COMMISSION: dict[str, float] = {
-    "crypto": 0.0004, "forex": 0.0003, "stocks": 0.0001, "commodities": 0.0003,
+    "crypto": 0.0004,
 }
 _TRAIN_SLIPPAGE: dict[str, float] = {
-    "crypto": 0.0002, "forex": 0.0001, "stocks": 0.0001, "commodities": 0.0002,
+    "crypto": 0.0002,
 }
 
 # ── Asset-Class-Specific SMC Parameters (from config smc_profiles) ─
@@ -212,24 +171,6 @@ ASSET_SMC_PARAMS: dict[str, dict[str, Any]] = {
         "order_block_lookback": 20, "liquidity_range_percent": 0.01,
         "alignment_threshold": 0.78, "weight_day": 1.25, "bos_choch_filter": "medium",
         "min_daily_atr_pct": 0.005, "min_5m_atr_pct": 0.0010,
-    },
-    "forex": {
-        "swing_length": 20, "fvg_threshold": 0.001,
-        "order_block_lookback": 30, "liquidity_range_percent": 0.008,
-        "alignment_threshold": 0.78, "weight_day": 1.25, "bos_choch_filter": "medium",
-        "min_daily_atr_pct": 0.003, "min_5m_atr_pct": 0.0003,
-    },
-    "stocks": {
-        "swing_length": 10, "fvg_threshold": 0.0003,
-        "order_block_lookback": 20, "liquidity_range_percent": 0.005,
-        "alignment_threshold": 0.78, "weight_day": 1.25, "bos_choch_filter": "medium",
-        "min_daily_atr_pct": 0.007, "min_5m_atr_pct": 0.0007,
-    },
-    "commodities": {
-        "swing_length": 10, "fvg_threshold": 0.0004,
-        "order_block_lookback": 20, "liquidity_range_percent": 0.005,
-        "alignment_threshold": 0.78, "weight_day": 1.25, "bos_choch_filter": "medium",
-        "min_daily_atr_pct": 0.006, "min_5m_atr_pct": 0.0008,
     },
 }
 
@@ -285,47 +226,36 @@ _OPTIMIZED_SMC_PARAMS: dict[str, dict] = _load_optimized_smc_params()
 
 # ── Asset-Class Leverage Caps ────────────────────────────────────
 ASSET_MAX_LEVERAGE: dict[str, int] = {
-    "crypto": 10, "forex": 15, "stocks": 4, "commodities": 10,
+    "crypto": 10,
 }
 
 # ── Per-Class Flag Configuration ─────────────────────────────────
 # Flags to SKIP for alignment checks (still contribute to alignment score).
-# Tick-volume classes skip volume_ok since it's unreliable without real volume.
 CLASS_SKIP_FLAGS: dict[str, list[str]] = {
     "crypto": [],
-    "forex": ["volume_ok"],
-    "stocks": [],
-    "commodities": ["volume_ok"],
 }
 
 # Max new signals per SYMBOL per 4-hour window, by asset class (safety throttle).
-# Per-symbol, not per-class: 28 forex pairs × 3 = 84 theoretical max per class.
 # Portfolio-level protection comes from circuit breakers (daily -3%, weekly -5%).
 MAX_SIGNALS_PER_SYMBOL_4H: dict[str, int] = {
-    "crypto": 10, "forex": 10, "stocks": 10, "commodities": 5,
+    "crypto": 10,
 }
 
 # ── Asset-Class IDs for RL Brain ─────────────────────────────────
 ASSET_CLASS_ID: dict[str, float] = {
-    "crypto": 0.0, "forex": 0.25, "stocks": 0.5, "commodities": 0.75,
+    "crypto": 0.0,
 }
 
-# ── REST Polling interval for OANDA/Alpaca (no WebSocket) ────────
-REST_POLL_INTERVAL_SEC = 10             # Forex/commodities: 10s (faster candle detection)
-REST_POLL_INTERVAL_STOCKS_CANDLE = 60   # Stocks: 60s (Alpaca rate limit: 200 req/min for 50 symbols)
+# DEPRECATED: REST polling constants (OANDA/Alpaca only) — not used for Crypto WebSocket
+REST_POLL_INTERVAL_SEC = 10
+REST_POLL_INTERVAL_STOCKS_CANDLE = 60
 REST_POLL_INTERVAL_STOCKS_TICKER = 30
-REST_STAGGER_SEC = 2.0                  # Stagger between REST bots (was 0.5, caused OANDA timeouts)
+REST_STAGGER_SEC = 2.0
 
 
 def symbol_to_asset_class(symbol: str) -> str:
-    """Determine asset class from symbol format."""
-    if symbol in COMMODITIES_4:
-        return "commodities"
-    if "_" in symbol and "/" not in symbol:
-        return "forex"
-    if "/" in symbol:
-        return "crypto"
-    return "stocks"
+    """Determine asset class from symbol format. Crypto-only: always returns 'crypto'."""
+    return "crypto"
 
 # ── Fixed Money Management ────────────────────────────────────────
 FIXED_RISK_PCT = 0.0025     # 0.25 % risk per trade
@@ -395,7 +325,7 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
         "min_sl_pct": 0.002,    # 0.2% min SL (lowered — brain validates)
         "max_sl_pct": 0.008,    # 0.8% max SL
-        "min_tp_pct": 0.002,    # 0.2% min TP (lowered from 0.6% — was blocking forex)
+        "min_tp_pct": 0.002,    # 0.2% min TP
         "max_tp_pct": 0.015,    # 1.5% max TP
         "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
         # cooldown removed — circuit breaker + rate limit are sufficient
@@ -1033,32 +963,19 @@ class PaperBot:
         daily_bias = "neutral"
         score = 0.0
 
-        # Core weights MUST match training (_compute_alignment_score in smc_multi_style.py:1370-1376)
+        # Core weights MUST match training (_compute_alignment_score in smc_multi_style.py:1375-1376)
         # The gate threshold (0.50) was calibrated against these training weights.
-        _fx = self.asset_class == "forex"
-        _tick_vol = self.asset_class in ("forex", "commodities")  # OANDA tick volume
-        if _fx:
-            # Forex: match training forex path (smc_multi_style.py:1372-1373)
-            _w_bias      = 0.12               # any non-neutral bias (additive base)
-            _w_bias_strong = 0.12             # strong bias bonus (additive on top)
-            _w_h4        = 0.12               # more HTF weight for forex
-            _w_h4_poi    = 0.08
-            _w_h1        = 0.10
-            _w_h1_choch  = 0.06
-            _w_zone      = 0.08               # forex: zone unreliable w/ tick vol
-            _w_trigger   = 0.08               # forex: trigger unreliable
-            _w_volume    = 0.14               # tick vol classes get auto-1.0 score below
-        else:
-            # Non-forex: match training default path (smc_multi_style.py:1375-1376)
-            _w_bias      = 0.12               # any non-neutral bias (additive base)
-            _w_bias_strong = 0.08             # strong bias bonus (additive on top)
-            _w_h4        = 0.08
-            _w_h4_poi    = 0.08
-            _w_h1        = 0.08
-            _w_h1_choch  = 0.06
-            _w_zone      = 0.15
-            _w_trigger   = 0.15
-            _w_volume    = 0.10
+        # Crypto (non-forex) path only.
+        _tick_vol = False  # Crypto uses real volume — no tick-volume override needed
+        _w_bias      = 0.12               # any non-neutral bias (additive base)
+        _w_bias_strong = 0.08             # strong bias bonus (additive on top)
+        _w_h4        = 0.08
+        _w_h4_poi    = 0.08
+        _w_h1        = 0.08
+        _w_h1_choch  = 0.06
+        _w_zone      = 0.15
+        _w_trigger   = 0.15
+        _w_volume    = 0.10
         # Bonus components (not in training, small weight — never needed for gate)
         _w_adx       = 0.02
         _w_session   = 0.02
@@ -1089,13 +1006,6 @@ class PaperBot:
                 self.logger.debug("1D bias computation failed: %s", exc)
 
         if daily_bias == "neutral":
-            _cur_hour = datetime.now(timezone.utc).hour
-            if self.asset_class == "forex" and _cur_hour != self._last_neutral_bias_log_hour:
-                self._last_neutral_bias_log_hour = _cur_hour
-                self.logger.info(
-                    "NEAR-MISS NEUTRAL-BIAS %s | class=%s | no_daily_direction",
-                    self.symbol, self.asset_class,
-                )
             direction = "long"
             return 0.0, direction, comp
 
@@ -1287,12 +1197,6 @@ class PaperBot:
                 comp["volume_ok"] = vol_result.get("volume_ok", False)
                 comp["volume_score"] = vol_score
                 comp["volume_details"] = vol_result
-                # Tick-volume classes (OANDA): auto-pass volume with score 1.0
-                # Tick volume is unreliable for dollar-vol floors and relative ratios
-                if _tick_vol:
-                    vol_score = 1.0
-                    comp["volume_ok"] = True
-                    comp["volume_score"] = 1.0
                 score += _w_volume * vol_score
             except Exception as exc:
                 self.logger.debug("Volume scoring failed: %s", exc)
@@ -1839,12 +1743,9 @@ class PaperBot:
 
         Mirrors generate_rl_data.py:793-813 vectorized formula, per-bar.
         """
-        if asset_class == "forex":
-            w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.12, 0.12, 0.08
-            w_h1, w_choch, w_zone, w_trigger, w_vol = 0.10, 0.06, 0.08, 0.08, 0.14
-        else:
-            w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.08, 0.08, 0.08
-            w_h1, w_choch, w_zone, w_trigger, w_vol = 0.08, 0.06, 0.15, 0.15, 0.10
+        # Crypto (non-forex) weights — matches training default path
+        w_bias, w_strong, w_h4, w_h4poi = 0.12, 0.08, 0.08, 0.08
+        w_h1, w_choch, w_zone, w_trigger, w_vol = 0.08, 0.06, 0.15, 0.15, 0.10
 
         has_bias = 1.0 if components.get("bias") else 0.0
         bias_strong = 1.0 if components.get("bias_strong") else 0.0
@@ -1856,11 +1757,8 @@ class PaperBot:
         # entry time we only reach this code when an entry exists, so set to 1.
         has_entry_zone = 1.0
         precision_trigger = 1.0 if components.get("precision_trigger") else 0.0
-        # volume_ok: 0.5 for forex/commodities (tick volume), else 0/1
-        if asset_class in ("forex", "commodities"):
-            volume_ok_val = 0.5
-        else:
-            volume_ok_val = 1.0 if components.get("volume_ok") else 0.0
+        # Crypto uses real volume — no tick-volume neutral override needed
+        volume_ok_val = 1.0 if components.get("volume_ok") else 0.0
 
         alignment = (
             has_bias * w_bias
@@ -1991,11 +1889,7 @@ class PaperBot:
                      "precision_trigger", "volume_ok"):
             feat[flag] = 1.0 if components.get(flag) else 0.0
 
-        # Tick-volume classes: override volume_ok to neutral 0.5
-        # Real volume_ok is unreliable for forex/commodities (tick volume),
-        # and must match training data to avoid train/inference mismatch.
-        if self.asset_class in ("forex", "commodities"):
-            feat["volume_ok"] = 0.5
+        # Crypto uses real volume — no tick-volume neutral override needed
 
         # has_entry_zone: always 1.0 for live entry signals — by the time we
         # reach _build_xgb_features, entry zone existence is already confirmed.
@@ -2264,14 +2158,12 @@ class PaperBot:
 
         # ── Volume filter (basic pre-check – detailed scoring in alignment) ─
         # Quick reject if volume is clearly dead (< 0.5x avg)
-        # Skip for tick-volume classes (forex/commodities) — meaningless with tick data
         # The full 3-layer volume scoring happens in _multi_tf_alignment_score
-        if self.asset_class not in ("forex", "commodities"):
-            volumes = [c["volume"] for c in buf[-20:]]
-            avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
-            if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
-                self._pending_signal = None
-                return
+        volumes = [c["volume"] for c in buf[-20:]]
+        avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
+        if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
+            self._pending_signal = None
+            return
 
         # ── Multi-TF alignment score (granular) ───────────────────
         score, direction, components = self._multi_tf_alignment_score(candle)
@@ -2433,19 +2325,8 @@ class PaperBot:
         # Style encoding for XGBoost (matches training: scalp=0.0, day=0.5, swing=1.0)
         _style_map = {STYLE_SCALP: 0.0, STYLE_DAY: 0.5, STYLE_SWING: 1.0}
         _xgb_features["style_id"] = _style_map.get(style, 0.5)
-        _ppo_obs = extract_features(
-            buf, score, direction,
-            setup_tier="", trade_style=style,
-            rr_ratio=rr, daily_atr_pct=daily_atr,
-            adx_normalized=min(components.get("adx_value", 0.0) / 50.0, 1.0),
-            session_score=components.get("session_score", 0.5),
-            zone_quality=components.get("zone_quality", 0.0),
-            volume_score=components.get("volume_score", 0.0),
-            momentum_score=components.get("momentum_score", 0.0),
-            tf_agreement_score=components.get("tf_agreement_score", 0.0),
-            spread_normalized=0.0,
-            asset_class_id=ASSET_CLASS_ID.get(self.asset_class, 0.0),
-        )
+        # Legacy PPO obs vector — no longer consumed (PPO brain removed).
+        _ppo_obs = np.zeros(24, dtype=np.float32)
 
         # Strip heavy indicator DataFrames — only needed for feature extraction
         for _k in ("_ind_1d", "_ind_4h", "_ind_1h", "_ind_15m", "_ind_5m", "_premium_discount"):
@@ -3027,9 +2908,6 @@ class PaperBot:
 
         def _round_qty(q: float) -> float:
             """Round qty to exchange precision, and clamp to [min_qty, max_qty]."""
-            # Alpaca: fractional shares cannot be sold short — floor to whole shares
-            if direction == "short" and self.adapter.exchange_id == "alpaca":
-                q = float(int(q))  # floor to integer
             try:
                 q = float(self.adapter.amount_to_precision(symbol, q))
             except Exception:
@@ -3900,11 +3778,9 @@ class PaperBot:
 # ═══════════════════════════════════════════════════════════════════
 
 async def create_adapters(config: dict[str, Any]) -> dict[str, ExchangeAdapter]:
-    """Create and connect all available exchange adapters.
+    """Create and connect the Binance exchange adapter (crypto-only).
 
     Returns dict mapping asset_class → adapter.
-    Skips adapters whose API keys are missing or packages not installed.
-    OANDA handles both 'forex' and 'commodities' (same adapter instance).
     """
     adapters: dict[str, ExchangeAdapter] = {}
 
@@ -3921,45 +3797,6 @@ async def create_adapters(config: dict[str, Any]) -> dict[str, ExchangeAdapter]:
             logger.warning("Binance connect failed: %s", exc)
     else:
         logger.warning("BINANCE keys missing — crypto disabled")
-
-    # ── OANDA (forex + commodities) ─────────────────────────────
-    ot = os.getenv("OANDA_ACCESS_TOKEN", "")
-    oa = os.getenv("OANDA_ACCOUNT_ID", "")
-    if ot and oa:
-        try:
-            from exchanges.oanda_adapter import OandaAdapter
-            adapter = OandaAdapter(
-                account_id=oa, access_token=ot, environment="practice",
-            )
-            await adapter.connect()
-            adapters["forex"] = adapter
-            adapters["commodities"] = adapter  # same instance
-            logger.info("OANDA (forex+commodities): connected ✓")
-        except ImportError:
-            logger.warning("v20 not installed — forex/commodities disabled (pip install v20)")
-        except Exception as exc:
-            logger.warning("OANDA connect failed: %s", exc)
-    else:
-        logger.warning("OANDA keys missing — forex/commodities disabled")
-
-    # ── Alpaca (stocks) ─────────────────────────────────────────
-    ak = os.getenv("ALPACA_API_KEY", "")
-    as_ = os.getenv("ALPACA_API_SECRET", "")
-    if ak and as_:
-        try:
-            from exchanges.alpaca_adapter import AlpacaAdapter
-            adapter = AlpacaAdapter(
-                api_key=ak, secret_key=as_, paper=True,
-            )
-            await adapter.connect()
-            adapters["stocks"] = adapter
-            logger.info("Alpaca (stocks): connected ✓")
-        except ImportError:
-            logger.warning("alpaca-py not installed — stocks disabled (pip install alpaca-py)")
-        except Exception as exc:
-            logger.warning("Alpaca connect failed: %s", exc)
-    else:
-        logger.warning("ALPACA keys missing — stocks disabled")
 
     return adapters
 
@@ -4193,15 +4030,13 @@ def build_dashboard(
 
 class LiveMultiBotRunner:
     """
-    Orchestrates multi-asset PaperBot instances (112 instruments) with:
-      - 3 exchange adapters: Binance (crypto), OANDA (forex+commodities), Alpaca (stocks)
-      - WebSocket for crypto, REST polling for forex/stocks/commodities
-      - Real bracket orders via adapter interface
-      - Position polling per adapter (detects TP/SL fills)
-      - Rich Live Dashboard grouped by asset class
-      - Central shared RL brain
+    Orchestrates 30 Crypto PaperBot instances (Binance Futures) with:
+      - WebSocket candle + ticker feeds
+      - Real bracket orders via BinanceAdapter
+      - Position polling (detects TP/SL fills)
+      - Rich Live Dashboard
+      - Central shared RL brain (RLBrainSuite)
       - Circuit breaker for portfolio-level risk management
-      - Paper Grid multi-variant A/B testing
 
     Each bot trades only its assigned instrument.
     """
@@ -4235,7 +4070,7 @@ class LiveMultiBotRunner:
 
         # ── Circuit Breakers (per-broker for funded account isolation) ──
         # Each broker = separate funded account → independent DD limits.
-        _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "oanda", "commodities": "oanda"}
+        _BROKER_MAP = {"crypto": "binance"}
         self._broker_cbs: dict[str, CircuitBreaker] = {}
         for bot in self.bots:
             broker = _BROKER_MAP.get(bot.asset_class, bot.asset_class)
@@ -4271,8 +4106,8 @@ class LiveMultiBotRunner:
 
         # ── Candle tracking + watchdog state ──────────────────────
         self._last_candle_ts: dict[str, float] = {}  # symbol -> time.time()
-        self._candles_by_class: dict[str, int] = {ac: 0 for ac in ["crypto", "forex", "stocks", "commodities"]}
-        self._candles_since_heartbeat: dict[str, int] = {ac: 0 for ac in ["crypto", "forex", "stocks", "commodities"]}
+        self._candles_by_class: dict[str, int] = {ac: 0 for ac in ["crypto"]}
+        self._candles_since_heartbeat: dict[str, int] = {ac: 0 for ac in ["crypto"]}
         self._symbol_restart_times: dict[str, list[float]] = {}  # symbol -> timestamps of watchdog restarts
         self._rest_fallback_symbols: set[str] = set()  # symbols degraded from WS to REST
         self._last_status_write: float = 0.0  # debounce heartbeat.json writes
@@ -4675,50 +4510,6 @@ class LiveMultiBotRunner:
                         bot.symbol, trade["sl"], trade["tp"], _atr,
                     )
 
-                    # Alpaca: submit standalone stop + limit orders
-                    if bot.adapter and bot.adapter.exchange_id == "alpaca":
-                        try:
-                            _open_orders = await bot.adapter.fetch_open_orders(bot.symbol)
-                            _has_stop = any("stop" in (o.get("type", "") or "").lower() for o in _open_orders)
-                            if not _has_stop:
-                                _sl_result = await bot.adapter.create_stop_loss(
-                                    symbol=bot.symbol, side=_closing_side,
-                                    qty=trade["qty"], stop_price=trade["sl"],
-                                )
-                                trade["sl_order_id"] = _sl_result.order_id
-                                _tp_result = await bot.adapter.create_take_profit(
-                                    symbol=bot.symbol, side=_closing_side,
-                                    qty=trade["qty"], stop_price=trade["tp"],
-                                )
-                                trade["tp_order_id"] = _tp_result.order_id
-                                logger.info(
-                                    "ATTACH SL/TP %s: exchange orders submitted (sl_id=%s tp_id=%s)",
-                                    bot.symbol, _sl_result.order_id, _tp_result.order_id,
-                                )
-                            else:
-                                logger.info("ATTACH SL/TP %s: existing stop order found, skipping", bot.symbol)
-                        except Exception as exc:
-                            logger.error(
-                                "ATTACH SL/TP %s: exchange orders FAILED: %s — CLOSING UNPROTECTED POSITION",
-                                bot.symbol, exc,
-                            )
-                            # Close unprotected position immediately
-                            try:
-                                await bot.adapter.create_market_order(
-                                    bot.symbol, _closing_side, trade["qty"],
-                                    {"reduceOnly": True},
-                                )
-                                logger.warning(
-                                    "ATTACH SL/TP %s: CLOSED unprotected position (SL/TP submit failed)",
-                                    bot.symbol,
-                                )
-                                bot._active_trades.remove(trade)
-                            except Exception as close_exc:
-                                logger.error(
-                                    "ATTACH SL/TP %s: FAILED to close unprotected position: %s — REQUIRES MANUAL INTERVENTION",
-                                    bot.symbol, close_exc,
-                                )
-
                     bot._save_state()
                 except Exception as exc:
                     logger.error("ATTACH SL/TP %s: ATR computation failed: %s — position remains UNPROTECTED", bot.symbol, exc)
@@ -4751,14 +4542,7 @@ class LiveMultiBotRunner:
                 continue
             seen_adapters.add(aid)
 
-            # OANDA: SL/TP are trade-attached, no standalone orders to sweep
-            if adapter.supports_attached_sl_tp:
-                continue
-
             bot_lists = [self._bots_by_class.get(ac, [])]
-            # OANDA adapter shared by forex + commodities (but skipped above)
-            if ac == "forex":
-                bot_lists.append(self._bots_by_class.get("commodities", []))
 
             for bot_list in bot_lists:
                 for bot in bot_list:
@@ -4874,34 +4658,6 @@ class LiveMultiBotRunner:
                 "_reconciled": True,  # flag: restored from exchange, not from signal
             }
 
-            # For OANDA: try to get trade details (SL/TP/trade_id)
-            if bot.adapter.exchange_id == "oanda":
-                try:
-                    trades_resp = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            bot.adapter._api.trade.list_open, bot.adapter._account_id,
-                        ),
-                        timeout=15.0,
-                    )
-                    if hasattr(trades_resp, 'body') and 'trades' in trades_resp.body:
-                        oanda_sym = bot.symbol.replace("/", "_")
-                        for t in trades_resp.body['trades']:
-                            if t.instrument == oanda_sym:
-                                trade["oanda_trade_id"] = t.id
-                                trade["entry"] = float(t.price)
-                                trade["qty"] = abs(float(t.currentUnits))
-                                if hasattr(t, 'stopLossOrder') and t.stopLossOrder:
-                                    trade["sl"] = float(t.stopLossOrder.price)
-                                if hasattr(t, 'takeProfitOrder') and t.takeProfitOrder:
-                                    trade["tp"] = float(t.takeProfitOrder.price)
-                                trade["direction"] = "long" if float(t.currentUnits) > 0 else "short"
-                                trade["entry_time"] = datetime.fromisoformat(
-                                    t.openTime[:19].replace("T", " ")
-                                ).replace(tzinfo=timezone.utc)
-                                break
-                except Exception as exc:
-                    bot.logger.debug("OANDA trade detail fetch failed: %s", exc)
-
             # ── ATR-based SL/TP for orphaned/reconciled trades with no protection ──
             if trade["sl"] == 0.0 and hasattr(bot, '_buffer_5m_deque') and bot._buffer_5m_deque and len(bot._buffer_5m_deque) >= 14:
                 try:
@@ -4923,50 +4679,6 @@ class LiveMultiBotRunner:
                             "RECONCILED %s: attached conservative SL=%.5f TP=%.5f (ATR=%.5f, 3x/4.5x)",
                             bot.symbol, trade["sl"], trade["tp"], _atr,
                         )
-                        # Alpaca: submit standalone stop + limit orders for the existing position
-                        if bot.adapter.exchange_id == "alpaca":
-                            try:
-                                _open_orders = await bot.adapter.fetch_open_orders(bot.symbol)
-                                _has_stop = any("stop" in (o.get("type", "") or "").lower() for o in _open_orders)
-                                if not _has_stop:
-                                    _sl_result = await bot.adapter.create_stop_loss(
-                                        symbol=bot.symbol, side=_closing_side,
-                                        qty=trade["qty"], stop_price=trade["sl"],
-                                    )
-                                    trade["sl_order_id"] = _sl_result.order_id
-                                    _tp_result = await bot.adapter.create_take_profit(
-                                        symbol=bot.symbol, side=_closing_side,
-                                        qty=trade["qty"], stop_price=trade["tp"],
-                                    )
-                                    trade["tp_order_id"] = _tp_result.order_id
-                                    logger.info(
-                                        "RECONCILED %s: exchange SL/TP submitted (sl_id=%s tp_id=%s)",
-                                        bot.symbol, _sl_result.order_id, _tp_result.order_id,
-                                    )
-                                else:
-                                    logger.info("RECONCILED %s: existing stop order found, skipping SL/TP submit", bot.symbol)
-                            except Exception as exc:
-                                logger.error(
-                                    "RECONCILED %s: exchange SL/TP FAILED: %s — CLOSING UNPROTECTED POSITION",
-                                    bot.symbol, exc,
-                                )
-                                # Close unprotected position immediately
-                                try:
-                                    _close_side = "sell" if trade["direction"] == "long" else "buy"
-                                    await bot.adapter.create_market_order(
-                                        bot.symbol, _close_side, trade["qty"],
-                                        {"reduceOnly": True},
-                                    )
-                                    logger.warning(
-                                        "RECONCILED %s: CLOSED unprotected position (SL/TP submit failed)",
-                                        bot.symbol,
-                                    )
-                                except Exception as close_exc:
-                                    logger.error(
-                                        "RECONCILED %s: FAILED to close unprotected position: %s — REQUIRES MANUAL INTERVENTION",
-                                        bot.symbol, close_exc,
-                                    )
-                                continue  # skip adding to active_trades
                 except Exception as exc:
                     logger.error(
                         "RECONCILED %s: ATR SL/TP computation failed: %s — CLOSING UNPROTECTED POSITION",
@@ -5044,11 +4756,11 @@ class LiveMultiBotRunner:
             # Per-class candle counts since last heartbeat
             counts = " ".join(
                 f"{ac}={self._candles_since_heartbeat.get(ac, 0)}"
-                for ac in ["crypto", "forex", "stocks", "commodities"]
+                for ac in ["crypto"]
             )
             totals = " ".join(
                 f"{ac}={self._candles_by_class.get(ac, 0)}"
-                for ac in ["crypto", "forex", "stocks", "commodities"]
+                for ac in ["crypto"]
             )
             active_positions = sum(
                 1 for b in self.bots if b._active_trades
@@ -5070,7 +4782,7 @@ class LiveMultiBotRunner:
         """Write heartbeat.json with real candle timestamps for the dashboard."""
         now = time.time()
         per_class: dict[str, dict[str, Any]] = {}
-        for ac in ["crypto", "forex", "stocks", "commodities"]:
+        for ac in ["crypto"]:
             # Find the most recent candle timestamp for this class
             class_symbols = [b.symbol for b in self.bots if b.asset_class == ac]
             latest = 0.0
@@ -5247,7 +4959,7 @@ class LiveMultiBotRunner:
     # ── Candle staleness monitor (faster than watchdog, per-class) ──
 
     async def _check_candle_staleness(self) -> None:
-        """Check for stale candles every 60s. Catches forex/commodity staleness faster than the 10-min watchdog."""
+        """Check for stale candles every 60s. Catches WebSocket staleness faster than the 10-min watchdog."""
         # 5m candles arrive once per 5 min (300s). Threshold must be > 300s to avoid
         # false positives between candle deliveries. 420s = 7 min = missed one full cycle.
         STALE_THRESHOLD = 420
@@ -6105,10 +5817,9 @@ class LiveMultiBotRunner:
     async def _fetch_per_broker_equity(self) -> dict[str, float]:
         """Fetch equity per broker for per-account DD tracking.
 
-        Returns dict like {"binance": 5000.0, "oanda": 100000.0, "alpaca": 100000.0}.
-        OANDA is shared by forex + commodities (one account).
+        Returns dict like {"binance": 5000.0}.
         """
-        _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+        _BROKER_MAP = {"crypto": "binance"}
         broker_equity: dict[str, float] = {}
         seen: set[int] = set()
         for ac, adapter in self.adapters.items():
@@ -6132,7 +5843,7 @@ class LiveMultiBotRunner:
             while not self._shutdown.is_set():
                 try:
                     # Per-broker equity + circuit breaker updates
-                    _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+                    _BROKER_MAP = {"crypto": "binance"}
                     broker_equity = await self._fetch_per_broker_equity()
                     total_equity = sum(broker_equity.values())
                     for b in self.bots:
@@ -6204,51 +5915,22 @@ class LiveMultiBotRunner:
         # Replaces the old indiscriminate "cancel ALL orders" sweep.
         await self._startup_sweep_zombie_orders()
 
-        # Start watchers: WebSocket for crypto, REST polling for others
-        # Crypto: stagger WS subscriptions (1s apart) to avoid thundering herd on ccxt.pro
-        # REST: stagger to avoid rate limits (stocks: 2s apart, others: 2s)
+        # Start watchers: WebSocket for crypto
+        # Stagger WS subscriptions (1s apart) to avoid thundering herd on ccxt.pro
         _crypto_idx = 0
-        _stock_idx = 0
-        _rest_idx = 0
         for bot in self.bots:
-            if bot.asset_class == "crypto":
-                # WebSocket-based — staggered to prevent subscription deadlock
-                stagger = _crypto_idx * WS_STAGGER_SEC
-                self._watcher_tasks[bot.symbol] = asyncio.create_task(
-                    self._watch_symbol(bot.symbol, stagger_delay=stagger)
-                )
-                self._ticker_tasks[bot.symbol] = asyncio.create_task(
-                    self._watch_ticker(bot.symbol, stagger_delay=stagger)
-                )
-                _crypto_idx += 1
-            else:
-                # REST polling for OANDA/Alpaca — staggered start
-                if bot.asset_class == "stocks":
-                    stagger = _stock_idx * 2.0
-                    _stock_idx += 1
-                else:
-                    stagger = _rest_idx * REST_STAGGER_SEC
-                    _rest_idx += 1
-                self._watcher_tasks[bot.symbol] = asyncio.create_task(
-                    self._poll_candles(bot, stagger_sec=stagger)
-                )
-                # OANDA bots use batch ticker (1-2 calls instead of 36)
-                if bot.adapter.exchange_id != "oanda":
-                    self._ticker_tasks[bot.symbol] = asyncio.create_task(
-                        self._poll_ticker(bot, stagger_sec=stagger)
-                    )
-
-        # Start batch ticker polling for OANDA bots (forex + commodities)
-        _oanda_bots = [b for b in self.bots if b.adapter is not None and b.adapter.exchange_id == "oanda"]
-        if _oanda_bots:
-            self._batch_ticker_task = asyncio.create_task(
-                self._poll_tickers_batch_oanda(_oanda_bots)
+            stagger = _crypto_idx * WS_STAGGER_SEC
+            self._watcher_tasks[bot.symbol] = asyncio.create_task(
+                self._watch_symbol(bot.symbol, stagger_delay=stagger)
             )
-            logger.info("Batch ticker started for %d OANDA instruments", len(_oanda_bots))
+            self._ticker_tasks[bot.symbol] = asyncio.create_task(
+                self._watch_ticker(bot.symbol, stagger_delay=stagger)
+            )
+            _crypto_idx += 1
 
         logger.info(
-            "All watchers started: %d crypto (staggered %.0fs apart), %d REST",
-            _crypto_idx, WS_STAGGER_SEC, _stock_idx + _rest_idx,
+            "All watchers started: %d crypto (staggered %.0fs apart)",
+            _crypto_idx, WS_STAGGER_SEC,
         )
 
         # Position poller (detects TP/SL fills on exchange)
@@ -6310,7 +5992,7 @@ class LiveMultiBotRunner:
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
         # Fetch final equity per-broker before closing exchange
-        _BROKER_MAP = {"crypto": "binance", "forex": "oanda", "stocks": "alpaca", "commodities": "oanda"}
+        _BROKER_MAP = {"crypto": "binance"}
         final_broker_eq = await self._fetch_per_broker_equity()
         for b in self.bots:
             broker = _BROKER_MAP.get(b.asset_class, b.asset_class)
@@ -6399,7 +6081,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
 
     # ── Determine active instruments ──────────────────────────────
     active: list[tuple[str, str]] = []  # (symbol, asset_class)
-    for ac in ["crypto", "forex", "stocks", "commodities"]:
+    for ac in ["crypto"]:
         if ac in adapters:
             for sym in ALL_INSTRUMENTS[ac]:
                 active.append((sym, ac))
@@ -6417,7 +6099,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
     # ── Create Student Brain (unified Teacher-Student) ────────────
     # When `student_brain.enabled: true`, replaces rl_suite's entry/SL/TP/size
     # stack with one multi-head model trained on hindsight-optimal targets.
-    # Initialised here so all 112 bots share one loaded instance (saves RAM).
+    # Initialised here so all bots share one loaded instance (saves RAM).
     student_brain = StudentBrain(config)
 
     # ── Create bots ───────────────────────────────────────────────
@@ -6512,7 +6194,7 @@ async def async_main(config: dict[str, Any], output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SMC Multi-Asset Live Trading Bot (Crypto + Forex + Stocks + Commodities)",
+        description="SMC Crypto Live Trading Bot (Binance Futures)",
     )
     parser.add_argument(
         "--config", default="config/default_config.yaml",
