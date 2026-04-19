@@ -40,7 +40,7 @@ Crypto-Only Trading Bot basierend auf Smart Money Concepts (SMC/ICT) auf Binance
   → Tier-Gate (alignment_threshold = 0.78) → Student/XGB Gate → Bracket Order
 ```
 
-Vollständiger Signal-Flow: siehe `@agents/smc-strategist.md`. Phase 2.1 wird `core/alignment.py` als Single Source of Truth einführen.
+Vollständiger Signal-Flow: siehe `@agents/smc-strategist.md`. Phase 2.1 ✅ hat `core/alignment.py` als Single Source of Truth etabliert (Tag `v1.3-ssot-alignment`).
 
 ### Tier-System (Threshold konsolidiert auf 0.78)
 
@@ -56,9 +56,9 @@ Vollständiger Signal-Flow: siehe `@agents/smc-strategist.md`. Phase 2.1 wird `c
 |-------|--------|-----|
 | Phase 0: Stabilisierung (Bug_006/007 Fix, Snapshots, Baseline) | ✅ FERTIG | `v1.0-multi-asset` |
 | Phase 1: Asset-Class Strip | ✅ FERTIG | `v1.1-crypto-only-stripped` |
-| Phase 2: Core Simplification (SSOT, ML-Friedhof, Teacher/Student-Decision, Retrain) | 🔄 LÄUFT (2.1 ✅, 2.2 ✅, 2.4 ⏳) | `v1.2-core-clean` (geplant), `v1.3-ssot-alignment` (2026-04-18) |
-| Phase 3: Code Restructuring (live_multi_bot Aufspaltung) | ⏳ TODO | `v1.3-restructured` |
-| Phase 4: ML-Konsolidierung + Funded-Compliance (Calendar-Day Fix) | ⏳ TODO | `v1.4-funded-ready` |
+| Phase 2: Core Simplification (SSOT, ML-Friedhof, Teacher/Student-Decision, Retrain) | 🔄 LÄUFT (2.1 ✅, 2.2 ✅, 2.4 ⏳) | `v1.3-ssot-alignment` (2026-04-18) |
+| Phase 3: Code Restructuring (live_multi_bot Aufspaltung) | 🔄 LÄUFT (Dashboard ✅, Block 0 record-close ownership ✅) | `v1.4-record-close-owned` (2026-04-19). Runner + PaperBot File-Split pending. |
+| Phase 4: ML-Konsolidierung + Funded-Compliance (Calendar-Day Fix ✅) | 🔄 (CB Calendar-Day ✅) | `v1.3-cb-funded` |
 | Phase 5: Validation (Walk-Forward + 4 Wochen Paper) | ⏳ TODO | `v1.5-validated` |
 | Phase 6: Funded Account Go/No-Go | ⏳ Nach Phase 5 | — |
 
@@ -143,10 +143,10 @@ Details: siehe `@agents/backtester.md`
 ## Dateistruktur
 
 ```
-bot/
+bongus_rival/                      # Repo-Root
 ├── .env / .env.example            # API Keys
 ├── check_downloads.sh / check_backtest.sh
-├── live_multi_bot.py              # Haupt-Orchestrator (PaperBot + Runner) — Phase 3 spaltet auf
+├── live_multi_bot.py              # Haupt-Orchestrator (PaperBot + Runner) — Phase 3 spaltet in bot/ auf
 ├── paper_grid.py                  # Multi-Variant A/B Testing (Crypto)
 ├── rl_brain_v2.py                 # XGBoost RLBrainSuite (Entry-Filter + BE-Manager aktiv)
 ├── train_student.py               # Student-Brain Training
@@ -154,6 +154,12 @@ bot/
 ├── drift_monitor.py               # KS/PSI Drift-Detection
 ├── trade_journal.py               # SQLite Trade-Logging (Bug_006 fixed)
 ├── live_teacher.py                # Live Teacher-Feedback
+├── bot/                           # Phase 3 Extract-Ziel
+│   ├── __init__.py
+│   └── dashboard.py               # Rich TUI Dashboard (250 LOC, extrahiert 2026-04-18)
+├── core/
+│   ├── constants.py               # COMMISSION, SLIPPAGE, ALIGNMENT_THRESHOLD SSOT
+│   └── alignment.py               # compute_alignment_score + CORE_WEIGHTS_CRYPTO (Phase 2.1 SSOT)
 ├── strategies/
 │   └── smc_multi_style.py         # SMC/ICT Strategie (kausale Indikatoren V16)
 ├── filters/                       # AAA++ Filter-Module
@@ -187,7 +193,12 @@ bot/
 │   ├── binance_adapter.py         # Crypto Adapter
 │   └── replay_adapter.py          # Backtest-Replay
 ├── risk/
-│   └── circuit_breaker.py         # Daily/Weekly/All-Time DD (Phase 4: Calendar-Day Fix)
+│   └── circuit_breaker.py         # Daily/Weekly/All-Time DD (Calendar-Day ✅ Phase 4.5)
+├── tests/                         # pytest suite (52 cases)
+│   ├── test_alignment.py          # Bit-parity sweep (1536 cases) + Core SSOT
+│   ├── test_bug_fixes.py          # Bug_006 / Bug_007 regression
+│   ├── test_circuit_breaker.py    # Calendar-Day funded-compat
+│   └── test_constants.py          # SSOT verification
 ├── archive/
 │   ├── multi_asset_legacy/        # OANDA/Alpaca-Adapter, Forex/Stocks-Downloader, ranker/, rl_brain.py
 │   ├── models/                    # 10 deaktivierte/legacy .pkl
