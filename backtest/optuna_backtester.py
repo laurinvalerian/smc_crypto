@@ -65,6 +65,7 @@ from core.metrics import (
     trial_sharpe_variance as _trial_sharpe_variance,
 )
 from backtest.cpcv import run_cpcv, cpcv_summary
+from backtest.pbo import compute_pbo
 
 # Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS, BACKTEST_OPTUNA_WORKERS).
 # Signal precompute is numpy-heavy → scales with physical cores.
@@ -2829,6 +2830,81 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                 except Exception as exc:
                     logger.error(
                         "%s CPCV post-bruteforce validation failed: %s",
+                        ac.upper(), exc, exc_info=True,
+                    )
+
+            # ── Phase E: PBO post-bruteforce validation ──────────────
+            # DSR asks "is this Sharpe real vs. the null?"
+            # CPCV asks "is this Sharpe stable across OOS combinations?"
+            # PBO asks "how often does IS-best lose OOS?" — the
+            # *selection* question neither of the above directly answers.
+            # Deploy-gate per plan §2.5: PBO < 0.30.
+            pbo_cfg = cfg.get("pbo", {}) or {}
+            pbo_enabled = pbo_cfg.get("enabled", True)
+            pbo_n_splits = int(pbo_cfg.get("n_splits", 128))
+            pbo_gate = float(pbo_cfg.get("gate_threshold", 0.30))
+            if pbo_enabled:
+                try:
+                    pbo_sharpe_cols = [
+                        c for c in grid_df.columns
+                        if c.startswith("w") and c.endswith("_sharpe")
+                    ]
+                    if len(pbo_sharpe_cols) < 4:
+                        raise ValueError(
+                            f"need >= 4 window-sharpe columns, "
+                            f"got {len(pbo_sharpe_cols)}"
+                        )
+                    # Bailey-BLLZ PBO needs even T; drop the last col
+                    # if windows are odd — order preserved so IS/OOS
+                    # halves stay contiguous-comparable.
+                    if len(pbo_sharpe_cols) % 2 != 0:
+                        pbo_sharpe_cols = pbo_sharpe_cols[:-1]
+                    pbo_perf = grid_df[pbo_sharpe_cols].to_numpy(dtype=float)
+
+                    pbo_result = compute_pbo(
+                        pbo_perf, n_splits=pbo_n_splits, seed=42,
+                    )
+                    # Make JSON-serializable.
+                    pbo_result["logit_values"] = pbo_result[
+                        "logit_values"
+                    ].tolist()
+                    pbo_result["gate_threshold"] = pbo_gate
+                    pbo_result["gate_pass"] = (
+                        pbo_result["pbo"] < pbo_gate
+                    )
+                    pbo_result["asset_class"] = ac
+                    pbo_result["metric_used"] = "w*_sharpe"
+
+                    with open(ac_results_dir / "pbo_summary.json", "w") as f:
+                        json.dump(pbo_result, f, indent=2, default=str)
+
+                    evergreen["pbo"] = {
+                        k: v for k, v in pbo_result.items()
+                        if k != "logit_values"
+                    }
+                    with open(eg_path, "w") as f:
+                        json.dump(evergreen, f, indent=2, default=str)
+
+                    gate_msg = (
+                        "PASS" if pbo_result["gate_pass"]
+                        else "FAIL — funded-deploy blocked"
+                    )
+                    logger.info(
+                        "%s PBO: %.3f (gate %.2f, %d splits, "
+                        "λ_median=%.3f) | %s",
+                        ac.upper(), pbo_result["pbo"], pbo_gate,
+                        pbo_result["n_splits_used"],
+                        pbo_result["lambda_median"], gate_msg,
+                    )
+                    if not pbo_result["gate_pass"]:
+                        logger.warning(
+                            "%s PBO %.3f >= %.2f: selection-bias gate "
+                            "FAIL. Do NOT deploy to funded account.",
+                            ac.upper(), pbo_result["pbo"], pbo_gate,
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "%s PBO post-bruteforce validation failed: %s",
                         ac.upper(), exc, exc_info=True,
                     )
         else:
