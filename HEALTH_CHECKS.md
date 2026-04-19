@@ -5,7 +5,7 @@
 > with an expected result and an escalation path. Update this file whenever the
 > architecture changes or you deploy something that needs observation.
 
-Last updated: 2026-04-17
+Last updated: 2026-04-19 (post v1.11-robustness-plus deploy + clean-start)
 
 ---
 
@@ -14,17 +14,21 @@ Last updated: 2026-04-17
 Run these first. If any fail, the bot might be in trouble and needs deep check.
 
 ```bash
-# 1. Service active?
-ssh server "systemctl is-active trading-bot.service"
-# Expected: active
+# 1. All 4 units active?
+ssh server "for s in trading-bot trading-dashboard trading-dashboard-public; do systemctl is-active \$s.service; done; systemctl is-active drift-monitor.timer"
+# Expected: active × 4
 
 # 2. Last activity recent?
 ssh server "tail -3 /root/bot/paper_trading.log"
-# Expected: timestamp within last ~5 minutes (markets open) or last heartbeat
+# Expected: timestamp within last ~5 minutes (crypto 24/7) or last heartbeat
 
-# 3. Heartbeat stats
-ssh server "grep 'heartbeat' /root/bot/paper_trading.log | tail -1"
-# Expected: sensible numbers (bots active, equity, positions)
+# 3. Heartbeat stats (HEARTBEAT_SEC=300 → every 5 min)
+ssh server "grep -i 'heartbeat' /root/bot/paper_trading.log | tail -1"
+# Expected: sensible numbers (active=N, equity=X, crypto=candles)
+
+# 4. Drift-monitor external timer — next fire
+ssh server "systemctl list-timers drift-monitor.timer --no-pager | head -3"
+# Expected: NEXT timestamp is today or tomorrow 09:00 UTC
 ```
 
 ## 📊 State Check (1-2 minutes)
@@ -43,17 +47,20 @@ ssh server "systemctl show trading-bot.service -p ActiveEnterTimestamp -p MainPI
 ```bash
 ssh server "tail -200 /root/bot/paper_trading.log | grep -E 'heartbeat|equity=|active=|Restored state.*active=[1-9]'"
 ```
-- Should show running heartbeat every ~60s
+- Should show running heartbeat every ~300s
 - `active=1` or higher for bots holding positions
-- AUD_USD #259 (opened 2026-04-14 09:25 UTC) may still be open — if closed, check outcome in trades table
+- Crypto-only since 2026-04-18 refocus — no FX/stock symbols anymore
+- Clean-start baseline 2026-04-19 17:28 UTC → first trades expected within hours
 
 ### C. Trade journal
 
 ```bash
 ssh server "sqlite3 /root/bot/trade_journal/journal.db 'SELECT COUNT(*) as total_trades, SUM(CASE WHEN outcome=\"win\" THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN exit_time IS NULL THEN 1 ELSE 0 END) as open FROM trades'"
 ```
-- Known baseline (2026-04-15): 4 total, 3 wins, 1 open (AUD_USD)
-- Growth rate: ~2-3 closed trades/week
+- Fresh baseline (2026-04-19 17:28 UTC): 0|0|0 at deploy.
+- Week 1 target ≥ 10 closed (end-to-end validation).
+- Week 2 target ≥ 50 closed (first continuous_learner retrain trigger).
+- Clean-start archive: `/root/bot/archive/pre-v1.11-clean-start-20260419_1728/` (pre-refocus trades, 783 MB).
 
 ```bash
 ssh server "sqlite3 /root/bot/trade_journal/journal.db 'SELECT trade_id, symbol, asset_class, outcome, rr_actual, pnl_pct FROM trades ORDER BY entry_time DESC LIMIT 5'"
@@ -117,6 +124,29 @@ ssh server "tail -500 /root/bot/paper_trading.log | grep -E 'OANDA|PRICE_PRECISI
 ---
 
 ## 🔍 Current Watchlist (temporary, remove once resolved)
+
+### W0: Clean-start paper validation (active 2026-04-19)
+
+**Goal**: Validate v1.11-robustness-plus live on Testnet over 4 weeks before funded deploy.
+
+**Start**: 2026-04-19 17:28 UTC | **End target**: 2026-05-17 17:28 UTC.
+
+**Checks per week:**
+- **Week 1** (by 2026-04-26): ≥ 10 closed trades, 0 ERROR in log, drift_state INFO
+- **Week 2** (by 2026-05-03): ≥ 50 closed → first continuous_learner retrain fires → new `models/student_*.pkl` appears
+- **Week 3** (by 2026-05-10): ≥ 100 closed, PF ≥ 1.5 on realized trades, drift stable
+- **Week 4** (by 2026-05-17): Paper-vs-Backtest reconciliation (Sharpe Δ, PF Δ, cost-stress realität). Write report at `.omc/plans/paper_validation/week4_report.md`.
+
+**Red flags specific to paper phase:**
+- `alignment_threshold=0.82` from v1.11 too strict → 0 trades for > 72 h → lower to 0.80 (fallback tier)
+- Realized Sharpe < 50 % of backtest-forecast → pause funded plan, investigate
+- Any drift_state CRITICAL lasting > 48 h → pause bot, inspect features
+
+**Resolve when**: 4 weeks elapsed AND PF ≥ 1.5 AND no unresolved CRITICAL drifts.
+
+### W-legacy: Pre-v1.11 watchlist items W1–W6 (resolved by clean-start)
+
+All W1–W6 items below referred to the pre-refocus multi-asset era (OANDA FX, XGB F-fix 2026-04-15, TP/SL disable 2026-04-17, sample-weight rebalance). They are **moot** after the 2026-04-19 clean-start — journal is fresh, all old models archived, crypto-only since 2026-04-18 refocus. Keeping them below as historical reference; delete after 2026-05-17 if no regressions.
 
 ### W1: First post-F-fix XGB decision (active 2026-04-15)
 
