@@ -58,6 +58,12 @@ from filters.zone_quality import compute_zone_quality
 from risk.circuit_breaker import CircuitBreaker
 from core.constants import ALIGNMENT_THRESHOLD, SCALP_MAX_HOLD_BARS
 from core.sizing import compute_risk_amount
+from core.metrics import (
+    sharpe_daily as _sharpe_daily,
+    return_moments as _return_moments,
+    deflated_sharpe_ratio as _deflated_sharpe,
+    trial_sharpe_variance as _trial_sharpe_variance,
+)
 
 # Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS, BACKTEST_OPTUNA_WORKERS).
 # Signal precompute is numpy-heavy → scales with physical cores.
@@ -503,11 +509,19 @@ def simulate_trades(
 # ═══════════════════════════════════════════════════════════════════
 
 def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> dict[str, float]:
-    """Compute comprehensive performance metrics."""
+    """Compute comprehensive performance metrics.
+
+    `sharpe` is the daily-equity-return Sharpe (crypto-annualized sqrt(365)),
+    implemented in core.metrics per Phase-B quality-upgrade. `sharpe_naive`
+    is the pre-Phase-B per-trade-PnL Sharpe kept only for debug comparison —
+    do not use it downstream. `skew`, `kurt_nonexcess`, `n_obs_daily` are
+    inputs needed by the Deflated Sharpe Ratio gate.
+    """
     if trades_df.empty:
         return {
             "total_pnl": 0.0, "profit_factor": 0.0, "pf_real": 0.0,
-            "max_drawdown": 0.0, "sharpe": 0.0,
+            "max_drawdown": 0.0, "sharpe": 0.0, "sharpe_naive": 0.0,
+            "skew": 0.0, "kurt_nonexcess": 3.0, "n_obs_daily": 0,
             "winrate": 0.0, "winrate_real": 0.0, "be_rate": 0.0,
             "total_trades": 0, "n_wins": 0, "n_losses": 0, "n_breakeven": 0,
             "recovery_factor": 0.0, "avg_rr": 0.0,
@@ -554,11 +568,17 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     drawdown = (equity - running_max) / running_max
     max_drawdown = float(drawdown.min())
 
-    # Annualised Sharpe
+    # Sharpe (Phase B quality-upgrade, 2026-04-19):
+    #   - `sharpe` = daily-equity-return Sharpe, crypto-annualized sqrt(365)
+    #   - `sharpe_naive` = old per-trade-PnL sqrt(252) — kept only for debug
+    sharpe = _sharpe_daily(trades_df, account_size=account_size)
     if len(pnl) > 1 and pnl.std() > 0:
-        sharpe = float((pnl.mean() / pnl.std()) * math.sqrt(252))
+        sharpe_naive = float((pnl.mean() / pnl.std()) * math.sqrt(252))
     else:
-        sharpe = 0.0
+        sharpe_naive = 0.0
+    n_obs_daily, skew, kurt_nonexcess = _return_moments(
+        trades_df, account_size=account_size,
+    )
 
     # Recovery factor
     max_dd_usd = abs(max_drawdown * account_size) if max_drawdown != 0 else 1e-9
@@ -590,6 +610,10 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
         "pf_real": pf_real,
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
+        "sharpe_naive": sharpe_naive,
+        "skew": skew,
+        "kurt_nonexcess": kurt_nonexcess,
+        "n_obs_daily": n_obs_daily,
         "winrate": winrate,
         "winrate_real": winrate_real,
         "be_rate": be_rate,
@@ -728,20 +752,28 @@ def validate_oos_results(
     oos_metrics: dict[str, float],
     mc_result: dict[str, Any] | None = None,
     stability_result: dict[str, Any] | None = None,
+    dsr_result: dict[str, Any] | None = None,
     max_dd_limit: float = -0.10,
+    dsr_threshold: float = 0.70,
     asset_class: str = "crypto",
 ) -> dict[str, Any]:
     """
     Check if out-of-sample results pass anti-overfitting gates.
 
-    7 Gates (ALL must pass):
+    8 Gates (ALL must pass):
     1. Profit Factor >= 1.5
     2. Minimum trades (per-class: 20 for crypto/stocks, 5 for forex/commodities)
     3. Sharpe >= 0.5
     4. Monte Carlo robust (95% CI profitable)
     5. Max Drawdown > -10% (funded account compliance)
     6. Parameter stability (±10% change < 50% PF shift)
-    7. Win Rate > 20% AND Avg RR > 2.0 (quality check)
+    7. Win Rate > 20% AND positive expectancy (quality check)
+    8. Deflated Sharpe Ratio >= threshold (Bailey & Lopez de Prado 2014) —
+       probability the Sharpe is genuine after accounting for selection bias
+       over `n_trials`. Phase-B quality-upgrade (2026-04-19).
+
+    Deploy to funded account requires `dsr_threshold >= 0.95`. During the
+    research phase we use 0.70 to keep a signal from the existing flow.
     """
     gates: dict[str, bool] = {}
     reasons: list[str] = []
@@ -818,6 +850,19 @@ def validate_oos_results(
     if not exp_ok:
         reasons.append(f"Negative expectancy: {expectancy:.2f}")
 
+    # Gate 8: Deflated Sharpe Ratio — probability observed Sharpe is not
+    # a selection-bias artefact of running `n_trials` random strategies.
+    if dsr_result is not None:
+        dsr_value = dsr_result.get("dsr", 0.0)
+        gates["dsr_ok"] = dsr_value >= dsr_threshold
+        if not gates["dsr_ok"]:
+            reasons.append(
+                f"DSR {dsr_value:.3f} < {dsr_threshold:.2f} "
+                f"(selection bias over {dsr_result.get('n_trials', '?')} trials)"
+            )
+    else:
+        gates["dsr_ok"] = True  # Skip if not computed
+
     all_passed = all(gates.values())
 
     # ── Sanity warnings (don't auto-reject, but flag suspicious metrics) ──
@@ -840,6 +885,64 @@ def validate_oos_results(
         "reasons": reasons,
         "warnings": warnings,
         "verdict": verdict,
+    }
+
+
+def compute_dsr_for_oos(
+    study: optuna.Study,
+    oos_metrics: dict[str, float],
+) -> dict[str, Any] | None:
+    """Post-Optuna DSR for the selected OOS run.
+
+    Collects the Sharpe of every completed trial to estimate the null
+    distribution's variance, then applies the Bailey & Lopez de Prado
+    (2014) haircut to the OOS-Sharpe using the return moments computed
+    in `compute_metrics`.
+
+    Returns `None` when the study has <2 completed trials with positive
+    Sharpe, or when variance collapses to 0 — both signals that DSR
+    cannot be meaningfully computed.
+    """
+    trial_sharpes: list[float] = []
+    for t in study.trials:
+        if t.state.name != "COMPLETE":
+            continue
+        sr = t.user_attrs.get("sharpe")
+        if sr is not None and not np.isnan(sr):
+            trial_sharpes.append(float(sr))
+
+    if len([s for s in trial_sharpes if s > 0]) < 2:
+        return None
+
+    trial_var = _trial_sharpe_variance(trial_sharpes)
+    if trial_var <= 0:
+        return None
+
+    n_obs = int(oos_metrics.get("n_obs_daily", 0))
+    if n_obs < 2:
+        return None
+
+    observed = float(oos_metrics.get("sharpe", 0.0))
+    skew = float(oos_metrics.get("skew", 0.0))
+    kurt = float(oos_metrics.get("kurt_nonexcess", 3.0))
+
+    dsr = _deflated_sharpe(
+        observed_sharpe=observed,
+        sharpe_variance=trial_var,
+        n_trials=len(trial_sharpes),
+        observation_count=n_obs,
+        skewness=skew,
+        kurtosis=kurt,
+    )
+
+    return {
+        "dsr": dsr,
+        "observed_sharpe": observed,
+        "trial_sharpe_variance": trial_var,
+        "n_trials": len(trial_sharpes),
+        "n_obs_daily": n_obs,
+        "skew": skew,
+        "kurt_nonexcess": kurt,
     }
 
 
@@ -1080,24 +1183,35 @@ def _build_objective(
                 index=False,
             )
 
-        # Objective: capped PF × Sharpe × DD × confidence × WR sanity
-        # Caps prevent Optuna from chasing "zero loss" edge cases
-        pf = min(metrics["pf_real"], 5.0)           # Cap: PF>5 is noise
-        sharpe = min(max(metrics["sharpe"], 0.01), 5.0)
-        trades = metrics["total_trades"]
+        # Phase-C objective (2026-04-19): daily Sharpe with hard quality guards.
+        # Replaces the pre-Phase-B composite (pf × sharpe × dd × trades × wr),
+        # which was a data-mining invitation — no theoretical grounding.
+        #
+        # DSR is computed post-hoc on best_trial (gates deploy, not optimization).
+        # Here we only need a noise-robust score surface for Optuna to navigate.
+        trades_count = metrics["total_trades"]
+        pf_real = metrics["pf_real"]
+        max_dd = metrics["max_drawdown"]
+        sharpe = metrics["sharpe"]
 
-        if trades < 5:
+        # Hard guards — insufficient evidence fails the trial outright.
+        # Thresholds calibrated to Lopez de Prado "minimum track record" (Ch. 14):
+        #   - 20 trades below any robust Sharpe estimate
+        #   - PF<1.3 is indistinguishable from noise at this sample size
+        #   - DD>15% violates funded-account compliance envelope (-8% all-time).
+        if trades_count < 20:
+            return 0.0
+        if pf_real < 1.3:
+            return 0.0
+        if max_dd < -0.15:
             return 0.0
 
-        trade_conf = min(trades / 30.0, 1.0)       # More trades = more reliable
+        # Soft winrate penalty — real-WR > 80 % on this regime is almost
+        # always a BE-ratchet/TP-hit artefact, not genuine edge.
         wr = metrics.get("winrate_real", 0.5)
         wr_factor = 1.0 if wr <= 0.80 else max(0.3, 1.0 - (wr - 0.80) * 5)
 
-        dd_factor = max(0.1, 1.0 + metrics["max_drawdown"])
-        if metrics["max_drawdown"] < -0.10:
-            dd_factor *= 0.1
-
-        score = pf * sharpe * dd_factor * trade_conf * wr_factor
+        score = max(0.0, sharpe) * wr_factor
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
@@ -1509,15 +1623,28 @@ def run(
             stability_result["max_pf_change_pct"],
         )
 
-        # ── Validation gates (7 gates: PF, trades, Sharpe, MC, DD, stability, quality) ──
+        # ── Deflated Sharpe Ratio (post-Optuna selection-bias haircut) ─
+        dsr_result = compute_dsr_for_oos(study, oos_metrics)
+        if dsr_result is not None:
+            logger.info(
+                "DSR W%d: %.3f (observed SR=%.2f, trial_var=%.3f, n_trials=%d, n_obs=%d)",
+                wi, dsr_result["dsr"], dsr_result["observed_sharpe"],
+                dsr_result["trial_sharpe_variance"], dsr_result["n_trials"],
+                dsr_result["n_obs_daily"],
+            )
+
+        # ── Validation gates (8 gates: PF, trades, Sharpe, MC, DD, stability, quality, DSR) ──
         validation = validate_oos_results(
             oos_metrics, mc_result,
             stability_result=stability_result,
+            dsr_result=dsr_result,
             max_dd_limit=-0.10,  # Funded account: max -10% all-time DD
+            dsr_threshold=0.70,  # Research phase; 0.95 required before funded deploy
             asset_class="crypto",  # Global mode — default to crypto trade gate
         )
         validation["window"] = wi
         validation["stability"] = stability_result
+        validation["dsr"] = dsr_result
         all_validations.append(validation)
 
         logger.info(
@@ -1923,21 +2050,23 @@ def run_per_asset_class(
                     if res_dir is not None and trial.number < 10:
                         pass  # skip per-trial CSV saves for per-class mode
 
-                    # ── Objective: capped PF × Sharpe × DD × confidence × WR sanity ──
-                    pf = min(metrics["pf_real"], 5.0)
-                    sharpe = min(max(metrics["sharpe"], 0.01), 5.0)
-                    trades = metrics["total_trades"]
-                    wr = metrics.get("winrate_real", 0.5)
+                    # Phase-C objective (2026-04-19): daily Sharpe + hard guards.
+                    # See _build_objective for the rationale (same contract).
+                    trades_count = metrics["total_trades"]
+                    pf_real = metrics["pf_real"]
+                    max_dd = metrics["max_drawdown"]
+                    sharpe = metrics["sharpe"]
 
-                    if trades < 5:
+                    if trades_count < 20:
+                        score = 0.0
+                    elif pf_real < 1.3:
+                        score = 0.0
+                    elif max_dd < -0.15:
                         score = 0.0
                     else:
-                        trade_conf = min(trades / 30.0, 1.0)
+                        wr = metrics.get("winrate_real", 0.5)
                         wr_factor = 1.0 if wr <= 0.80 else max(0.3, 1.0 - (wr - 0.80) * 5)
-                        dd_factor = max(0.1, 1.0 + metrics["max_drawdown"])
-                        if metrics["max_drawdown"] < -0.10:
-                            dd_factor *= 0.1
-                        score = pf * sharpe * dd_factor * trade_conf * wr_factor
+                        score = max(0.0, sharpe) * wr_factor
 
                     for k, v in metrics.items():
                         trial.set_user_attr(k, v)
@@ -2000,12 +2129,16 @@ def run_per_asset_class(
                 asset_class=ac,
             )
 
-            # Validation (per-class min trade gates)
+            # DSR haircut + Validation (per-class min trade gates)
+            dsr_result = compute_dsr_for_oos(study, oos_metrics)
             validation = validate_oos_results(
                 oos_metrics, mc_result,
                 stability_result=stability_result,
+                dsr_result=dsr_result,
+                dsr_threshold=0.70,  # Research phase; 0.95 required before funded deploy
                 asset_class=ac,
             )
+            validation["dsr"] = dsr_result
 
             logger.info(
                 "%s W%d OOS: PF=%.2f(real) WR=%.1f%%(real) BE=%.0f%% "
