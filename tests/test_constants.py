@@ -23,8 +23,8 @@ def test_core_constants_have_expected_values():
     assert SLIPPAGE == 0.0002
     assert ALIGNMENT_THRESHOLD == 0.78
     assert LEVERAGE_CAP == 10
-    assert DEFAULT_RISK_PER_TRADE == 0.005
-    assert MAX_RISK_PER_TRADE == 0.015
+    assert DEFAULT_RISK_PER_TRADE == 0.0025
+    assert MAX_RISK_PER_TRADE == 0.010
     assert MAX_PORTFOLIO_HEAT == 0.06
     assert SCALP_MAX_HOLD_BARS == 48
 

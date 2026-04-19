@@ -49,9 +49,9 @@ Vollständiger Signal-Flow: siehe `@agents/smc-strategist.md`. Phase 2.1 ✅ hat
 
 - **Einziger Entry-Gate**: `alignment_score ≥ 0.78` + `rr ≥ 2.0`
 - **Risk-Sizing linear**: `core/sizing.py::compute_risk_fraction(score)`
-  - At score 0.78 → 0.5% of equity (`DEFAULT_RISK_PER_TRADE`)
-  - At score 1.00 → 1.5% of equity (`MAX_RISK_PER_TRADE`)
-  - Linear interpolation dazwischen
+  - At score 0.78 → 0.25% of equity (`DEFAULT_RISK_PER_TRADE`)
+  - At score 1.00 → 1.00% of equity (`MAX_RISK_PER_TRADE`)
+  - Linear interpolation dazwischen (2026-04-19: lowered from 0.5%/1.5% for Scalp-Day Hybrid more-trades regime)
 - **Live-Multiplikator**: Student size-Head Prediction (clamped zu `size_floor/size_cap`)
 - **Backtest**: `student_size_multiplier = 1.0`, sonst identisch
 
@@ -109,8 +109,8 @@ ALIGNMENT_THRESHOLD = 0.78       # Einziger Entry-Gate (SSOT: core/constants.py)
 MIN_RR = 2.0                     # Scalp-Day Hybrid Default (config.risk_reward.default)
 SCALP_MAX_HOLD_BARS = 48         # 4h auf 5m (Scalp-Day Hybrid, 2026-04-19)
 LEVERAGE = 5                     # Konservativ (Cap: 10x für Crypto)
-DEFAULT_RISK_PER_TRADE = 0.005   # 0.5% at alignment threshold
-MAX_RISK_PER_TRADE = 0.015       # 1.5% at alignment score 1.0 (linear scale)
+DEFAULT_RISK_PER_TRADE = 0.0025  # 0.25% at alignment threshold (2026-04-19: lowered for more-trades regime)
+MAX_RISK_PER_TRADE = 0.010       # 1.0% at alignment score 1.0 (linear scale; was 1.5% pre-2026-04-19)
 MAX_EQUITY_FOR_SIZING = 2x       # Equity Cap bei 2× Initial
 
 # Circuit Breaker — Phase 4: Calendar-Day-Fix für Funded-Compliance

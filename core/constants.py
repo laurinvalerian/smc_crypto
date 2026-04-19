@@ -51,11 +51,22 @@ to hard-code.
 # Risk / Position Sizing
 # ------------------------------------------------------------------------
 
-DEFAULT_RISK_PER_TRADE: float = 0.005
-"""Default risk per trade as fraction of equity (0.5%, conservative fallback)."""
+DEFAULT_RISK_PER_TRADE: float = 0.0025
+"""
+Default risk per trade as fraction of equity (0.25%, at alignment threshold).
 
-MAX_RISK_PER_TRADE: float = 0.015
-"""Hard cap on risk per trade (1.5%). Funded-account compliance limit."""
+Lowered from 0.5% → 0.25% (2026-04-19) because Scalp-Day Hybrid produces
+~3-5× more trades than the old Sniper-Day approach. Smaller per-trade
+risk is needed to keep portfolio-heat and daily-DD under funded limits.
+"""
+
+MAX_RISK_PER_TRADE: float = 0.010
+"""
+Hard cap on risk per trade (1.0%, at alignment score 1.0).
+
+Lowered from 1.5% → 1.0% (2026-04-19) — see DEFAULT_RISK_PER_TRADE.
+Still well inside funded-account compliance (<1.5%).
+"""
 
 MAX_PORTFOLIO_HEAT: float = 0.06
 """

@@ -47,7 +47,7 @@ def test_at_max_score_returns_max_risk():
 def test_midpoint_halfway_between_base_and_max():
     """Score halfway between threshold and 1.0 → risk halfway between default and max."""
     mid_score = (ALIGNMENT_THRESHOLD + 1.0) / 2  # = 0.89
-    expected = (DEFAULT_RISK_PER_TRADE + MAX_RISK_PER_TRADE) / 2  # = 0.01
+    expected = (DEFAULT_RISK_PER_TRADE + MAX_RISK_PER_TRADE) / 2  # = 0.00625 (0.25%+1.0% /2)
     assert math.isclose(
         compute_risk_fraction(mid_score), expected, abs_tol=1e-12
     )

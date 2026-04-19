@@ -16,8 +16,8 @@ leverage:
   max: 15                  # Hard cap – funding & liquidation safety
 
 risk_per_trade:
-  min: 0.003               # 0.3 %
-  max: 0.015               # 1.5 %
+  min: 0.0025              # 0.25% (Scalp-Day Hybrid: more trades → smaller per-trade risk)
+  max: 0.010               # 1.0%  (lowered from 1.5% on 2026-04-19)
 
 risk_reward:
   options: [2.0, 2.5, 3.0, 3.5]   # min_rr filter (TP is structure-based). Default 2.0 for scalp-hybrid.
