@@ -66,6 +66,12 @@ from core.metrics import (
 )
 from backtest.cpcv import run_cpcv, cpcv_summary
 from backtest.pbo import compute_pbo
+from backtest.monte_carlo import compute_mc_cvar_dd
+from backtest.region_heatmap import (
+    build_region_grid,
+    plot_region_heatmap,
+    region_summary,
+)
 
 # Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS, BACKTEST_OPTUNA_WORKERS).
 # Signal precompute is numpy-heavy → scales with physical cores.
@@ -2905,6 +2911,189 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                 except Exception as exc:
                     logger.error(
                         "%s PBO post-bruteforce validation failed: %s",
+                        ac.upper(), exc, exc_info=True,
+                    )
+
+            # ── Phase G: Monte-Carlo tail-risk (CVaR-95% DD) ────────
+            # VaR answers "how bad at the 5%-quantile?" — CVaR (Expected
+            # Shortfall) answers "how bad on average in that tail?". CVaR
+            # is coherent and penalises tail concentration; correct
+            # funded-account DD gate. Plan §2.6: cvar_dd_95 > -0.20.
+            mc_cfg = cfg.get("monte_carlo", {}) or {}
+            mc_enabled = mc_cfg.get("enabled", True)
+            mc_n_sims = int(mc_cfg.get("n_simulations", 1000))
+            mc_confidence = float(mc_cfg.get("confidence", 0.95))
+            mc_seed = int(mc_cfg.get("seed", 42))
+            mc_gate = float(mc_cfg.get("gate_threshold", -0.20))
+            if mc_enabled:
+                try:
+                    # Union of all-window OOS signals → single simulation
+                    # of best_params → single tail-risk estimate.
+                    union_sigs: list[Any] = []
+                    for sigs in oos_signals_per_window:
+                        union_sigs.extend(sigs)
+                    mc_trades, _ = _simulate_with_params(
+                        best["params"], union_sigs, cfg, symbol_to_asset,
+                    )
+                    mc_result = compute_mc_cvar_dd(
+                        mc_trades,
+                        account_size=account_size,
+                        n_simulations=mc_n_sims,
+                        confidence=mc_confidence,
+                        seed=mc_seed,
+                    )
+                    mc_result["gate_threshold"] = mc_gate
+                    mc_result["gate_pass"] = (
+                        mc_result["cvar_dd_95"] > mc_gate
+                    )
+                    mc_result["asset_class"] = ac
+                    mc_result["n_trades"] = int(len(mc_trades))
+
+                    with open(ac_results_dir / "mc_summary.json", "w") as f:
+                        json.dump(mc_result, f, indent=2, default=str)
+
+                    evergreen["mc"] = mc_result
+                    with open(eg_path, "w") as f:
+                        json.dump(evergreen, f, indent=2, default=str)
+
+                    gate_msg = (
+                        "PASS" if mc_result["gate_pass"]
+                        else "FAIL — funded-deploy blocked"
+                    )
+                    logger.info(
+                        "%s MC: CVaR-%.0f%% DD=%.2f%% (gate > %.2f%%, "
+                        "VaR=%.2f%%, median DD=%.2f%%, n_sims=%d, "
+                        "trades=%d) | %s",
+                        ac.upper(), mc_confidence * 100,
+                        mc_result["cvar_dd_95"] * 100, mc_gate * 100,
+                        mc_result["var_dd_95"] * 100,
+                        mc_result["median_dd"] * 100,
+                        mc_result["n_simulations"],
+                        mc_result["n_trades"], gate_msg,
+                    )
+                    if not mc_result["gate_pass"]:
+                        logger.warning(
+                            "%s MC CVaR-%.0f%% DD %.2f%% worse than "
+                            "gate %.2f%%. Do NOT deploy to funded account.",
+                            ac.upper(), mc_confidence * 100,
+                            mc_result["cvar_dd_95"] * 100, mc_gate * 100,
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "%s MC post-bruteforce validation failed: %s",
+                        ac.upper(), exc, exc_info=True,
+                    )
+
+            # ── Phase G: Parameter-region heatmap ──────────────────
+            # PBO bounds *selection* bias; Region-Heatmap bounds
+            # parameter *instability*. If the top-10% of cells span a
+            # DSR range > 0.10 the selected combo sits on a ridge —
+            # small perturbations collapse the edge. Plan §2.6:
+            # spread_q90_q10 < 0.10.
+            rh_cfg = cfg.get("region_heatmap", {}) or {}
+            rh_enabled = rh_cfg.get("enabled", True)
+            rh_top_pct = float(rh_cfg.get("top_pct", 0.10))
+            rh_gate = float(rh_cfg.get("gate_threshold", 0.10))
+            rh_param_x = rh_cfg.get("param_x", "alignment_threshold")
+            rh_param_y = rh_cfg.get("param_y", "risk_reward")
+            rh_obs_count = int(rh_cfg.get("observation_count", 60))
+            if rh_enabled:
+                try:
+                    rh_sharpe_cols = [
+                        c for c in grid_df.columns
+                        if c.startswith("w") and c.endswith("_sharpe")
+                    ]
+                    if not rh_sharpe_cols:
+                        raise ValueError("no w*_sharpe columns in grid_df")
+
+                    # Same null-distribution logic as CPCV: evergreen-
+                    # qualified first, fallback to "traded in every
+                    # window" to keep variance estimate meaningful.
+                    eg_mask2 = grid_df["is_evergreen"].fillna(False).astype(bool)
+                    rh_qualified = grid_df[eg_mask2]
+                    if len(rh_qualified) < 5:
+                        rh_window_trade_cols = [
+                            c for c in grid_df.columns if c.endswith("_trades")
+                        ]
+                        if rh_window_trade_cols:
+                            rh_has_all = (
+                                grid_df[rh_window_trade_cols].fillna(0) > 0
+                            ).all(axis=1)
+                            rh_qualified = grid_df[rh_has_all]
+
+                    rh_trial_sharpes: list[float] = []
+                    for _, rrow in rh_qualified.iterrows():
+                        vals = [
+                            float(rrow[c]) for c in rh_sharpe_cols
+                            if not pd.isna(rrow[c])
+                        ]
+                        if vals:
+                            rh_trial_sharpes.append(float(np.mean(vals)))
+
+                    region_pivot = build_region_grid(
+                        grid_df,
+                        trial_sharpes=rh_trial_sharpes,
+                        observation_count=rh_obs_count,
+                        window_sharpe_cols=rh_sharpe_cols,
+                        param_x=rh_param_x,
+                        param_y=rh_param_y,
+                    )
+                    region_sum = region_summary(
+                        region_pivot,
+                        top_pct=rh_top_pct,
+                        gate_threshold=rh_gate,
+                    )
+                    region_sum["asset_class"] = ac
+                    region_sum["param_x"] = rh_param_x
+                    region_sum["param_y"] = rh_param_y
+                    region_sum["n_trials_in_variance"] = len(rh_trial_sharpes)
+
+                    if not region_pivot.empty:
+                        region_pivot.to_csv(
+                            ac_results_dir / "region_heatmap.csv"
+                        )
+
+                    with open(ac_results_dir / "region_heatmap.json", "w") as f:
+                        json.dump(region_sum, f, indent=2, default=str)
+
+                    try:
+                        plot_region_heatmap(
+                            region_pivot,
+                            output_path=ac_results_dir / "region_heatmap.png",
+                            title=f"{ac.upper()} parameter region — median DSR",
+                        )
+                    except Exception as plot_exc:
+                        logger.warning(
+                            "%s REGION heatmap PNG render failed: %s",
+                            ac.upper(), plot_exc,
+                        )
+
+                    evergreen["region"] = region_sum
+                    with open(eg_path, "w") as f:
+                        json.dump(evergreen, f, indent=2, default=str)
+
+                    gate_msg = (
+                        "PASS" if region_sum["gate_pass"]
+                        else "FAIL — funded-deploy blocked"
+                    )
+                    logger.info(
+                        "%s REGION: top-%.0f%% spread_q90_q10=%.3f "
+                        "(gate < %.2f, top_cells=%d/%d, n_trials=%d) | %s",
+                        ac.upper(), rh_top_pct * 100,
+                        region_sum["spread_q90_q10"], rh_gate,
+                        region_sum["n_cells_top"],
+                        region_sum["n_cells_valid"],
+                        len(rh_trial_sharpes), gate_msg,
+                    )
+                    if not region_sum["gate_pass"]:
+                        logger.warning(
+                            "%s REGION spread %.3f >= gate %.2f: landscape "
+                            "not plateau-like. Do NOT deploy to funded account.",
+                            ac.upper(), region_sum["spread_q90_q10"], rh_gate,
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "%s REGION post-bruteforce validation failed: %s",
                         ac.upper(), exc, exc_info=True,
                     )
         else:
