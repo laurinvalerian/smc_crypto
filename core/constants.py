@@ -31,33 +31,20 @@ SLIPPAGE: float = 0.0002
 
 
 # ------------------------------------------------------------------------
-# Tier Thresholds
+# Alignment Gate (single threshold, no tiers)
 # ------------------------------------------------------------------------
 
 ALIGNMENT_THRESHOLD: float = 0.78
 """
 Single Source of Truth for the alignment-score gate.
 
-Previously inconsistent: config/default_config.yaml had 0.65 (never read),
-live_multi_bot.py:213 hardcoded 0.78 (actual live value), CLAUDE.md
-documented 0.88 (Sniper aspiration). 0.78 is the actual live behaviour
-verified in the 2026-04-18 audit and is now authoritative.
-
-Note: The 0.88 value lives on as AAA_PLUS_PLUS_THRESHOLD — the tier
-classification ceiling, not the entry gate.
+Signals with score < ALIGNMENT_THRESHOLD are rejected outright.
+Signals with score >= ALIGNMENT_THRESHOLD pass; risk sizing is then
+scaled linearly by confidence (see core/sizing.py). No AAA++/AAA+ tier
+classification — killed 2026-04-19 because Student size-head + linear
+scaling already captures the confidence gradient the tier system tried
+to hard-code.
 """
-
-AAA_PLUS_PLUS_THRESHOLD: float = 0.88
-"""
-Tier-classification ceiling for AAA++ (highest-conviction setups).
-
-A trade is AAA++ if alignment_score >= 0.88 AND all 11 component flags
-are True. AAA++ trades use the full risk allocation (1.0-1.5% per trade).
-Below this but >= ALIGNMENT_THRESHOLD: AAA+ tier (0.5-1% risk).
-"""
-
-AAA_PLUS_THRESHOLD: float = ALIGNMENT_THRESHOLD
-"""Tier-classification floor for AAA+. Same as the entry gate."""
 
 
 # ------------------------------------------------------------------------
@@ -84,6 +71,20 @@ Enforced by risk/circuit_breaker.py before opening a new bracket order.
 
 LEVERAGE_CAP: int = 10
 """Maximum leverage for crypto (Binance USDT-M Futures, V14 reduced cap)."""
+
+
+# ------------------------------------------------------------------------
+# Holding period (Scalp-Day Hybrid, 2026-04-19 decision)
+# ------------------------------------------------------------------------
+
+SCALP_MAX_HOLD_BARS: int = 48
+"""
+Maximum holding period = 48 bars × 5m = 4 hours.
+
+Scalp-Day Hybrid: 5m entry, SMC structure plays out in 1–4h, Commission
+budget still healthy. Tighter than classical day (24h) for shorter RL
+feedback loop; longer than pure scalp (<2h) so SMC targets have room.
+"""
 
 
 # ------------------------------------------------------------------------

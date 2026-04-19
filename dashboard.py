@@ -350,10 +350,12 @@ def _aggregate_stats() -> dict:
                     last_rl_filtered = True
 
             # Parse OPEN entries
+            # Log format (live_multi_bot.py:2791): "OPEN [<STYLE>] <DIR> <SYM> @ ..."
+            # Tier system killed 2026-04-19; only style group remains.
             if "OPEN [" in line:
                 m = re.search(
                     r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*"
-                    r"OPEN \[(\w+)\|(\w+)\] (\w+) (\S+) @ ([\d.]+).*"
+                    r"OPEN \[(\w+)\] (\w+) (\S+) @ ([\d.]+).*"
                     r"SL=([\d.]+) TP=([\d.]+) RR=([\d.]+).*"
                     r"score=([\d.]+)",
                     line,
@@ -361,15 +363,14 @@ def _aggregate_stats() -> dict:
                 if m:
                     trade_entry = {
                         "time": m.group(1),
-                        "tier": m.group(2),
-                        "style": m.group(3),
-                        "direction": m.group(4),
+                        "style": m.group(2),
+                        "direction": m.group(3),
                         "symbol": bot.get("symbol", tag),
-                        "entry": float(m.group(6)),
-                        "sl": float(m.group(7)),
-                        "tp": float(m.group(8)),
-                        "rr": float(m.group(9)),
-                        "score": float(m.group(10)),
+                        "entry": float(m.group(5)),
+                        "sl": float(m.group(6)),
+                        "tp": float(m.group(7)),
+                        "rr": float(m.group(8)),
+                        "score": float(m.group(9)),
                         "type": "OPEN",
                         "asset_class": ac,
                         "rl_filtered": last_rl_filtered,

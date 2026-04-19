@@ -90,7 +90,7 @@ Ran first with 400-day warmup, aborted because forex processing 92K bars/item wa
 - **Service**: active, no crashes
 - **Config**: optimized SMC params RE-ENABLED (back to original behavior)
 - **AUD_USD trade #259**: OPEN, long, entry 0.71088, SL 0.704518, TP 0.738185, currently +0.17% (+0.19R)
-- **Note**: This trade was opened at 09:25 UTC during my brief fix window (optimized params temporarily disabled) and correctly represents a genuine AAA+ setup (every flag = 1.0, including rare h1_choch).
+- **Note**: This trade was opened at 09:25 UTC during my brief fix window (optimized params temporarily disabled) and had every component flag = 1.0, including rare h1_choch. (Historically labelled "AAA+" — tier system retired 2026-04-19, alignment-threshold gate only.)
 
 ---
 

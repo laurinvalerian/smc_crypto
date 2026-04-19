@@ -2,12 +2,13 @@
 ═══════════════════════════════════════════════════════════════════
  backtest/optuna_backtester.py
  ─────────────────────────────
- Walk-Forward Optimization with Optuna + AAA++ Filter Validation.
+ Walk-Forward Optimization with Optuna (Scalp-Day Hybrid, no tiers).
 
  Features:
    • Rolling walk-forward windows (configurable train/test months)
    • Optuna Bayesian optimisation (configurable trials per window)
-   • AAA++ tier filtering: only AAA++ and AAA+ trades pass
+   • Single alignment-threshold gate (core.constants.ALIGNMENT_THRESHOLD)
+   • Confidence-based risk sizing (core.sizing.compute_risk_fraction)
    • Circuit breaker simulation (daily -3%, weekly -5%, class -2%,
      all-time -8%)
    • REAL price-path simulation: walks candles forward to check
@@ -54,6 +55,8 @@ from filters.volume_liquidity import compute_volume_score
 from filters.session_filter import compute_session_score
 from filters.zone_quality import compute_zone_quality
 from risk.circuit_breaker import CircuitBreaker
+from core.constants import ALIGNMENT_THRESHOLD, SCALP_MAX_HOLD_BARS
+from core.sizing import compute_risk_amount
 
 # ── Logging ───────────────────────────────────────────────────────
 _results_dir = Path("backtest/results")
@@ -69,22 +72,6 @@ _console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(m
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 logger = logging.getLogger(__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-
-# ── AAA++ Tier Thresholds ─────────────────────────────────────────
-
-TIER_AAA_PLUS_PLUS = "AAA++"
-TIER_AAA_PLUS = "AAA+"
-
-TIER_THRESHOLDS = {
-    TIER_AAA_PLUS_PLUS: {"min_score": 0.88, "min_rr": 3.0},
-    TIER_AAA_PLUS:      {"min_score": 0.78, "min_rr": 2.0},
-}
-
-TIER_RISK = {
-    TIER_AAA_PLUS_PLUS: {"base_risk": 0.010, "max_risk": 0.015},
-    TIER_AAA_PLUS:      {"base_risk": 0.005, "max_risk": 0.010},
-}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -135,63 +122,8 @@ def generate_wf_windows(
     return windows
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  AAA++ Signal Classifier
-# ═══════════════════════════════════════════════════════════════════
-
-def classify_signal_tier(
-    signal: TradeSignal,
-    alignment_score: float,
-    rr: float,
-) -> str | None:
-    """
-    Classify a trade signal into AAA++ or AAA+ tier.
-    Returns None if signal doesn't meet minimum quality.
-
-    Checks component flags from signal.meta to match live bot behavior.
-    """
-    meta = getattr(signal, 'meta', {}) or {}
-
-    # Components available from generate_signals():
-    # bias_strong, h4_confirms, h4_poi, h1_confirm, h1_choch,
-    # entry_zone, precision_trigger, volume_ok
-
-    # AAA++ requires ALL available structure components
-    aaa_pp_required = [
-        "bias_strong", "h4_confirms", "h4_poi", "h1_confirm", "h1_choch",
-        "entry_zone", "precision_trigger", "volume_ok",
-    ]
-    # AAA+ requires core components
-    aaa_p_required = [
-        "bias_strong", "h4_confirms", "h1_confirm",
-        "precision_trigger", "volume_ok",
-    ]
-
-    if alignment_score >= TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]["min_score"] \
-       and rr >= TIER_THRESHOLDS[TIER_AAA_PLUS_PLUS]["min_rr"]:
-        if all(meta.get(k) for k in aaa_pp_required):
-            return TIER_AAA_PLUS_PLUS
-
-    if alignment_score >= TIER_THRESHOLDS[TIER_AAA_PLUS]["min_score"] \
-       and rr >= TIER_THRESHOLDS[TIER_AAA_PLUS]["min_rr"]:
-        if all(meta.get(k) for k in aaa_p_required):
-            return TIER_AAA_PLUS
-
-    return None
-
-
-def compute_dynamic_risk(
-    tier: str,
-    score: float,
-    account_size: float,
-) -> float:
-    """Compute risk amount based on tier and score."""
-    risk_cfg = TIER_RISK.get(tier, TIER_RISK[TIER_AAA_PLUS])
-    base = risk_cfg["base_risk"]
-    max_r = risk_cfg["max_risk"]
-    # Scale between base and max based on score
-    risk_pct = base + (max_r - base) * min(score, 1.0)
-    return account_size * risk_pct
+# Signal gate + risk sizing moved to core.constants.ALIGNMENT_THRESHOLD and
+# core.sizing.compute_risk_amount (Scalp-Day Hybrid refocus, 2026-04-19).
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -373,26 +305,27 @@ def simulate_trades(
     slippage_pct: float = 0.0001,
     account_size: float = 100_000,
     use_circuit_breaker: bool = True,
-    aaa_only: bool = True,
+    alignment_threshold: float = ALIGNMENT_THRESHOLD,
     asset_class: str = "crypto",
     risk_per_trade_override: float | None = None,
     max_equity_for_sizing: float | None = None,
     be_ratchet_r: float = 1.5,
     timeout_rr_threshold: float = 0.5,
-    max_hold_bars: int = 576,
+    max_hold_bars: int = SCALP_MAX_HOLD_BARS,
 ) -> pd.DataFrame:
     """
     Simulate trades using REAL price-path outcomes.
 
-    For each signal, walks forward through actual 5m/1m candle data
+    For each signal, walks forward through actual 5m candle data
     to check whether SL or TP is hit first. No synthetic win probability.
 
     Features:
     - Real price-path simulation (SL/TP hit detection on actual candles)
-    - AAA++ / AAA+ tier filtering
+    - Alignment-threshold gate (rejects sig.alignment_score < threshold)
+    - Confidence-based risk sizing via core.sizing.compute_risk_amount
     - Compound position sizing (risk % of current equity)
     - Circuit breaker (daily -3%, weekly -5%, class -2%, all-time -8%)
-    - Max holding period by style (scalp 4h, day 48h, swing 2w)
+    - Scalp-Day Hybrid max hold: 4h (48 bars @ 5m)
     - Timeout trades closed at market price
     """
     if not signals:
@@ -430,13 +363,10 @@ def simulate_trades(
         rr = tp_dist / sl_dist
         alignment = sig.alignment_score
 
-        # ── AAA++ tier gate ──────────────────────────────────────
-        tier = classify_signal_tier(sig, alignment, rr)
-        if aaa_only and tier is None:
+        # ── Alignment-threshold gate (replaces AAA++/AAA+ tier dispatch) ──
+        if alignment < alignment_threshold:
             rejected_count += 1
             continue
-
-        tier = tier or TIER_AAA_PLUS  # Fallback if not filtering
 
         # ── Circuit breaker check ────────────────────────────────
         if cb is not None:
@@ -458,7 +388,8 @@ def simulate_trades(
         if max_equity_for_sizing is not None:
             sizing_equity = min(equity, max_equity_for_sizing)
 
-        risk_amount = compute_dynamic_risk(tier, alignment, sizing_equity)
+        # Confidence-based sizing via core.sizing (Scalp-Day Hybrid, no tiers).
+        risk_amount = compute_risk_amount(alignment, sizing_equity)
         # Optuna-tuned max risk cap (overrides hard 3% default)
         max_risk_pct = risk_per_trade_override if risk_per_trade_override is not None else 0.03
         risk_amount = min(risk_amount, sizing_equity * max_risk_pct)
@@ -531,7 +462,6 @@ def simulate_trades(
                 "symbol": sig.symbol,
                 "direction": sig.direction,
                 "style": sig.style,
-                "tier": tier,
                 "entry": sig.entry_price,
                 "sl": sig.stop_loss,
                 "tp": sig.take_profit,
@@ -554,7 +484,7 @@ def simulate_trades(
 
     if rejected_count > 0 or skipped_no_data > 0:
         logger.info(
-            "Trade simulation: %d executed, %d rejected (tier/CB), %d skipped (no price data)",
+            "Trade simulation: %d executed, %d rejected (gate/CB), %d skipped (no price data)",
             len(rows), rejected_count, skipped_no_data,
         )
 
@@ -635,9 +565,10 @@ def compute_metrics(trades_df: pd.DataFrame, account_size: float = 100_000) -> d
     else:
         avg_rr = 0.0
 
-    # Tier breakdown
-    trades_aaa_pp = int((trades_df.get("tier") == TIER_AAA_PLUS_PLUS).sum()) if "tier" in trades_df.columns else 0
-    trades_aaa_p = int((trades_df.get("tier") == TIER_AAA_PLUS).sum()) if "tier" in trades_df.columns else 0
+    # Tier system killed 2026-04-19. Keys retained for dashboard/legacy
+    # callers but always 0 — downstream code should prefer total_trades.
+    trades_aaa_pp = 0
+    trades_aaa_p = 0
 
     # Expectancy using REAL wins/losses only (excluding BE trades)
     real_wins_pnl = pnl[outcomes == "win"] if len(outcomes) > 0 else pnl[pnl > 0]
@@ -1122,7 +1053,6 @@ def _build_objective(
                 slippage_pct=ASSET_SLIPPAGE.get(ac, config["backtest"]["slippage_pct"]),
                 account_size=config["account"]["size"],
                 use_circuit_breaker=True,
-                aaa_only=True,
                 asset_class=ac,
                 risk_per_trade_override=risk_per_trade,
                 max_equity_for_sizing=max_eq,
@@ -1383,7 +1313,7 @@ def run(
     config_path: str = "config/default_config.yaml",
 ) -> None:
     """
-    Full walk-forward Optuna backtest pipeline with AAA++ filtering.
+    Full walk-forward Optuna backtest pipeline (alignment-threshold gate).
 
     All validation gates (Monte Carlo, stability, max DD) always run.
     """
@@ -1527,7 +1457,6 @@ def run(
                 slippage_pct=cfg["backtest"]["slippage_pct"],
                 account_size=account_size,
                 use_circuit_breaker=True,
-                aaa_only=True,
                 asset_class=ac,
                 risk_per_trade_override=best_rpt,
                 max_equity_for_sizing=max_eq,
@@ -1717,7 +1646,6 @@ def _simulate_with_params(
             slippage_pct=ASSET_SLIPPAGE.get(ac, config["backtest"]["slippage_pct"]),
             account_size=account_size,
             use_circuit_breaker=True,
-            aaa_only=True,
             asset_class=ac,
             risk_per_trade_override=rpt,
             max_equity_for_sizing=max_eq,
@@ -2585,7 +2513,7 @@ def generate_paper_grid_variants(
             _v("RR-Strict",       al,        rr + 0.5, lev,           risk),
             _v("Align-Relaxed",   al - 0.05, rr,       lev,           risk),
             _v("Align-Strict",    al + 0.02, rr,       lev,           risk),
-            _v("AAA+-Fallback",   0.78,      2.0,      lev,           risk),
+            _v("Fallback-Base",   0.78,      2.0,      lev,           risk),
             _v("Aggressive",      al - 0.05, rr - 0.5, lev * 1.5,    risk * 1.5),
             _v("Defensive",       al + 0.02, rr + 0.5, lev * 0.5,    risk * 0.5),
             _v("Wild-Max",        0.78,      2.0,      max_lev,       0.02),
@@ -2613,7 +2541,7 @@ def generate_paper_grid_variants(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Optuna Walk-Forward Backtester with AAA++ Filtering",
+        description="Optuna Walk-Forward Backtester (Scalp-Day Hybrid, alignment-threshold gate)",
     )
     parser.add_argument(
         "--config", default="config/default_config.yaml",

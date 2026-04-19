@@ -8,7 +8,7 @@ silently drift the Live vs Backtest gate (alignment_threshold = 0.78).
 
 Scope:
   - Bit-parity across all 2^7 binary flag combinations (crypto & forex)
-  - Known-value scenarios (AAA++, AAA+, rejection, backward-compat boost)
+  - Known-value scenarios (max score, above-threshold, rejection, legacy boost)
   - Weight-table invariants (sum == 0.90)
   - Call-site consistency: generate_rl_data._compute_alignment_score is
     the identical function object as core.alignment.compute_alignment_score
@@ -68,7 +68,7 @@ def test_crypto_weights_match_documented_training_values():
 #  Known-value scenarios
 # ════════════════════════════════════════════════════════════════════
 
-def test_aaa_plus_plus_all_flags_true_scores_at_max():
+def test_all_flags_true_scores_at_max():
     """All 9 flags True → score = 0.90 (saturates before clamp)."""
     score = compute_alignment_score(
         "bullish", True, {"top": 100, "bottom": 99}, True,
@@ -86,8 +86,8 @@ def test_rejection_all_flags_false_scores_zero():
     assert score == 0.0
 
 
-def test_aaa_plus_partial_flags_still_above_gate():
-    """Enough flags for AAA+ tier (score >= 0.78)."""
+def test_partial_flags_still_above_gate():
+    """Enough flags to clear the 0.78 alignment gate without volume_ok."""
     # bias(0.12) + bias_strong(0.08) + h4(0.08) + h4_poi(0.08) + h1(0.08)
     # + h1_choch(0.06) + zone(0.15) + trigger(0.15) = 0.80
     score = compute_alignment_score(
@@ -99,7 +99,7 @@ def test_aaa_plus_partial_flags_still_above_gate():
         volume_ok=False,
     )
     assert math.isclose(score, 0.80, abs_tol=1e-12)
-    assert score >= 0.78, "must clear AAA+ gate"
+    assert score >= 0.78, "must clear alignment gate"
 
 
 def test_neutral_bias_skips_bias_weight_even_with_bias_strong_true():

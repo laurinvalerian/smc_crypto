@@ -177,13 +177,13 @@ X = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0)
 9  close_return_20           - 20-bar return
 10 high_low_range_norm       - (H-L) / close (current bar)
 11 rsi_14_normalised         - RSI(14) / 100 (normalized to 0-1)
-12 setup_tier_encoded        - 0.5=AAA+, 1.0=AAA++ (from setup_tier param)
+12 setup_tier_encoded        - DEPRECATED 2026-04-19 (tier system killed); feature slot held at 0.0 for backwards compat with existing .pkl models
 13 trade_style_encoded       - 0.0=scalp, 0.5=day, 1.0=swing (from trade_style param)
 14 rr_ratio_normalised       - RR / 10, clamped to [0, 1]
 15 daily_atr_pct_normalised  - daily ATR% * 10, clamped to [0, 1]
 ```
 
-#### [16-23] AAA++ Additional Features
+#### [16-23] SMC Quality Features
 ```
 16 adx_normalized            - ADX / 50, clamped [0, 1]
 17 session_score             - Session quality [0, 1] (parameter)

@@ -20,7 +20,8 @@ risk_per_trade:
   max: 0.015               # 1.5 %
 
 risk_reward:
-  options: [2.0, 2.5, 3.0, 3.5]   # min_rr filter (TP is structure-based, min 2.0 aligned with tier gates)
+  options: [2.0, 2.5, 3.0, 3.5]   # min_rr filter (TP is structure-based). Default 2.0 for scalp-hybrid.
+  default: 2.0                    # Scalp-Day Hybrid (2026-04-19): lowered from 3.0 for shorter feedback loop.
 
 # ── Volume Filter (3-Layer AAA++ Scoring) ────────────────────────
 volume_filter:
@@ -34,12 +35,15 @@ volume_filter:
     crypto: 50000
 
 # ── Trading Styles ────────────────────────────────────────────────
+# Scalp-Day Hybrid (2026-04-19): single style, 5m entry, 4h max hold.
+# SMC structure plays out within 1-4h; pure scalp (<2h) would miss targets,
+# classical day (8-24h) starves the RL feedback loop.
 styles:
   day:
     entry_tf: "5m"         # 5m decision/entry timeframe (crypto sweet spot)
     confirm_tf: "1h"       # 1H structure confirmation
     weight: 1.0
-    max_hold_bars: 96      # ~8 h in 5 m bars
+    max_hold_bars: 48      # 4h on 5m bars — Scalp-Day Hybrid (was 96 = 8h)
 
 # ── SMC Indicator Settings ────────────────────────────────────────
 smc:
@@ -61,27 +65,17 @@ top_down:
   decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
   alignment_threshold: 0.78 # Konsolidiert 2026-04-18: 0.78 ist Live-Wert. Vorher 3-fach Diskrepanz (0.65 config / 0.78 code / 0.88 CLAUDE.md)
 
-# ── AAA++ Filter Settings ───────────────────────────────────────
-aaa_plus_plus:
+# ── Quality Floor Filters ───────────────────────────────────────
+# Hard minimums that must pass regardless of alignment score.
+# Risk sizing scales linearly with alignment_score (see core/sizing.py) —
+# no more AAA++/AAA+ tier system (killed 2026-04-19).
+quality_filters:
   min_adx: 25              # ADX floor (1H) – below this = choppy/ranging
   min_session_score: 0.8   # Only trade in optimal sessions
   min_zone_quality: 0.7    # Zone must be fresh, unmitigated, well-formed
   min_volume_score: 0.6    # 3-layer volume must pass
   require_momentum: true   # RSI + MACD must be confluent
   require_all_tf_aligned: true  # 4/4 timeframes must agree on direction
-  tiers:
-    "AAA++":
-      min_score: 0.88
-      min_rr: 3.0
-      base_risk: 0.01       # 1.0%
-      max_risk: 0.015        # 1.5%
-      max_leverage: 10
-    "AAA+":
-      min_score: 0.78
-      min_rr: 2.0
-      base_risk: 0.005       # 0.5%
-      max_risk: 0.01          # 1.0%
-      max_leverage: 10
 
 # ── Multi-Asset SMC Profiles ────────────────────────────────────
 smc_profiles:

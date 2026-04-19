@@ -15,13 +15,12 @@ from core.constants import (
     COMMISSION,
     SLIPPAGE,
     ALIGNMENT_THRESHOLD,
-    AAA_PLUS_PLUS_THRESHOLD,
-    AAA_PLUS_THRESHOLD,
     LEVERAGE_CAP,
     BINANCE_TAKER_FEE,
     DEFAULT_RISK_PER_TRADE,
     MAX_PORTFOLIO_HEAT,
     MAX_RISK_PER_TRADE,
+    SCALP_MAX_HOLD_BARS,
 )
 
 from core.alignment import (
@@ -30,18 +29,24 @@ from core.alignment import (
     CORE_WEIGHTS_FOREX,
 )
 
+from core.sizing import (
+    compute_risk_fraction,
+    compute_risk_amount,
+)
+
 __all__ = [
     "COMMISSION",
     "SLIPPAGE",
     "ALIGNMENT_THRESHOLD",
-    "AAA_PLUS_PLUS_THRESHOLD",
-    "AAA_PLUS_THRESHOLD",
     "LEVERAGE_CAP",
     "BINANCE_TAKER_FEE",
     "DEFAULT_RISK_PER_TRADE",
     "MAX_PORTFOLIO_HEAT",
     "MAX_RISK_PER_TRADE",
+    "SCALP_MAX_HOLD_BARS",
     "compute_alignment_score",
     "CORE_WEIGHTS_CRYPTO",
     "CORE_WEIGHTS_FOREX",
+    "compute_risk_fraction",
+    "compute_risk_amount",
 ]

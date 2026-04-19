@@ -1,7 +1,8 @@
 """
-AAA++ Trade Quality Filters
-============================
-Advanced filtering modules for selecting only the highest-probability trades.
+SMC Quality Filters
+===================
+Confluence modules that feed the alignment score (core.alignment) and the
+confidence-based risk sizer (core.sizing).
 
 Modules:
   - trend_strength : ADX, momentum confluence, multi-TF trend agreement

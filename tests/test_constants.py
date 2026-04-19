@@ -13,22 +13,27 @@ def test_core_constants_have_expected_values():
         COMMISSION,
         SLIPPAGE,
         ALIGNMENT_THRESHOLD,
-        AAA_PLUS_PLUS_THRESHOLD,
-        AAA_PLUS_THRESHOLD,
         LEVERAGE_CAP,
         DEFAULT_RISK_PER_TRADE,
         MAX_RISK_PER_TRADE,
         MAX_PORTFOLIO_HEAT,
+        SCALP_MAX_HOLD_BARS,
     )
     assert COMMISSION == 0.0004
     assert SLIPPAGE == 0.0002
     assert ALIGNMENT_THRESHOLD == 0.78
-    assert AAA_PLUS_PLUS_THRESHOLD == 0.88
-    assert AAA_PLUS_THRESHOLD == ALIGNMENT_THRESHOLD
     assert LEVERAGE_CAP == 10
     assert DEFAULT_RISK_PER_TRADE == 0.005
     assert MAX_RISK_PER_TRADE == 0.015
     assert MAX_PORTFOLIO_HEAT == 0.06
+    assert SCALP_MAX_HOLD_BARS == 48
+
+
+def test_tier_constants_removed():
+    """Tier system killed 2026-04-19 — AAA_PLUS_* must not be importable."""
+    import core.constants as cc
+    assert not hasattr(cc, "AAA_PLUS_PLUS_THRESHOLD")
+    assert not hasattr(cc, "AAA_PLUS_THRESHOLD")
 
 
 def test_commission_matches_in_live_multi_bot():

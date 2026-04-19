@@ -38,35 +38,6 @@ SLIPPAGE_PCT = SLIPPAGE
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Tier classification (mirrors live_multi_bot.py)
-# ═══════════════════════════════════════════════════════════════════
-
-TIER_AAA_PLUS_PLUS = "AAA++"
-TIER_AAA_PLUS = "AAA+"
-
-# Required component flags for AAA++ (same as live_multi_bot)
-AAA_PP_REQUIRED = {
-    "bias_strong", "h4_confirms", "h4_poi", "h1_confirms", "h1_choch",
-    "entry_zone", "precision_trigger", "volume_ok", "adx_strong",
-    "session_optimal", "zone_quality_ok", "momentum_confluent",
-}
-
-
-def _classify_tier(score: float, rr: float, components: dict) -> str | None:
-    """Classify signal into AAA++ / AAA+ / None (rejected)."""
-    if score >= 0.88 and rr >= 3.0:
-        # Check all required flags
-        if all(components.get(k) for k in AAA_PP_REQUIRED):
-            return TIER_AAA_PLUS_PLUS
-    if score >= 0.78 and rr >= 2.0:
-        required = {"bias_strong", "h4_confirms", "h1_confirms",
-                     "precision_trigger", "volume_ok", "adx_strong"}
-        if all(components.get(k) for k in required):
-            return TIER_AAA_PLUS
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════
 #  Variant configuration + state
 # ═══════════════════════════════════════════════════════════════════
 
@@ -95,7 +66,6 @@ class VirtualTrade:
     asset_class: str
     entry_time: float       # time.time()
     score: float
-    tier: str
 
 
 @dataclass
@@ -147,34 +117,36 @@ class VariantState:
 #  Default 20 variants
 # ═══════════════════════════════════════════════════════════════════
 
+# Scalp-Day Hybrid variants (2026-04-19): no AAA tier dispatch, risk scales
+# with alignment score. Variants explore threshold / RR / leverage space.
 DEFAULT_VARIANTS: list[VariantConfig] = [
-    # Core Sniper variants (user requested 1.0%, 1.5%, 2.0%)
-    VariantConfig("Sniper-1.0",        0.88, 3.0,  5, 0.010),
-    VariantConfig("Sniper-1.5",        0.88, 3.0,  5, 0.015),
-    VariantConfig("Sniper-2.0",        0.88, 3.0,  5, 0.020),
-    # Leverage tests
-    VariantConfig("Sniper-HiLev",      0.88, 3.0, 10, 0.010),
-    VariantConfig("Sniper-LoRisk",     0.88, 3.0,  5, 0.005),
-    # AAA+ tier (more trades)
-    VariantConfig("AAA+-Base",         0.78, 2.0,  7, 0.010),
-    VariantConfig("AAA+-Conservative", 0.80, 2.5,  5, 0.008),
-    # W1 Summer survivor
-    VariantConfig("W1-Summer",         0.85, 3.0,  8, 0.003),
-    # Ultra variants
-    VariantConfig("Ultra-Sniper",      0.90, 3.5,  3, 0.010),
-    VariantConfig("Sniper-HiLev-1.5",  0.88, 3.0, 10, 0.015),
-    # Mixed
-    VariantConfig("AAA+-1.5",          0.78, 2.0,  7, 0.015),
-    VariantConfig("Sniper-RR2.5",      0.88, 2.5,  5, 0.010),
-    VariantConfig("Sniper-Lev3",       0.88, 3.0,  3, 0.010),
-    VariantConfig("Sniper-Lev15",      0.88, 3.0, 15, 0.010),
-    # Wild shots
-    VariantConfig("Wild-A85-RR2",      0.85, 2.0,  5, 0.010),
-    VariantConfig("Wild-A78-RR3",      0.78, 3.0,  5, 0.010),
-    VariantConfig("Wild-A88-RR2-L10",  0.88, 2.0, 10, 0.010),
-    VariantConfig("Wild-Max",          0.78, 2.0, 15, 0.020),
-    VariantConfig("Wild-Min",          0.90, 3.5,  3, 0.003),
-    VariantConfig("Wild-Balanced",     0.85, 2.5,  7, 0.010),
+    # Baseline: threshold 0.78, RR 2.0, moderate leverage
+    VariantConfig("Base-0.78-RR2",     0.78, 2.0,  5, 0.010),
+    VariantConfig("Base-0.78-RR2-Lo",  0.78, 2.0,  5, 0.005),
+    VariantConfig("Base-0.78-RR2-Hi",  0.78, 2.0,  5, 0.015),
+    # Tighter threshold (fewer trades, higher conviction)
+    VariantConfig("Tight-0.82-RR2",    0.82, 2.0,  5, 0.010),
+    VariantConfig("Tight-0.85-RR2",    0.85, 2.0,  5, 0.010),
+    VariantConfig("Tight-0.88-RR2.5",  0.88, 2.5,  5, 0.010),
+    # RR sweeps (same gate, longer target)
+    VariantConfig("Base-RR2.5",        0.78, 2.5,  5, 0.010),
+    VariantConfig("Base-RR3.0",        0.78, 3.0,  5, 0.010),
+    # Leverage sweeps
+    VariantConfig("Base-Lev3",         0.78, 2.0,  3, 0.010),
+    VariantConfig("Base-Lev7",         0.78, 2.0,  7, 0.010),
+    VariantConfig("Base-Lev10",        0.78, 2.0, 10, 0.010),
+    # Risk sweeps
+    VariantConfig("Base-Risk0.3",      0.78, 2.0,  5, 0.003),
+    VariantConfig("Base-Risk0.8",      0.78, 2.0,  5, 0.008),
+    VariantConfig("Base-Risk1.5",      0.78, 2.0,  5, 0.015),
+    # Tight + Lev combinations
+    VariantConfig("Tight-0.85-Lev10",  0.85, 2.0, 10, 0.010),
+    VariantConfig("Tight-0.88-Lev3",   0.88, 2.5,  3, 0.010),
+    # Wild corners
+    VariantConfig("Wild-Max-Agg",      0.78, 2.0, 10, 0.015),
+    VariantConfig("Wild-Min-Defensive",0.90, 3.0,  3, 0.003),
+    VariantConfig("Wild-HiRR",         0.80, 3.5,  5, 0.010),
+    VariantConfig("Wild-LoRR",         0.78, 1.5,  5, 0.010),
 ]
 
 
@@ -285,19 +257,7 @@ class PaperGrid:
                 results[name] = None
                 continue
 
-            # Filter 3: tier classification
-            # Use pre-computed tier from the live bot's signal dict when
-            # available.  The live bot's tier classification respects
-            # per-asset-class skip flags (e.g. volume_ok skipped for
-            # crypto testnet / forex / commodities).  Re-classifying here
-            # without those skip flags would reject every signal from
-            # those classes.
-            tier = signal.get("tier") or _classify_tier(score, rr, components)
-            if tier is None:
-                results[name] = None
-                continue
-
-            # Filter 4: max 1 open trade per variant (sniper approach)
+            # Filter 3: max 1 open trade per variant (sniper approach)
             if state.open_trades:
                 results[name] = None
                 continue
@@ -337,7 +297,6 @@ class PaperGrid:
                 asset_class=asset_class,
                 entry_time=time.time(),
                 score=score,
-                tier=tier,
             )
             state.open_trades[trade_id] = vtrade
             results[name] = trade_id
@@ -419,7 +378,6 @@ class PaperGrid:
             "pnl": net_pnl,
             "actual_rr": actual_rr,
             "outcome": outcome,
-            "tier": vt.tier,
             "score": vt.score,
             "cost": vt.cost,
             "entry_time": vt.entry_time,

@@ -312,37 +312,40 @@ class _RejectionTracker:
     day_done: bool = False
     # swing_done implied by removal from list
 
+# Scalp-Day Hybrid (2026-04-19): all styles cap at 4h hold (48 × 5m bars).
+# Style detection (_detect_style) still classifies by SL-size, but every
+# bucket times out at the same horizon — SMC structure plays out within
+# 1-4h, anything still open after that has invalidated its thesis.
 STYLE_CONFIG: dict[str, dict[str, Any]] = {
     STYLE_SCALP: {
         "min_sl_pct": 0.002,    # 0.2% min SL (lowered — brain validates)
         "max_sl_pct": 0.008,    # 0.8% max SL
         "min_tp_pct": 0.002,    # 0.2% min TP
         "max_tp_pct": 0.015,    # 1.5% max TP
-        "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
-        # cooldown removed — circuit breaker + rate limit are sufficient
-        "max_hold_candles": 72,  # 6h × 12 candles/h (5m bars, market-hours only)
+        "min_rr": 2.0,          # minimum 2:1 RR enforced
+        "max_hold_candles": 48,  # 4h on 5m bars (Scalp-Day Hybrid)
     },
     STYLE_DAY: {
         "min_sl_pct": 0.002,    # 0.2% min SL (lowered — brain validates)
         "max_sl_pct": 0.025,    # 2.5% max SL
-        "min_tp_pct": 0.004,    # 0.4% min TP (lowered from 0.8%)
+        "min_tp_pct": 0.004,    # 0.4% min TP
         "max_tp_pct": 0.06,     # 6% max TP
-        "min_rr": 2.0,          # restored — minimum 2:1 RR enforced
-        # cooldown removed — circuit breaker + rate limit are sufficient
-        "max_hold_candles": 288, # 24h × 12 candles/h (5m bars, market-hours only)
+        "min_rr": 2.0,          # minimum 2:1 RR enforced
+        "max_hold_candles": 48,  # 4h on 5m bars (Scalp-Day Hybrid)
     },
     STYLE_SWING: {
         "min_sl_pct": 0.008,    # 0.8% min SL
         "max_sl_pct": 0.05,     # 5% max SL
         "min_tp_pct": 0.02,     # 2% min TP
         "max_tp_pct": 0.15,     # 15% max TP
-        "min_rr": 2.0,          # lowered from 3.0 — brain filters bad RR
-        # cooldown removed — circuit breaker + rate limit are sufficient
-        "max_hold_candles": 1440, # 10d × 12 candles/h × ~12h avg market day (5m bars, market-hours only)
+        "min_rr": 2.0,          # brain filters bad RR
+        "max_hold_candles": 48,  # 4h on 5m bars — wide-SL setups timeout (by design)
     },
 }
 
-# Risk sizing is 100% confidence-based. Leverage capped by ASSET_MAX_LEVERAGE.
+# Risk sizing is 100% confidence-based via core.sizing.compute_risk_fraction
+# (linear scale 0.5% -> 1.5% between ALIGNMENT_THRESHOLD and score 1.0).
+# Leverage capped by ASSET_MAX_LEVERAGE. No AAA++/AAA+ tier dispatch.
 
 # (removed: _history_exchange / _get_history_exchange — history now loaded via adapter)
 
