@@ -34,14 +34,15 @@ if [[ ! -f "${JOURNAL_DB}" ]]; then
   exit 0
 fi
 
-TS="$(date -u +%Y%m%d_%H%M)"
+TS="$(date -u +%Y%m%d_%H%M%S)"
 OUT_DB="${BACKUP_DIR}/journal_${TS}.db"
 OUT_GZ="${OUT_DB}.gz"
 
 # Use sqlite3's online backup so concurrent WAL writes stay safe.
 sqlite3 "${JOURNAL_DB}" ".backup '${OUT_DB}'"
 BYTES_RAW="$(stat -c %s "${OUT_DB}")"
-gzip -9 "${OUT_DB}"
+# -f: allow overwrite if a stale .gz from a crashed run is present.
+gzip -9 -f "${OUT_DB}"
 BYTES_GZ="$(stat -c %s "${OUT_GZ}")"
 
 log "backup_journal: wrote ${OUT_GZ} (raw=${BYTES_RAW}B, gz=${BYTES_GZ}B)"
