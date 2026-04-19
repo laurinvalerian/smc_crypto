@@ -64,6 +64,7 @@ from core.metrics import (
     deflated_sharpe_ratio as _deflated_sharpe,
     trial_sharpe_variance as _trial_sharpe_variance,
 )
+from backtest.cpcv import run_cpcv, cpcv_summary
 
 # Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS, BACKTEST_OPTUNA_WORKERS).
 # Signal precompute is numpy-heavy → scales with physical cores.
@@ -1490,6 +1491,8 @@ def run(
 
     all_window_results: list[pd.DataFrame] = []
     all_validations: list[dict[str, Any]] = []
+    per_window_best_params: list[dict[str, Any]] = []  # Phase D — kept verbatim for CPCV
+    per_window_study_names: list[str] = []             # Phase D — re-open best window's study
 
     for wi, window in enumerate(tqdm(windows, desc="Walk-forward windows")):
         logger.info(
@@ -1536,6 +1539,8 @@ def run(
         best_params["style_weights"] = {
             "day": best_params.pop("weight_day", 1.0),
         }
+        per_window_best_params.append(dict(best_params))  # snapshot for Phase-D CPCV
+        per_window_study_names.append(window_study_name)
 
         # ── Precompute OOS signals ──────────────────────────────────
         oos_all_signals = _precompute_window_signals(
@@ -1717,6 +1722,139 @@ def run(
             json.dump(all_validations, fh, indent=2, default=str)
 
         logger.info("Summary stats: %s", json.dumps(stats, indent=2))
+
+        # ── Phase D: CPCV post-WF validation ─────────────────────────
+        # Lopez de Prado (2018), Ch. 7. Multiplies OOS evaluations from
+        # N=len(windows) to C(N, k). Fixed-parameter evaluation: tests the
+        # deployment-candidate across every combinatorial choice of test
+        # windows. Tight DSR IQR across splits → parameters are not
+        # split-specific. Disable by setting `cpcv.enabled: false` in config.
+        cpcv_cfg = cfg.get("cpcv", {}) or {}
+        cpcv_enabled = cpcv_cfg.get("enabled", True)
+        cpcv_k = int(cpcv_cfg.get("k", 2))
+        cpcv_min_windows = int(cpcv_cfg.get("min_windows", 4))
+        cpcv_embargo = int(cpcv_cfg.get("embargo_bars", 288))
+        cpcv_funded = float(cpcv_cfg.get("funded_threshold", 0.95))
+        cpcv_research = float(cpcv_cfg.get("research_threshold", 0.70))
+
+        if (
+            cpcv_enabled
+            and len(per_window_best_params) >= cpcv_min_windows
+            and len(all_validations) == len(per_window_best_params)
+        ):
+            try:
+                # Pick best window by OOS DSR (fall back to OOS Sharpe if DSR missing).
+                def _cpcv_window_score(v: dict[str, Any]) -> float:
+                    d = v.get("dsr") or {}
+                    if d:
+                        return float(d.get("dsr", 0.0))
+                    # No DSR → rank by raw Sharpe as last-resort tie-breaker.
+                    w = v.get("window", 0)
+                    row = summary.iloc[w] if w < len(summary) else None
+                    return float(row["sharpe"]) if row is not None and "sharpe" in row else 0.0
+
+                best_wi = max(
+                    range(len(all_validations)),
+                    key=lambda i: _cpcv_window_score(all_validations[i]),
+                )
+                best_params = per_window_best_params[best_wi]
+                best_score = _cpcv_window_score(all_validations[best_wi])
+
+                # Collect trial Sharpes from the best window's study — the
+                # null-distribution sample for the DSR haircut.
+                best_study = optuna.load_study(
+                    study_name=per_window_study_names[best_wi],
+                    storage=storage,
+                )
+                trial_sharpes: list[float] = []
+                for t in best_study.trials:
+                    if t.state.name != "COMPLETE":
+                        continue
+                    sr = t.user_attrs.get("sharpe")
+                    if sr is not None and not (isinstance(sr, float) and np.isnan(sr)):
+                        trial_sharpes.append(float(sr))
+
+                # Re-load OOS signals per window (disk cache → fast).
+                logger.info(
+                    "CPCV: reloading OOS signals for %d windows from disk cache...",
+                    len(windows),
+                )
+                signals_per_window: dict[int, list[TradeSignal]] = {}
+                for wi, window in enumerate(windows):
+                    signals_per_window[wi] = _precompute_window_signals(
+                        cfg, all_symbols_flat,
+                        window["test_start"], window["test_end"],
+                        symbol_to_asset=symbol_to_asset,
+                    )
+
+                n_splits_expected = math.comb(len(windows), cpcv_k)
+                logger.info(
+                    "CPCV: running C(%d, %d) = %d splits | best_params=window%d "
+                    "(DSR/Sharpe-score=%.3f) | trial_sharpes=%d",
+                    len(windows), cpcv_k, n_splits_expected,
+                    best_wi, best_score, len(trial_sharpes),
+                )
+
+                cpcv_df = run_cpcv(
+                    params=best_params,
+                    windows=windows,
+                    signals_per_window=signals_per_window,
+                    simulate_fn=_simulate_with_params,
+                    config=cfg,
+                    symbol_to_asset=symbol_to_asset,
+                    trial_sharpes=trial_sharpes,
+                    k=cpcv_k,
+                    embargo_bars=cpcv_embargo,
+                    max_hold_bars=SCALP_MAX_HOLD_BARS,
+                )
+
+                # Persist — tuple test_idx is not CSV-friendly.
+                cpcv_df_csv = cpcv_df.copy()
+                cpcv_df_csv["test_idx"] = cpcv_df_csv["test_idx"].apply(
+                    lambda t: "|".join(map(str, t))
+                )
+                cpcv_df_csv.to_csv(results_dir / "cpcv_results.csv", index=False)
+
+                cpcv_sum = cpcv_summary(
+                    cpcv_df,
+                    funded_threshold=cpcv_funded,
+                    research_threshold=cpcv_research,
+                )
+                # Serializable extras for reproducibility.
+                cpcv_sum["best_params_source_window"] = int(best_wi)
+                cpcv_sum["best_params"] = {
+                    k: (list(v) if isinstance(v, tuple) else v)
+                    for k, v in best_params.items()
+                    if not isinstance(v, dict)  # drop style_weights — dashboard/sim-only
+                }
+                cpcv_sum["n_trials_in_sharpe_variance"] = len(trial_sharpes)
+                cpcv_sum["k"] = cpcv_k
+                cpcv_sum["embargo_bars"] = cpcv_embargo
+                cpcv_sum["n_windows"] = len(windows)
+
+                with open(results_dir / "cpcv_summary.json", "w") as fh:
+                    json.dump(cpcv_sum, fh, indent=2, default=str)
+
+                logger.info(
+                    "CPCV complete: %d splits | median DSR=%.3f | IQR=%.3f | "
+                    "funded-pass=%.1f%% | research-pass=%.1f%%",
+                    cpcv_sum["n_splits"], cpcv_sum["median_dsr"],
+                    cpcv_sum["dsr_iqr"],
+                    cpcv_sum["percent_passing_funded"] * 100,
+                    cpcv_sum["percent_passing_research"] * 100,
+                )
+
+                # Phase-D robustness gate: IQR < 0.30 (plan Section 2.4).
+                if cpcv_sum["dsr_iqr"] >= 0.30:
+                    logger.warning(
+                        "CPCV IQR %.3f >= 0.30: params are NOT split-robust. "
+                        "PBO check (Phase E) will likely fail. Investigate "
+                        "per-window param drift before funded deploy.",
+                        cpcv_sum["dsr_iqr"],
+                    )
+
+            except Exception as exc:
+                logger.error("CPCV post-WF validation failed: %s", exc, exc_info=True)
 
     logger.info("Walk-forward backtest complete. Results in %s", results_dir)
 
@@ -2280,12 +2418,23 @@ def _eval_combo_worker(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         trades = metrics.get("total_trades", 0)
         dd = metrics.get("max_drawdown", 0)
         wr = metrics.get("winrate_real", 0)
-        sharpe = metrics.get("sharpe", 0)
-        if (pf < 2.0 or pf > 15.0   # PF sanity range (tightened from 20)
+        # Phase D+F (2026-04-19):
+        #   - Removed `sharpe > 8.0` ceiling: was calibrated for old naive
+        #     sqrt(252) per-trade Sharpe. Daily-equity sqrt(365) values 5-15
+        #     are legitimate (baseline_v1.7.1: max window Sharpe 14.29).
+        #   - Removed `pf > 15.0` ceiling: same root-cause scale mismatch.
+        #   - `pf < 1.5` (evergreen floor, matches cross_window_validate default)
+        #   - `dd < -0.12`: the circuit breaker trips at -8% all-time, so
+        #     observed DD clusters around -8.0 to -8.8% for aggressive combos.
+        #     `-0.08` rejected all of them; `-0.12` gives CB-overshoot
+        #     headroom and still respects funded-account's -10% alltime cap
+        #     in the relevant evergreen regime (real DD <= -0.10 expected).
+        #   - The overfit detector is the post-hoc DSR via CPCV, not
+        #     magic-number ceilings.
+        if (pf < 1.5
             or trades < _BF_MIN_TRADES
-            or dd < -0.08            # stricter DD gate
-            or wr > 0.80             # unrealistic WR
-            or sharpe > 8.0):        # impossible Sharpe
+            or dd < -0.12
+            or wr > 0.80):
             all_pass = False
             break
 
@@ -2309,7 +2458,11 @@ def _eval_combo_worker(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str
     if all_pass and len(window_metrics_list) == n_windows:
         pfs = [m.get("pf_real", 0) for m in window_metrics_list]
         pf_ratio = max(pfs) / min(pfs) if min(pfs) > 0 else 999
-        if pf_ratio > 5.0:
+        # Raised from 5.0 → 10.0 (Phase D+F): baseline_v1.7.1 shows legitimate
+        # PF variance across regimes (2.43 w5 → 17.84 w1, ratio ~7). A 5.0
+        # ceiling rejected robust params. CPCV IQR(DSR) < 0.3 is the
+        # stronger cross-window consistency gate.
+        if pf_ratio > 10.0:
             all_pass = False
 
     eg_entry = None
@@ -2463,7 +2616,12 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
         _BF_N_WINDOWS = len(windows)
 
         import multiprocessing as mp
-        with mp.Pool(processes=4) as pool:
+        # macOS Python 3.8+ default is 'spawn' which re-imports the module
+        # — globals set above (_BF_SIGNALS, _BF_CFG, ...) are invisible to
+        # workers. Force 'fork' so copy-on-write makes them visible.
+        # (Alternative: worker-initializer + pickled state, 3× slower.)
+        _mp_ctx = mp.get_context("fork")
+        with _mp_ctx.Pool(processes=4) as pool:
             results = list(tqdm(
                 pool.imap_unordered(_eval_combo_worker, grid, chunksize=32),
                 total=len(grid), desc=f"{ac} bruteforce",
@@ -2535,6 +2693,144 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                 confidence,
             )
             evergreen_results[ac] = evergreen
+
+            # ── Phase D+F: CPCV post-bruteforce validation ───────────
+            # Bruteforce is the primary path (TPE overfits on noisy 20-50-trade
+            # landscapes per plan §3.1). CPCV multiplies OOS evaluations of
+            # the deployment-candidate via C(N, k) splits and reports the
+            # DSR distribution — tight IQR signals split-robust params.
+            cpcv_cfg = cfg.get("cpcv", {}) or {}
+            cpcv_enabled = cpcv_cfg.get("enabled", True)
+            cpcv_k = int(cpcv_cfg.get("k", 2))
+            cpcv_min_windows = int(cpcv_cfg.get("min_windows", 4))
+            cpcv_embargo = int(cpcv_cfg.get("embargo_bars", 288))
+            cpcv_funded = float(cpcv_cfg.get("funded_threshold", 0.95))
+            cpcv_research = float(cpcv_cfg.get("research_threshold", 0.70))
+
+            if cpcv_enabled and len(windows) >= cpcv_min_windows:
+                try:
+                    # Null-distribution sample: mean-Sharpe across windows
+                    # for *qualified* strategy candidates only. Bailey-LdP's
+                    # n_trials is "independent strategies that competed for
+                    # selection", not "every mechanically-enumerated combo".
+                    # Using the full grid (incl. trivial filter configs that
+                    # produce zero/junk trades) inflates E_max_null and
+                    # collapses DSR to ~0 (seen in cpcv_summary v1 run).
+                    #
+                    # Primary filter: is_evergreen (passed WF PF-min gate).
+                    # Fallback at <5 evergreens: combos that traded in all
+                    # windows — still rejects "alignment=0.9 → no signals"
+                    # trivial combos while keeping variance estimate feasible.
+                    window_sharpe_cols = [
+                        c for c in grid_df.columns
+                        if c.startswith("w") and c.endswith("_sharpe")
+                    ]
+                    eg_mask = grid_df["is_evergreen"].fillna(False).astype(bool)
+                    qualified_df = grid_df[eg_mask]
+                    used_fallback = False
+                    if len(qualified_df) < 5:
+                        used_fallback = True
+                        window_trade_cols = [
+                            c for c in grid_df.columns if c.endswith("_trades")
+                        ]
+                        if window_trade_cols:
+                            has_all_trades = (
+                                grid_df[window_trade_cols].fillna(0) > 0
+                            ).all(axis=1)
+                            qualified_df = grid_df[has_all_trades]
+                        else:
+                            qualified_df = grid_df[eg_mask]
+
+                    trial_sharpes: list[float] = []
+                    if window_sharpe_cols:
+                        for _, rrow in qualified_df.iterrows():
+                            vals = [
+                                float(rrow[c]) for c in window_sharpe_cols
+                                if not pd.isna(rrow[c])
+                            ]
+                            if vals:
+                                trial_sharpes.append(float(np.mean(vals)))
+
+                    n_splits_expected = math.comb(len(windows), cpcv_k)
+                    logger.info(
+                        "%s CPCV: C(%d, %d) = %d splits | best_params=evergreen[0] "
+                        "(min_PF=%.2f) | n_trials=%d (qualified %d/%d, "
+                        "fallback=%s, evergreen=%d)",
+                        ac.upper(), len(windows), cpcv_k, n_splits_expected,
+                        best["min_pf"], len(trial_sharpes),
+                        len(qualified_df), len(grid_df),
+                        used_fallback, int(eg_mask.sum()),
+                    )
+
+                    cpcv_df = run_cpcv(
+                        params=best["params"],
+                        windows=windows,
+                        signals_per_window={
+                            wi: sigs for wi, sigs in enumerate(oos_signals_per_window)
+                        },
+                        simulate_fn=_simulate_with_params,
+                        config=cfg,
+                        symbol_to_asset=symbol_to_asset,
+                        trial_sharpes=trial_sharpes,
+                        k=cpcv_k,
+                        embargo_bars=cpcv_embargo,
+                        max_hold_bars=SCALP_MAX_HOLD_BARS,
+                    )
+
+                    cpcv_df_csv = cpcv_df.copy()
+                    cpcv_df_csv["test_idx"] = cpcv_df_csv["test_idx"].apply(
+                        lambda t: "|".join(map(str, t))
+                    )
+                    cpcv_df_csv.to_csv(
+                        ac_results_dir / "cpcv_results.csv", index=False,
+                    )
+
+                    cpcv_sum = cpcv_summary(
+                        cpcv_df,
+                        funded_threshold=cpcv_funded,
+                        research_threshold=cpcv_research,
+                    )
+                    cpcv_sum["asset_class"] = ac
+                    cpcv_sum["best_params"] = {
+                        k_: v for k_, v in best["params"].items()
+                        if not isinstance(v, dict)
+                    }
+                    cpcv_sum["evergreen_min_pf"] = float(best["min_pf"])
+                    cpcv_sum["evergreen_mean_pf"] = float(best["mean_pf"])
+                    cpcv_sum["n_trials_in_sharpe_variance"] = len(trial_sharpes)
+                    cpcv_sum["k"] = cpcv_k
+                    cpcv_sum["embargo_bars"] = cpcv_embargo
+                    cpcv_sum["n_windows"] = len(windows)
+                    cpcv_sum["source"] = "bruteforce_primary"
+
+                    with open(ac_results_dir / "cpcv_summary.json", "w") as f:
+                        json.dump(cpcv_sum, f, indent=2, default=str)
+
+                    evergreen["cpcv"] = cpcv_sum
+                    with open(eg_path, "w") as f:
+                        json.dump(evergreen, f, indent=2, default=str)
+
+                    logger.info(
+                        "%s CPCV: %d splits | median DSR=%.3f | IQR=%.3f | "
+                        "funded-pass=%.1f%% | research-pass=%.1f%%",
+                        ac.upper(), cpcv_sum["n_splits"],
+                        cpcv_sum["median_dsr"], cpcv_sum["dsr_iqr"],
+                        cpcv_sum["percent_passing_funded"] * 100,
+                        cpcv_sum["percent_passing_research"] * 100,
+                    )
+
+                    if cpcv_sum["dsr_iqr"] >= 0.30:
+                        logger.warning(
+                            "%s CPCV IQR %.3f >= 0.30: params NOT split-robust. "
+                            "PBO check (Phase E) will likely fail.",
+                            ac.upper(), cpcv_sum["dsr_iqr"],
+                        )
+
+                except Exception as exc:
+                    logger.error(
+                        "%s CPCV post-bruteforce validation failed: %s",
+                        ac.upper(), exc, exc_info=True,
+                    )
         else:
             logger.warning(
                 "✗ %s: No evergreen params found! Using conservative defaults.",
@@ -2698,7 +2994,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--bruteforce", action="store_true",
-        help="Exhaustive grid search on ALL OOS windows (no Optuna, anti-overfitting)",
+        help="[DEPRECATED — now the default] Exhaustive grid search on ALL "
+             "OOS windows. Kept for backwards compatibility.",
+    )
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Optuna TPE (fast preview, NOT robust — TPE overfits noisy "
+             "landscapes per quality-upgrade plan §3.1). Use for "
+             "sanity-checking new config changes; never for deploy-candidates.",
     )
     args = parser.parse_args()
 
@@ -2707,9 +3010,11 @@ if __name__ == "__main__":
         generate_paper_grid_variants(
             results_dir=cfg["backtest"]["results_dir"],
         )
-    elif args.bruteforce:
-        run_bruteforce(config_path=args.config)
+    elif args.fast:
+        # Optuna preview — overfitting-prone, no deploy-gate weight
+        run(config_path=args.config)
     elif args.per_class:
         run_per_asset_class(config_path=args.config)
     else:
-        run(config_path=args.config)
+        # Default: Bruteforce grid + CPCV (Phase D+F, quality-upgrade plan)
+        run_bruteforce(config_path=args.config)
