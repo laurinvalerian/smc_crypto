@@ -308,12 +308,18 @@ class TestRegionSummarySaturationFix:
         assert s["gate_pass"] is True
 
     def test_dsr_saturation_caught_by_sharpe_ridge(self):
-        """DSR all 1.0 (saturated) → DSR-spread=0 PASS.
+        """DSR near-saturated (all ≈ 1.0) → DSR-spread ≈ 0 PASS.
         But Sharpe landscape has a ridge → Sharpe-rel-spread high → combined FAIL.
         This is exactly the v1.10 failure mode the fix addresses.
+
+        Ridge cell given uniquely-max DSR (1.0 vs 0.9999 for the rest) so the
+        top-K selection is deterministic across numpy/pandas versions — the
+        saturation character is preserved since DSR-spread = 1e-4 ≪ gate.
         """
+        dsr_vals = np.full((4, 5), 0.9999)
+        dsr_vals[1, 2] = 1.0  # ridge cell uniquely max — deterministic top-1
         dsr_pivot = pd.DataFrame(
-            np.full((4, 5), 1.0),
+            dsr_vals,
             index=[1.5, 2.0, 2.5, 3.0],
             columns=[0.70, 0.75, 0.80, 0.85, 0.90],
         )

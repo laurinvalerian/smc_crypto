@@ -271,8 +271,9 @@ def region_summary(
     n_top = max(1, int(np.ceil(top_pct * valid.size)))
 
     # Sort cells by DSR descending; remember the indices of the top-K cells
-    # so the Sharpe gate evaluates the *same* set of cells.
-    order = np.argsort(valid)[::-1]
+    # so the Sharpe gate evaluates the *same* set of cells. Stable sort so
+    # tie-break is deterministic across numpy builds / platforms.
+    order = np.argsort(-valid, kind="stable")
     top_idx = order[:n_top]
     top_values = valid[top_idx]
 
