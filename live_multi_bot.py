@@ -38,7 +38,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import numpy as np
 import pandas as pd
@@ -478,6 +478,10 @@ class PaperBot:
         # Active trades on exchange (max 3, cleared by position poller)
         self._active_trades: list[dict[str, Any]] = []
         self._processed_exit_ids: set[str] = set()
+
+        # Teacher-analysis hook injected by Runner (keeps _teacher_semaphore in Runner).
+        self._teacher_enabled: bool = False
+        self._teacher_trigger: Callable[[PaperBot, dict[str, Any], float], Awaitable[None]] | None = None
 
         # Candle history  {symbol: list[dict]}
         self._candle_buf: dict[str, list[dict[str, Any]]] = {}
@@ -3762,6 +3766,269 @@ class PaperBot:
             "open_pos": len(self._active_trades),
         }
 
+    # ── Trade close accounting (moved from Runner._poll_positions) ──
+
+    async def _record_close(self, trade: dict[str, Any], exit_price: float) -> None:
+        """Finalize a closed trade: update equity/pnl, journal, schedule teacher, cleanup orders."""
+        entry_price = trade["entry"]
+        qty = trade["qty"]
+        direction = trade["direction"]
+        sl = trade["sl"]
+        # Pre-seed so teacher block + any early-return paths always have a value
+        exit_reason = "unknown"
+        outcome_str = "unknown"
+
+        if direction == "long":
+            raw_pnl = (exit_price - entry_price) * qty
+        else:
+            raw_pnl = (entry_price - exit_price) * qty
+
+        commission = qty * entry_price * self.commission_rate * COMMISSION_MULTIPLIER
+        net_pnl = raw_pnl - commission
+
+        pnl_pct = (net_pnl / self.equity * 100) if self.equity > 0 else 0.0
+
+        self.equity += net_pnl
+        self.total_pnl += net_pnl
+        self.trades += 1
+        if net_pnl > 0:
+            self.wins += 1
+        if self.equity > self.peak_equity:
+            self.peak_equity = self.equity
+
+        self._append_equity()
+
+        # ── RL performance kill switches ─────────────────────────
+        if self.trades >= 50 and self.rl_suite is not None and self.rl_suite.enabled:
+            _wr = self.wins / self.trades
+            _gross_win = self.total_pnl if self.total_pnl > 0 else 0.0
+            _gross_loss = abs(self.total_pnl - _gross_win) if self.total_pnl < 0 else 0.0
+            _pf = _gross_win / _gross_loss if _gross_loss > 0 else 99.0
+            if _wr < 0.35:
+                self.logger.critical(
+                    "RL KILL: WR %.1f%% < 35%% over %d trades — disabling RL",
+                    _wr * 100, self.trades,
+                )
+                self.rl_suite.enabled = False
+            elif _pf < 1.0 and self.total_pnl < 0:
+                self.logger.critical(
+                    "RL KILL: PF %.2f < 1.0, net PnL %.2f over %d trades — disabling RL",
+                    _pf, self.total_pnl, self.trades,
+                )
+                self.rl_suite.enabled = False
+
+        # Record PnL in circuit breaker
+        if self.circuit_breaker is not None:
+            pnl_pct_frac = net_pnl / self._account_equity if self._account_equity > 0 else 0.0
+            self.circuit_breaker.record_trade_pnl(
+                pnl_pct=pnl_pct_frac,
+                asset_class=self.asset_class,
+                symbol=self.symbol,
+            )
+
+        # Record trade close in Paper Grid (A/B testing)
+        if self.paper_grid is not None:
+            self.paper_grid.record_trade_close(exit_price, self.symbol)
+
+        # ── Trade Journal: record trade close ─────────────────────
+        if self.journal is not None:
+            trade_id_j = trade.get("rl_trade_id", "")
+            if trade_id_j:
+                try:
+                    entry_price_j = float(trade.get("entry", exit_price))
+                    sl_dist_j = abs(entry_price_j - float(trade.get("sl", entry_price_j)))
+                    rr_actual = (
+                        (abs(exit_price - entry_price_j) / sl_dist_j)
+                        if sl_dist_j > 0 else 0.0
+                    )
+                    rr_target = abs(
+                        float(trade.get("tp", entry_price_j)) - entry_price_j
+                    ) / sl_dist_j if sl_dist_j > 0 else 3.0
+
+                    outcome_str = "win" if net_pnl > 0 else "loss"
+                    _override_reason = trade.get("_exit_reason_override")
+                    if _override_reason:
+                        exit_reason = _override_reason
+                    else:
+                        tp_price = float(trade.get("tp", 0.0))
+                        sl_price = float(trade.get("sl", 0.0))
+                        # 1% tolerance — wider to handle slippage on illiquid instruments
+                        if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.01 and net_pnl > 0:
+                            exit_reason = "tp_hit"
+                        elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.01 and net_pnl <= 0:
+                            exit_reason = "sl_hit"
+                        else:
+                            # PnL-based fallback when price didn't match SL/TP within tolerance
+                            if net_pnl > 0:
+                                exit_reason = "tp_hit"
+                            else:
+                                exit_reason = "sl_hit"
+
+                    # MFE/MAE from journal's running tracker.
+                    # bug_012 fix (2026-04-17): ensure fallback uses same formula
+                    # as the tracker (gross, entry-relative) so labels stay on the same scale.
+                    _exit_move = abs(exit_price - entry_price_j) / entry_price_j if entry_price_j > 0 else 0.0
+                    max_fav = self.journal._max_favorable.get(
+                        trade_id_j,
+                        _exit_move if net_pnl > 0 else 0.0,
+                    )
+                    max_adv = self.journal._max_adverse.get(
+                        trade_id_j,
+                        _exit_move if net_pnl <= 0 else 0.0,
+                    )
+                    bars_held_j = trade.get("bars_held", 0)
+
+                    self.journal.close_trade(
+                        trade_id=trade_id_j,
+                        exit_time=datetime.now(timezone.utc),
+                        exit_price=exit_price,
+                        outcome=outcome_str,
+                        exit_reason=exit_reason,
+                        bars_held=bars_held_j,
+                        pnl_pct=pnl_pct / 100.0,
+                        rr_actual=rr_actual if net_pnl > 0 else -rr_actual,
+                        max_favorable_pct=max_fav,
+                        max_adverse_pct=max_adv,
+                        be_triggered=bool(trade.get("be_triggered", False)),
+                    )
+                except Exception as exc:
+                    self.logger.debug("journal.close_trade error: %s", exc)
+
+        # ── Teacher analysis (non-blocking, retroactive) ────────
+        if self._teacher_enabled and self._teacher_trigger is not None:
+            # Mirror live fields into teacher-expected keys
+            trade["_exit_reason"] = exit_reason
+            trade["outcome"] = outcome_str if outcome_str != "unknown" else ("win" if net_pnl > 0 else "loss")
+            trade["pnl_pct"] = (net_pnl / self.equity) if self.equity > 0 else 0.0
+            asyncio.create_task(self._teacher_trigger(self, trade, exit_price))
+
+        # === CLEANUP ===
+        _cancel_adapter = self.adapter if self.adapter is not None else None
+
+        # Track which ID-based cancels actually succeeded (or order was already gone)
+        cancelled_ids: set[str] = set()
+
+        if trade.get("sl_attached"):
+            # OANDA: SL/TP are trade-attached — they auto-cancel when trade closes.
+            self.logger.debug("Trade-attached SL/TP auto-cancelled with trade close")
+        else:
+            # Binance/Alpaca: cancel standalone SL/TP orders
+            sl_order_id = trade.get("sl_order_id")
+            tp_order_id = trade.get("tp_order_id")
+            cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
+
+            if cancel_targets and _cancel_adapter is not None:
+                for cancel_id in cancel_targets:
+                    try:
+                        await _cancel_adapter.cancel_order(cancel_id, self.symbol)
+                        cancelled_ids.add(str(cancel_id))
+                        self.logger.info(
+                            "Cancelled dangling order %s for %s after exit", cancel_id, self.symbol
+                        )
+                    except Exception as exc:
+                        # -2011 "Unknown order sent" expected when SL/TP triggered the close.
+                        exc_str = str(exc)
+                        if "-2011" in exc_str or "Unknown order" in exc_str:
+                            cancelled_ids.add(str(cancel_id))  # already gone = effectively cancelled
+                            self.logger.debug(
+                                "Order %s for %s already gone (filled/cancelled): %s",
+                                cancel_id, self.symbol, exc,
+                            )
+                        else:
+                            self.logger.warning(
+                                "Failed to cancel dangling order %s for %s: %s",
+                                cancel_id, self.symbol, exc,
+                            )
+
+        # Belt-and-suspenders: fetch open orders and cancel any remaining
+        # reduce-only SL/TP orders whose stop price matches this trade.
+        # IMPORTANT: protect orders belonging to OTHER active trades (different style).
+        if _cancel_adapter is not None:
+            # Collect order IDs of other still-active trades to protect them
+            protected_ids: set[str] = set()
+            for other in self._active_trades:
+                if other is trade:
+                    continue
+                for k in ("order_id", "sl_order_id", "tp_order_id"):
+                    oid = other.get(k)
+                    if oid:
+                        protected_ids.add(str(oid))
+            try:
+                open_orders = await _cancel_adapter.fetch_open_orders(self.symbol)
+                trade_sl = trade.get("sl")
+                trade_tp = trade.get("tp")
+
+                # Warn if stored order IDs not found on exchange at all
+                open_order_ids = {str(o.get("id") or "") for o in open_orders}
+                for label, stored_id in [("sl_order_id", trade.get("sl_order_id")),
+                                         ("tp_order_id", trade.get("tp_order_id"))]:
+                    if stored_id and str(stored_id) not in cancelled_ids and str(stored_id) not in open_order_ids:
+                        self.logger.warning(
+                            "ORDER ID MISMATCH: %s=%s for %s not found on exchange "
+                            "(possible order replacement/amendment)",
+                            label, stored_id, self.symbol,
+                        )
+
+                for o in open_orders:
+                    o_id = str(o.get("id") or "")
+                    if not o_id:
+                        continue
+                    if o_id in protected_ids:
+                        continue
+                    if o_id in cancelled_ids:
+                        continue
+                    o_stop = float(
+                        o.get("stopPrice")
+                        or o.get("info", {}).get("stopPrice", 0)
+                        or 0
+                    )
+                    o_type = (o.get("type", "") or "").lower()
+                    is_exit_type = any(
+                        k in o_type for k in ("stop", "take_profit")
+                    )
+                    if not (is_exit_type and o_stop > 0):
+                        continue
+                    tol = max(
+                        abs(o_stop) * PRICE_TOLERANCE_FACTOR,
+                        MIN_PRICE_TOLERANCE,
+                    )
+                    price_matches = (
+                        (trade_sl and abs(o_stop - trade_sl) <= tol)
+                        or (trade_tp and abs(o_stop - trade_tp) <= tol)
+                    )
+                    if price_matches:
+                        try:
+                            await _cancel_adapter.cancel_order(o_id, self.symbol)
+                            self.logger.info(
+                                "Zombie order cancelled (price-match) %s"
+                                " stopPrice=%.6f for %s [style=%s]",
+                                o_id, o_stop, self.symbol,
+                                trade.get("style", "?"),
+                            )
+                        except Exception as ce:
+                            self.logger.warning(
+                                "Zombie cancel failed %s for %s: %s",
+                                o_id, self.symbol, ce,
+                            )
+            except Exception as exc:
+                self.logger.warning(
+                    "fetch_open_orders cleanup failed for %s: %s",
+                    self.symbol, exc,
+                )
+
+        outcome = "WIN" if net_pnl > 0 else "LOSS"
+        self.logger.info(
+            "CLOSE %s %s %s @ %.6f → %.6f | pnl=%.2f equity=%.2f",
+            outcome,
+            direction.upper(),
+            self.symbol,
+            entry_price,
+            exit_price,
+            net_pnl,
+            self.equity,
+        )
+        self._save_state()
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Exchange helper
@@ -3893,6 +4160,12 @@ class LiveMultiBotRunner:
         # Teacher analysis (retroactive non-causal SMC after trade close)
         self._teacher_enabled = True
         self._teacher_semaphore = asyncio.Semaphore(1)  # max 1 concurrent analysis
+
+        # Inject teacher hook into each PaperBot so _record_close can schedule
+        # retroactive analysis without coupling PaperBot to the Runner class.
+        for _bot in self.bots:
+            _bot._teacher_enabled = self._teacher_enabled
+            _bot._teacher_trigger = self._run_teacher_analysis
 
     # ── WebSocket OHLCV watcher with auto-reconnect ───────────────
 
@@ -4801,290 +5074,8 @@ class LiveMultiBotRunner:
         position state, then updates bot stats and RL rewards.
         """
 
-        async def _record_close(bot: PaperBot, trade: dict[str, Any], exit_price: float) -> None:
-            entry_price = trade["entry"]
-            qty = trade["qty"]
-            direction = trade["direction"]
-            sl = trade["sl"]
-            # Pre-seed so teacher block + any early-return paths always have a value
-            exit_reason = "unknown"
-            outcome_str = "unknown"
-
-            if direction == "long":
-                raw_pnl = (exit_price - entry_price) * qty
-            else:
-                raw_pnl = (entry_price - exit_price) * qty
-
-            commission = qty * entry_price * bot.commission_rate * COMMISSION_MULTIPLIER
-            net_pnl = raw_pnl - commission
-
-            pnl_pct = (net_pnl / bot.equity * 100) if bot.equity > 0 else 0.0
-
-            bot.equity += net_pnl
-            bot.total_pnl += net_pnl
-            bot.trades += 1
-            if net_pnl > 0:
-                bot.wins += 1
-            if bot.equity > bot.peak_equity:
-                bot.peak_equity = bot.equity
-
-            bot._append_equity()
-
-            # ── RL performance kill switches ─────────────────────────
-            if bot.trades >= 50 and bot.rl_suite is not None and bot.rl_suite.enabled:
-                _wr = bot.wins / bot.trades
-                _gross_win = bot.total_pnl if bot.total_pnl > 0 else 0.0
-                _gross_loss = abs(bot.total_pnl - _gross_win) if bot.total_pnl < 0 else 0.0
-                _pf = _gross_win / _gross_loss if _gross_loss > 0 else 99.0
-                if _wr < 0.35:
-                    bot.logger.critical(
-                        "RL KILL: WR %.1f%% < 35%% over %d trades — disabling RL",
-                        _wr * 100, bot.trades,
-                    )
-                    bot.rl_suite.enabled = False
-                elif _pf < 1.0 and bot.total_pnl < 0:
-                    bot.logger.critical(
-                        "RL KILL: PF %.2f < 1.0, net PnL %.2f over %d trades — disabling RL",
-                        _pf, bot.total_pnl, bot.trades,
-                    )
-                    bot.rl_suite.enabled = False
-
-            # Record PnL in circuit breaker
-            if bot.circuit_breaker is not None:
-                pnl_pct_frac = net_pnl / bot._account_equity if bot._account_equity > 0 else 0.0
-                bot.circuit_breaker.record_trade_pnl(
-                    pnl_pct=pnl_pct_frac,
-                    asset_class=bot.asset_class,
-                    symbol=bot.symbol,
-                )
-
-            # Record trade close in Paper Grid (A/B testing)
-            if bot.paper_grid is not None:
-                bot.paper_grid.record_trade_close(exit_price, bot.symbol)
-
-            # ── Trade Journal: record trade close ─────────────────────
-            if bot.journal is not None:
-                trade_id_j = trade.get("rl_trade_id", "")
-                if trade_id_j:
-                    try:
-                        entry_price_j = float(trade.get("entry", exit_price))
-                        sl_dist_j = abs(entry_price_j - float(trade.get("sl", entry_price_j)))
-                        rr_actual = (
-                            (abs(exit_price - entry_price_j) / sl_dist_j)
-                            if sl_dist_j > 0 else 0.0
-                        )
-                        rr_target = abs(
-                            float(trade.get("tp", entry_price_j)) - entry_price_j
-                        ) / sl_dist_j if sl_dist_j > 0 else 3.0
-
-                        outcome_str = "win" if net_pnl > 0 else "loss"
-                        # Determine exit reason from price proximity to SL/TP
-                        # IMPORTANT: also check profitability — TP hit must be a win,
-                        # SL hit must be a loss. Prevents mislabeling that poisons
-                        # the continuous learner's sample weights.
-                        _override_reason = trade.get("_exit_reason_override")
-                        if _override_reason:
-                            exit_reason = _override_reason
-                        else:
-                            tp_price = float(trade.get("tp", 0.0))
-                            sl_price = float(trade.get("sl", 0.0))
-                            # 1% tolerance (was 0.3%) — wider to handle slippage
-                            # on OANDA and illiquid instruments
-                            if tp_price > 0 and abs(exit_price - tp_price) / max(tp_price, 1) < 0.01 and net_pnl > 0:
-                                exit_reason = "tp_hit"
-                            elif sl_price > 0 and abs(exit_price - sl_price) / max(sl_price, 1) < 0.01 and net_pnl <= 0:
-                                exit_reason = "sl_hit"
-                            else:
-                                # PnL-based fallback: if price didn't match SL/TP
-                                # within tolerance, infer from profit direction
-                                if net_pnl > 0:
-                                    exit_reason = "tp_hit"
-                                else:
-                                    exit_reason = "sl_hit"
-
-                        # MFE/MAE from journal's running tracker.
-                        # bug_012 fix (2026-04-17): previous fallback used `abs(pnl_pct/100)`
-                        # which is (a) net-of-commission, (b) equity-relative — while
-                        # _max_favorable stores gross, entry-price-relative fractions
-                        # (unrealized_pnl_pct in record_bar: (close-entry)/entry).
-                        # Mixing those units silently poisons MFE/MAE labels. The fallback
-                        # now uses the same formula as the tracker (gross, entry-relative)
-                        # for wins; for losses the MAE fallback uses the same absolute price
-                        # move. If the tracker has a value, use it — else this consistent
-                        # fallback keeps labels on the same scale.
-                        _exit_move = abs(exit_price - entry_price_j) / entry_price_j if entry_price_j > 0 else 0.0
-                        max_fav = bot.journal._max_favorable.get(
-                            trade_id_j,
-                            _exit_move if net_pnl > 0 else 0.0,
-                        )
-                        max_adv = bot.journal._max_adverse.get(
-                            trade_id_j,
-                            _exit_move if net_pnl <= 0 else 0.0,
-                        )
-                        bars_held_j = trade.get("bars_held", 0)
-
-                        bot.journal.close_trade(
-                            trade_id=trade_id_j,
-                            exit_time=datetime.now(timezone.utc),
-                            exit_price=exit_price,
-                            outcome=outcome_str,
-                            exit_reason=exit_reason,
-                            bars_held=bars_held_j,
-                            pnl_pct=pnl_pct / 100.0,
-                            rr_actual=rr_actual if net_pnl > 0 else -rr_actual,
-                            max_favorable_pct=max_fav,
-                            max_adverse_pct=max_adv,
-                            be_triggered=bool(trade.get("be_triggered", False)),
-                        )
-                    except Exception as exc:
-                        bot.logger.debug("journal.close_trade error: %s", exc)
-
-            # ── Teacher analysis (non-blocking, retroactive) ────────
-            if self._teacher_enabled:
-                # Mirror live fields into teacher-expected keys so the
-                # feedback JSONL gets real values, not defaults.
-                trade["_exit_reason"] = exit_reason
-                trade["outcome"] = outcome_str if outcome_str != "unknown" else ("win" if net_pnl > 0 else "loss")
-                trade["pnl_pct"] = (net_pnl / bot.equity) if bot.equity > 0 else 0.0
-                asyncio.create_task(self._run_teacher_analysis(bot, trade, exit_price))
-
-            # === CLEANUP ===
-            _cancel_adapter = bot.adapter if bot.adapter is not None else None
-
-            # Track which ID-based cancels actually succeeded (or order was already gone)
-            cancelled_ids: set[str] = set()
-
-            if trade.get("sl_attached"):
-                # OANDA: SL/TP are trade-attached — they auto-cancel when trade closes.
-                # No cancel_order needed. Standalone order IDs don't exist.
-                bot.logger.debug("Trade-attached SL/TP auto-cancelled with trade close")
-            else:
-                # Binance/Alpaca: cancel standalone SL/TP orders
-                sl_order_id = trade.get("sl_order_id")
-                tp_order_id = trade.get("tp_order_id")
-                cancel_targets = [oid for oid in (sl_order_id, tp_order_id) if oid]
-
-                if cancel_targets and _cancel_adapter is not None:
-                    for cancel_id in cancel_targets:
-                        try:
-                            await _cancel_adapter.cancel_order(cancel_id, bot.symbol)
-                            cancelled_ids.add(str(cancel_id))
-                            bot.logger.info(
-                                "Cancelled dangling order %s for %s after exit", cancel_id, bot.symbol
-                            )
-                        except Exception as exc:
-                            # -2011 "Unknown order sent" means order was already
-                            # filled or cancelled on the exchange – expected when
-                            # SL/TP triggered the close.  Log at DEBUG to reduce noise.
-                            exc_str = str(exc)
-                            if "-2011" in exc_str or "Unknown order" in exc_str:
-                                cancelled_ids.add(str(cancel_id))  # already gone = effectively cancelled
-                                bot.logger.debug(
-                                    "Order %s for %s already gone (filled/cancelled): %s",
-                                    cancel_id, bot.symbol, exc,
-                                )
-                            else:
-                                bot.logger.warning(
-                                    "Failed to cancel dangling order %s for %s: %s",
-                                    cancel_id, bot.symbol, exc,
-                                )
-
-            # Belt-and-suspenders: fetch open orders and cancel any remaining
-            # reduce-only SL/TP orders whose stop price matches this trade.
-            # This catches zombie orders when ID-based cancels fail (e.g. the
-            # triggered order already filled and its ID was re-used, or the
-            # stored ID was wrong).
-            # IMPORTANT: protect orders belonging to OTHER active trades
-            # (different style) on the same coin — only cancel orders that
-            # match the closed trade's SL/TP prices.
-            if _cancel_adapter is not None:
-                # Collect order IDs of other still-active trades to protect them
-                protected_ids: set[str] = set()
-                for other in bot._active_trades:
-                    if other is trade:
-                        continue
-                    for k in ("order_id", "sl_order_id", "tp_order_id"):
-                        oid = other.get(k)
-                        if oid:
-                            protected_ids.add(str(oid))
-                try:
-                    open_orders = await _cancel_adapter.fetch_open_orders(bot.symbol)
-                    trade_sl = trade.get("sl")
-                    trade_tp = trade.get("tp")
-
-                    # Warn if stored order IDs not found on exchange at all
-                    # (surfaces Binance order ID replacement/amendment issues)
-                    open_order_ids = {str(o.get("id") or "") for o in open_orders}
-                    for label, stored_id in [("sl_order_id", trade.get("sl_order_id")),
-                                             ("tp_order_id", trade.get("tp_order_id"))]:
-                        if stored_id and str(stored_id) not in cancelled_ids and str(stored_id) not in open_order_ids:
-                            bot.logger.warning(
-                                "ORDER ID MISMATCH: %s=%s for %s not found on exchange "
-                                "(possible order replacement/amendment)",
-                                label, stored_id, bot.symbol,
-                            )
-
-                    for o in open_orders:
-                        o_id = str(o.get("id") or "")
-                        if not o_id:
-                            continue
-                        # Never cancel orders belonging to other active trades
-                        if o_id in protected_ids:
-                            continue
-                        # Skip orders we already successfully cancelled above
-                        if o_id in cancelled_ids:
-                            continue
-                        o_stop = float(
-                            o.get("stopPrice")
-                            or o.get("info", {}).get("stopPrice", 0)
-                            or 0
-                        )
-                        o_type = (o.get("type", "") or "").lower()
-                        is_exit_type = any(
-                            k in o_type for k in ("stop", "take_profit")
-                        )
-                        if not (is_exit_type and o_stop > 0):
-                            continue
-                        tol = max(
-                            abs(o_stop) * PRICE_TOLERANCE_FACTOR,
-                            MIN_PRICE_TOLERANCE,
-                        )
-                        price_matches = (
-                            (trade_sl and abs(o_stop - trade_sl) <= tol)
-                            or (trade_tp and abs(o_stop - trade_tp) <= tol)
-                        )
-                        if price_matches:
-                            try:
-                                await _cancel_adapter.cancel_order(o_id, bot.symbol)
-                                bot.logger.info(
-                                    "Zombie order cancelled (price-match) %s"
-                                    " stopPrice=%.6f for %s [style=%s]",
-                                    o_id, o_stop, bot.symbol,
-                                    trade.get("style", "?"),
-                                )
-                            except Exception as ce:
-                                bot.logger.warning(
-                                    "Zombie cancel failed %s for %s: %s",
-                                    o_id, bot.symbol, ce,
-                                )
-                except Exception as exc:
-                    bot.logger.warning(
-                        "fetch_open_orders cleanup failed for %s: %s",
-                        bot.symbol, exc,
-                    )
-
-            outcome = "WIN" if net_pnl > 0 else "LOSS"
-            bot.logger.info(
-                "CLOSE %s %s %s @ %.6f → %.6f | pnl=%.2f equity=%.2f",
-                outcome,
-                direction.upper(),
-                bot.symbol,
-                entry_price,
-                exit_price,
-                net_pnl,
-                bot.equity,
-            )
-            bot._save_state()
+        # NOTE: _record_close moved to PaperBot.__dict__ (Block 0, 2026-04-19).
+        # Call sites below use ``await bot._record_close(trade, price)`` directly.
 
         while not self._shutdown.is_set():
             try:
@@ -5218,7 +5209,7 @@ class LiveMultiBotRunner:
                                     _candles_seen, _max_candles, _trade_style, _timeout_price,
                                 )
                                 trade["_exit_reason_override"] = "timeout"
-                                await _record_close(bot, trade, _timeout_price)
+                                await bot._record_close(trade, _timeout_price)
                                 continue
                             except Exception as _to_exc:
                                 bot.logger.error("Timeout exit failed %s: %s", bot.symbol, _to_exc)
@@ -5250,7 +5241,7 @@ class LiveMultiBotRunner:
                                     _ml_exit_price, _ml_close.order_id,
                                 )
                                 trade["_exit_reason_override"] = "ml_exit"
-                                await _record_close(bot, trade, _ml_exit_price)
+                                await bot._record_close(trade, _ml_exit_price)
                                 continue
                             except Exception as _ml_exc:
                                 bot.logger.error("ML exit market close failed %s: %s", bot.symbol, _ml_exc)
@@ -5287,7 +5278,7 @@ class LiveMultiBotRunner:
                         if exit_price is not None:
                             if exit_id:
                                 bot._processed_exit_ids.add(exit_id)
-                            await _record_close(bot, trade, exit_price)
+                            await bot._record_close(trade, exit_price)
                             continue
 
                         # No exit trade found but position flat → use last known trade price or SL as fallback
@@ -5315,7 +5306,7 @@ class LiveMultiBotRunner:
                                 exit_price,
                             )
                             trade["_exit_reason_override"] = "ghost_exit"
-                            await _record_close(bot, trade, exit_price)
+                            await bot._record_close(trade, exit_price)
                             continue
 
                         remaining.append(trade)
