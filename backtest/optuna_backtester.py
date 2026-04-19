@@ -36,6 +36,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import pickle
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -57,6 +58,13 @@ from filters.zone_quality import compute_zone_quality
 from risk.circuit_breaker import CircuitBreaker
 from core.constants import ALIGNMENT_THRESHOLD, SCALP_MAX_HOLD_BARS
 from core.sizing import compute_risk_amount
+
+# Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS, BACKTEST_OPTUNA_WORKERS).
+# Signal precompute is numpy-heavy → scales with physical cores.
+# Optuna trials share one SQLite store → cap conservatively to avoid write contention.
+_CPU_COUNT = os.cpu_count() or 4
+_SIGNAL_WORKERS = int(os.environ.get("BACKTEST_SIGNAL_WORKERS", max(2, _CPU_COUNT - 2)))
+_OPTUNA_WORKERS = int(os.environ.get("BACKTEST_OPTUNA_WORKERS", max(1, _CPU_COUNT // 2)))
 
 # ── Logging ───────────────────────────────────────────────────────
 _results_dir = Path("backtest/results")
@@ -178,9 +186,8 @@ def load_price_data_for_symbols(
                 break
 
 
-# Maximum holding period for day trading (number of 5m bars)
-# Day trade = max 48 hours (2 trading days). All styles map to this.
-_MAX_BARS_DEFAULT = 576  # 48 hours × 12 bars/hour
+# Maximum holding period — Scalp-Day Hybrid: 4h on 5m (SSOT: core.constants).
+_MAX_BARS_DEFAULT = SCALP_MAX_HOLD_BARS
 
 
 def _resolve_trade_outcome(
@@ -189,7 +196,7 @@ def _resolve_trade_outcome(
     slippage_pct: float = 0.0001,
     be_ratchet_r: float = 1.5,
     timeout_rr_threshold: float = 0.5,
-    max_hold_bars: int = 576,
+    max_hold_bars: int = SCALP_MAX_HOLD_BARS,
 ) -> tuple[str, float, pd.Timestamp | None]:
     """
     Walk forward through real price bars after entry to determine outcome.
@@ -939,12 +946,12 @@ def _precompute_window_signals(
             logger.debug("Signal gen failed for %s: %s", sym, exc)
             return []
 
-    # Process in batches of 30 to limit peak memory (8GB server)
+    # Process in batches of 30 to limit peak memory (worker-count tunable).
     all_signals: list[TradeSignal] = []
     batch_size = 30
     for batch_start in range(0, len(symbols), batch_size):
         batch = symbols[batch_start:batch_start + batch_size]
-        batch_results = Parallel(n_jobs=2)(
+        batch_results = Parallel(n_jobs=_SIGNAL_WORKERS)(
             delayed(_gen_signals)(sym) for sym in batch
         )
         for sublist in batch_results:
@@ -1170,10 +1177,10 @@ def compute_param_importance(study: optuna.Study, results_dir: Path) -> pd.DataF
 # ═══════════════════════════════════════════════════════════════════
 
 def get_available_symbols(data_dir: Path) -> list[str]:
-    """Return all symbols with a 1m Parquet file in data_dir (legacy single-dir)."""
-    parquets = sorted(data_dir.glob("*_1m.parquet"))
+    """Return all symbols with a 5m Parquet file in data_dir (legacy single-dir)."""
+    parquets = sorted(data_dir.glob("*_5m.parquet"))
     symbols = [
-        p.stem.replace("_1m", "").replace("_", "/").replace("/USDT/USDT", "/USDT:USDT")
+        p.stem.replace("_5m", "").replace("_", "/").replace("/USDT/USDT", "/USDT:USDT")
         for p in parquets
     ]
     return symbols
@@ -1190,15 +1197,16 @@ def get_multi_asset_symbols(cfg: dict[str, Any]) -> dict[str, list[str]]:
     data_cfg = cfg["data"]
     result: dict[str, list[str]] = {}
 
-    # Crypto: data/crypto/ → Top 30 by 1m file size (proxy for volume/liquidity)
+    # Crypto: data/crypto/ → Top 30 by 5m file size (proxy for volume/liquidity).
+    # Post-Phase-1: 1m parquets are no longer downloaded; 5m is the entry TF.
     crypto_dir = Path(data_cfg.get("crypto_dir", "data/crypto"))
     max_crypto = cfg.get("volume_filter", {}).get("max_crypto_symbols", 30)
     if crypto_dir.exists():
-        parquets = list(crypto_dir.glob("*_1m.parquet"))
+        parquets = list(crypto_dir.glob("*_5m.parquet"))
         # Rank by file size (more data = more liquid/actively traded)
         sized = []
         for p in parquets:
-            raw = p.stem.replace("_1m", "")
+            raw = p.stem.replace("_5m", "")
             if "USDT" in raw and raw != "volume":
                 sized.append((raw, p.stat().st_size))
         sized.sort(key=lambda x: x[1], reverse=True)
@@ -1407,7 +1415,7 @@ def run(
             window_index=wi, results_dir=results_dir,
             symbol_to_asset=symbol_to_asset,
         )
-        study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+        study.optimize(objective, n_trials=n_trials, n_jobs=_OPTUNA_WORKERS, show_progress_bar=True)
 
         # ── Out-of-sample test with best params ──────────────────
         best_params = study.best_trial.params
@@ -1608,7 +1616,7 @@ def _simulate_with_params(
     rpt = params.get("risk_per_trade", None)
     be_ratchet_r = params.get("be_ratchet_r", 1.5)
     timeout_rr_threshold = params.get("timeout_rr_threshold", 0.5)
-    max_hold_bars = params.get("max_hold_bars", 576)
+    max_hold_bars = params.get("max_hold_bars", SCALP_MAX_HOLD_BARS)
     account_size = config["account"]["size"]
     max_eq = account_size * 2
 
@@ -1947,7 +1955,7 @@ def run_per_asset_class(
                 cfg, train_signals, wi, ac_results_dir,
                 symbol_to_asset, lev_min, lev_max,
             )
-            study.optimize(objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+            study.optimize(objective, n_trials=n_trials, n_jobs=_OPTUNA_WORKERS, show_progress_bar=True)
 
             best = study.best_trial.params
             best_params_per_window.append(dict(best))
@@ -2206,7 +2214,7 @@ def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]
 
     V17: Optimized grid — removed parameters with zero PF impact:
     - leverage: fixed per class (doesn't affect PF, only position sizing)
-    - max_hold_bars: fixed at 576 (no PF difference 288 vs 576)
+    - max_hold_bars: fixed at SCALP_MAX_HOLD_BARS (Scalp-Day Hybrid: 4h on 5m)
     - timeout_rr_threshold: fixed at 0.5 (no PF difference)
     - alignment 0.92 removed (produces 0% evergreen across all classes)
     - be_ratchet_r floor raised to 1.5 (1.0R too easily triggered = inflated WR)
@@ -2228,8 +2236,8 @@ def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]
             "leverage": lev,
             "risk_per_trade": risk,
             "be_ratchet_r": be_r,
-            "timeout_rr_threshold": 0.5,   # Fixed — zero PF impact
-            "max_hold_bars": 576,           # Fixed — zero PF impact
+            "timeout_rr_threshold": 0.5,              # Fixed — zero PF impact
+            "max_hold_bars": SCALP_MAX_HOLD_BARS,      # Scalp-Day Hybrid (4h on 5m)
         })
     return grid
 
