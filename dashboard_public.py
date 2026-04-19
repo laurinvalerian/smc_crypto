@@ -1630,15 +1630,10 @@ a:hover{text-decoration:underline}
   </div>
 
   <div class="grid-2">
-    <!-- Asset Class Table -->
+    <!-- Near-miss Monitor -->
     <div class="section">
-      <div class="section-title">Per Asset Class</div>
-      <div class="tbl-scroll">
-        <table class="tbl" id="class-table">
-          <thead><tr><th>Class</th><th>Trades</th><th>WR</th><th>PnL</th><th>Open</th></tr></thead>
-          <tbody id="class-body"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
-        </table>
-      </div>
+      <div class="section-title">Near-Miss Monitor</div>
+      <div class="nm-list" id="nm-list"><div class="empty">No near-misses recorded</div></div>
     </div>
 
     <!-- RL Analytics -->
@@ -1646,16 +1641,6 @@ a:hover{text-decoration:underline}
       <div class="section-title">RL Analytics</div>
       <div id="rl-content"><div class="empty">Loading...</div></div>
     </div>
-  </div>
-
-
-  <div class="grid-2">
-    <!-- Near-miss Monitor -->
-    <div class="section">
-      <div class="section-title">Near-Miss Monitor</div>
-      <div class="nm-list" id="nm-list"><div class="empty">No near-misses recorded</div></div>
-    </div>
-    <div></div>
   </div>
 
   <div class="grid-2">
@@ -1875,36 +1860,6 @@ function updateDailyPnl(data){
   }
 }
 
-// ── Per-Class Table ──────────────────────────────────────────────
-
-function updatePerClass(d){
-  var body = $('class-body');
-  var classes = ['crypto'];
-  var html = '';
-  var anyData = false;
-  for(var i=0; i<classes.length; i++){
-    var ac = classes[i];
-    var info = d[ac];
-    if(!info) info = {trades:0, wins:0, pnl:0, win_rate:0, active:0};
-    if(info.trades > 0) anyData = true;
-    html += '<tr><td style="text-transform:capitalize;font-weight:600">'+ac+'</td>';
-    html += '<td>'+info.trades+'</td>';
-    html += '<td>'+fmt(info.win_rate,1)+'%</td>';
-    html += '<td class="'+pnlColor(info.pnl)+'">'+fmt(info.pnl,4)+'</td>';
-    html += '<td>'+( info.active||0)+'</td></tr>';
-  }
-  // Include unknown class if present
-  for(var k in d){
-    if(classes.indexOf(k) === -1 && d[k].trades > 0){
-      var u = d[k];
-      html += '<tr><td>'+escHtml(k)+'</td><td>'+u.trades+'</td><td>'+fmt(u.win_rate,1)+'%</td>';
-      html += '<td class="'+pnlColor(u.pnl)+'">'+fmt(u.pnl,4)+'</td><td>'+(u.active||0)+'</td></tr>';
-    }
-  }
-  if(!anyData && !html) html = '<tr><td colspan="5" class="empty">No data yet</td></tr>';
-  body.innerHTML = html;
-}
-
 // ── RL Analytics ─────────────────────────────────────────────────
 
 function updateRL(d){
@@ -2119,7 +2074,6 @@ function loadAll(){
   fetchJ('/api/public/overview', updateOverview);
   fetchJ('/api/public/equity', updateEquity);
   fetchJ('/api/public/daily-pnl', updateDailyPnl);
-  fetchJ('/api/public/per-class', updatePerClass);
   fetchJ('/api/public/period-stats', updatePeriodStats);
   fetchJ('/api/public/rl-stats', updateRL);
   fetchJ('/api/public/near-misses', updateNearMisses);
@@ -2136,7 +2090,6 @@ setInterval(function(){ fetchJ('/api/public/status', updateStatus); }, 10000);
 setInterval(function(){ fetchJ('/api/public/overview', updateOverview); }, 30000);
 setInterval(function(){ fetchJ('/api/public/equity', updateEquity); }, 60000);
 setInterval(function(){ fetchJ('/api/public/daily-pnl', updateDailyPnl); }, 60000);
-setInterval(function(){ fetchJ('/api/public/per-class', updatePerClass); }, 30000);
 setInterval(function(){ fetchJ('/api/public/period-stats', updatePeriodStats); }, 30000);
 setInterval(function(){ fetchJ('/api/public/rl-stats', updateRL); }, 60000);
 setInterval(function(){ fetchJ('/api/public/near-misses', updateNearMisses); }, 30000);
