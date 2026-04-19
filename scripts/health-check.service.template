@@ -1,0 +1,34 @@
+# systemd service — daily automated health-check for the trading bot stack.
+#
+# Install (as root):
+#   sudo cp scripts/health-check.service.template /etc/systemd/system/health-check.service
+#   sudo cp scripts/health-check.timer.template   /etc/systemd/system/health-check.timer
+#   Replace __REPO_ROOT__ with /root/bot.
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now health-check.timer
+#
+# Runs 09:05 UTC daily (right after drift-monitor at 09:00). If any check
+# fails (rc=2) systemd fires OnFailure=telegram-alert.service (if configured).
+
+[Unit]
+Description=Bongus daily stack health-check (services, heartbeat, journal, disk, drift)
+After=network.target drift-monitor.service
+Wants=drift-monitor.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/bin/bash __REPO_ROOT__/scripts/health_check.sh
+
+ProtectSystem=strict
+ReadWritePaths=__REPO_ROOT__/logs
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Fire Telegram alert (or generic alert unit) on any failure.
+# OnFailure only wires if the alert unit exists; otherwise harmless no-op.
+OnFailure=telegram-alert.service
+
+[Install]
+WantedBy=multi-user.target

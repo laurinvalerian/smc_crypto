@@ -1,0 +1,14 @@
+# systemd timer — daily 09:05 UTC health-check (5 min after drift-monitor).
+
+[Unit]
+Description=Run daily stack health-check for the trading bot
+Requires=health-check.service
+
+[Timer]
+OnCalendar=*-*-* 09:05:00 UTC
+RandomizedDelaySec=120
+Persistent=true
+Unit=health-check.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+# systemd timer — fires journal-backup.service every day at 04:00 UTC.
+#
+# 04:00 UTC is a quiet time for most crypto books (no major futures-settlement
+# cluster), which minimises any chance of colliding with high WS write rates.
+
+[Unit]
+Description=Run journal-backup daily during paper + funded phases
+Requires=journal-backup.service
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+Unit=journal-backup.service
+
+[Install]
+WantedBy=timers.target

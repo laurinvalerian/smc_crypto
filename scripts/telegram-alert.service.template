@@ -1,0 +1,37 @@
+# systemd service — fires a Telegram notification. Triggered by OnFailure=
+# hooks from drift-monitor.service and health-check.service.
+#
+# Install (as root):
+#   sudo cp scripts/telegram-alert.service.template /etc/systemd/system/telegram-alert.service
+#   Replace __REPO_ROOT__ with /root/bot.
+#   sudo systemctl daemon-reload
+#
+# Enable alerting: edit /root/bot/.env and add:
+#   TELEGRAM_BOT_TOKEN=...
+#   TELEGRAM_CHAT_ID=...
+# No bot restart needed (alert script re-reads .env on each fire).
+#
+# Test:
+#   sudo systemctl start telegram-alert.service
+#   journalctl -u telegram-alert.service -n 20
+
+[Unit]
+Description=Bongus generic Telegram alert notifier (fired by OnFailure hooks)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+# The trigger unit name and its Result/ExecMainStatus are passed via %i placeholder;
+# the alert script formats them into the message body.
+ExecStart=/bin/bash -c '/bin/bash __REPO_ROOT__/scripts/telegram_alert.sh "Bot alert" "$(systemctl --no-pager status drift-monitor.service health-check.service trading-bot.service 2>&1 | head -40)"'
+
+ProtectSystem=strict
+ReadWritePaths=__REPO_ROOT__/logs
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

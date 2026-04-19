@@ -1,0 +1,36 @@
+# systemd service — nightly WAL-safe sqlite backup of the trade journal.
+#
+# Install (as root):
+#   sudo cp scripts/journal-backup.service.template /etc/systemd/system/journal-backup.service
+#   sudo cp scripts/journal-backup.timer.template   /etc/systemd/system/journal-backup.timer
+#   Replace __REPO_ROOT__ with /root/bot (or wherever).
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now journal-backup.timer
+#
+# Manual fire: sudo systemctl start journal-backup.service
+# Status:      systemctl status journal-backup.service
+# Tail log:    tail -f __REPO_ROOT__/logs/backup_journal.log
+
+[Unit]
+Description=Bongus trade-journal nightly backup (sqlite online .backup, gzipped, 30d retention)
+After=network.target
+# Don't race with the live bot during heavy WS bursts — run when bot is idle.
+Conflicts=
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/bin/bash __REPO_ROOT__/scripts/backup_journal.sh
+
+# Filesystem hardening — read-only except the two paths we need.
+ProtectSystem=strict
+ReadWritePaths=__REPO_ROOT__/archive __REPO_ROOT__/logs
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Alert via OnFailure if the backup step dies (add your alert unit here).
+# OnFailure=telegram-alert@%i.service
+
+[Install]
+WantedBy=multi-user.target
