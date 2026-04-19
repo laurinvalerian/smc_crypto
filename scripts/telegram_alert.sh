@@ -46,13 +46,15 @@ SUBJECT="${1:-Bongus alert}"
 BODY="${2:-(no body)}"
 HOST="$(hostname)"
 
-# Telegram max is 4096 chars; trim defensively.
-MESSAGE="$(printf '🚨 *%s*\n`%s`\n\n%s' "${SUBJECT}" "${HOST}" "${BODY}" | head -c 3900)"
+# Plain text — no parse_mode. The BODY often contains arbitrary systemctl
+# status output with unbalanced *, _, ` that break Markdown parsing and
+# trigger HTTP 400. UTF-8 emoji in plain text is fine.
+# Telegram hard cap is 4096 chars; trim defensively.
+MESSAGE="$(printf '🚨 %s\n[%s]\n\n%s' "${SUBJECT}" "${HOST}" "${BODY}" | head -c 3900)"
 
 RESPONSE="$(curl -fsS -m 10 -X POST \
   "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
   -d chat_id="${TELEGRAM_CHAT_ID}" \
-  -d parse_mode="Markdown" \
   --data-urlencode text="${MESSAGE}" 2>&1)" || {
     log "alert failed: ${RESPONSE}"
     exit 1
