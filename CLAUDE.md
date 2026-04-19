@@ -29,7 +29,8 @@ Crypto-Only Trading Bot basierend auf Smart Money Concepts (SMC/ICT) auf Binance
 | `train_student.py` | Training-Skript für Student-Brain |
 | `paper_grid.py` | Multi-Variant A/B Testing (Crypto-Varianten) |
 | `filters/` | SMC Quality Filter-Module (trend_strength, volume_liquidity, session_filter, zone_quality) |
-| `core/sizing.py` | Confidence-based Risk-Sizing SSOT (linear 0.5%→1.5% zwischen threshold und 1.0) |
+| `core/sizing.py` | Confidence-based Risk-Sizing SSOT (linear 0.25%→1.0% zwischen threshold und 1.0) |
+| `core/metrics.py` | Daily Sharpe + Deflated Sharpe Ratio (Bailey & Lopez de Prado) — Phase-B Quality-Upgrade (2026-04-19) |
 | `exchanges/` | Binance USDT-M Futures Adapter (CCXT) |
 | `risk/` | Circuit Breakers (Daily/Weekly/All-Time Loss, Heat) |
 | `config/default_config.yaml` | Alle Parameter (Crypto-Only) |
@@ -169,7 +170,8 @@ bongus_rival/                      # Repo-Root
 ├── core/
 │   ├── constants.py               # COMMISSION, SLIPPAGE, ALIGNMENT_THRESHOLD, SCALP_MAX_HOLD_BARS SSOT
 │   ├── alignment.py               # compute_alignment_score + CORE_WEIGHTS_CRYPTO (Phase 2.1 SSOT)
-│   └── sizing.py                  # compute_risk_fraction/amount (Scalp-Day Hybrid SSOT, 2026-04-19)
+│   ├── sizing.py                  # compute_risk_fraction/amount (Scalp-Day Hybrid SSOT, 2026-04-19)
+│   └── metrics.py                 # daily Sharpe + Deflated Sharpe Ratio (Phase-B quality-upgrade, 2026-04-19)
 ├── strategies/
 │   └── smc_multi_style.py         # SMC/ICT Strategie (kausale Indikatoren V16)
 ├── filters/                       # SMC Quality Filter-Module
