@@ -135,7 +135,7 @@ def build_dashboard(
 
     eq_color = _pnl_color(total_pnl)
     header_text = Text.from_markup(
-        f"[bold cyan]📊 SMC MULTI-ASSET LIVE TRADING DASHBOARD[/bold cyan]\n"
+        f"[bold cyan]📊 SMC CRYPTO-ONLY LIVE TRADING DASHBOARD[/bold cyan]\n"
         f"[dim]{now_str}[/dim]  ·  Uptime: [bold]{uptime}[/bold]  ·  "
         f"Bots: [bold]{len(bots)}[/bold] ({class_str})\n"
         f"Total Equity: [bold]{total_equity:,.2f}[/bold]  ·  "

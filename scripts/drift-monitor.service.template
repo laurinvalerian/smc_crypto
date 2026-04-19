@@ -1,0 +1,38 @@
+# systemd service unit — drift_monitor standalone runner.
+#
+# Install (as root on the server):
+#   1. Copy this + drift-monitor.timer.template to /etc/systemd/system/
+#      sudo cp scripts/drift-monitor.service.template /etc/systemd/system/drift-monitor.service
+#      sudo cp scripts/drift-monitor.timer.template   /etc/systemd/system/drift-monitor.timer
+#   2. Replace __REPO_ROOT__ with the absolute repo path (e.g. /root/bot).
+#   3. Replace __PYTHON_BIN__ with the python3 absolute path.
+#   4. sudo systemctl daemon-reload
+#   5. sudo systemctl enable --now drift-monitor.timer
+#   6. sudo systemctl list-timers | grep drift   # verify next run
+#   7. journalctl -u drift-monitor.service -f     # tail output
+#
+# Alerting: the cron wrapper exits rc=2 on MAJOR drift. Hook that via:
+#   OnFailure=send-telegram-alert@%i.service
+# (not committed — add per-environment).
+
+[Unit]
+Description=Bongus drift monitor (daily KS/PSI feature-distribution check)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+Environment=PYTHON_BIN=__PYTHON_BIN__
+ExecStart=/bin/bash __REPO_ROOT__/scripts/drift_monitor_cron.sh
+
+# Lock down the runner — read-only filesystem access with specific
+# writable paths only, matching the script's actual outputs.
+ProtectSystem=strict
+ReadWritePaths=__REPO_ROOT__/logs __REPO_ROOT__/data
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# systemd timer — triggers drift-monitor.service once a day at 09:00 UTC.
+#
+# See drift-monitor.service.template for install instructions.
+#
+# Schedule:
+#   OnCalendar=*-*-* 09:00:00 UTC     → daily 09:00 UTC
+# Randomised delay 0–300s so multiple hosts don't hammer the same moment.
+
+[Unit]
+Description=Run drift-monitor daily during pre-funded paper phase
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=drift-monitor.service
+
+[Install]
+WantedBy=timers.target

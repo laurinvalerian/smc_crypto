@@ -35,7 +35,7 @@ from strategies.smc_multi_style import (
     SMCMultiStyleStrategy,
     TradeSignal,
 )
-from backtest.optuna_backtester import (
+from backtest.wf_bruteforce import (
     load_config,
     generate_wf_windows,
     simulate_trades,

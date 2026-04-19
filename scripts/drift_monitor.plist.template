@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent: runs drift_monitor_cron.sh once a day at 09:00 local
+  time during the pre-funded paper phase.
+
+  Install:
+    1. Copy this file to ~/Library/LaunchAgents/com.bongus.drift-monitor.plist
+    2. Replace __REPO_ROOT__ with an absolute path (e.g. /Users/whoami/Documents/trading_bots/bongus_rival)
+    3. Replace __PYTHON_BIN__ with the python3 absolute path (e.g. /Library/Frameworks/Python.framework/Versions/3.13/bin/python3)
+    4. launchctl load -w ~/Library/LaunchAgents/com.bongus.drift-monitor.plist
+
+  Verify:
+    launchctl list | grep drift-monitor
+    tail -f __REPO_ROOT__/logs/drift_monitor_cron.log
+
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/com.bongus.drift-monitor.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bongus.drift-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/scripts/drift_monitor_cron.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHON_BIN</key>
+        <string>__PYTHON_BIN__</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/drift_monitor_cron.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/drift_monitor_cron.err</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

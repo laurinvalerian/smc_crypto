@@ -2,7 +2,7 @@
 
 Phase B of .omc/plans/quality-upgrade-plan.md.
 
-Replaces the inflated trade-PnL Sharpe in `backtest/optuna_backtester.compute_metrics`
+Replaces the inflated trade-PnL Sharpe in `backtest/wf_bruteforce.compute_metrics`
 (which used sqrt(252) on per-trade PnL — wrong for 5m-entry/4h-hold regime).
 
 All functions pure, deterministic, test-covered. No side-effects.

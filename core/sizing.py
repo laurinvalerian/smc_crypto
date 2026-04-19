@@ -2,8 +2,8 @@
 core.sizing — Confidence-based risk sizing as Single Source of Truth.
 
 Replaces the tier-based AAA++/AAA+ risk dispatch that previously lived in
-backtest/optuna_backtester.py::compute_dynamic_risk and the
-aaa_plus_plus.tiers config block.
+backtest/wf_bruteforce.py::compute_dynamic_risk (Optuna backtester, now
+retired) and the aaa_plus_plus.tiers config block.
 
 Model:
   risk_fraction(score) scales LINEARLY between DEFAULT_RISK_PER_TRADE

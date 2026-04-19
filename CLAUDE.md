@@ -86,9 +86,9 @@ Details: siehe `@agents/exchange-adapter.md`
 # Live/Paper Trading
 python3 live_multi_bot.py [--config config/default_config.yaml]
 
-# Backtesting
-python3 -m backtest.optuna_backtester                         # Walk-Forward Optuna
-python3 -m backtest.optuna_backtester --generate-paper-grid   # Crypto-Varianten
+# Backtesting (walk-forward bruteforce + full gate stack — renamed 2026-04-19, replaces optuna_backtester)
+python3 -m backtest.wf_bruteforce                             # Walk-Forward Bruteforce + CPCV/PBO/MC/Region/CostStress
+python3 -m backtest.wf_bruteforce --generate-paper-grid       # Crypto-Varianten
 
 # Daten herunterladen
 python3 -m utils.data_downloader --workers 3                  # Crypto (Binance)
@@ -193,7 +193,12 @@ bongus_rival/                      # Repo-Root
 │   ├── default_config.yaml        # Crypto-Only Parameter
 │   └── instrument_clusters.json   # Crypto-Cluster
 ├── backtest/
-│   ├── optuna_backtester.py       # Walk-Forward Optimizer
+│   ├── wf_bruteforce.py           # Walk-Forward Bruteforce + Quant-Math Gate Stack (renamed 2026-04-19 from optuna_backtester.py; Optuna path killed)
+│   ├── cpcv.py                    # Phase D: Combinatorial Purged CV (Lopez de Prado 2018 Ch. 7)
+│   ├── pbo.py                     # Phase E: Probability of Backtest Overfitting (Bailey-Borwein-LdP-Zhu 2014)
+│   ├── monte_carlo.py             # Phase G: CVaR-95% DD (Rockafellar-Uryasev 2000)
+│   ├── region_heatmap.py          # Phase G: DSR + Sharpe-rel-spread plateau gate (saturation-fix v1.11)
+│   ├── cost_stress.py             # Phase H: transaction-cost shock gate (v1.11)
 │   └── generate_rl_data.py        # Training-Data Pipeline (Bug_007 fixed)
 ├── utils/
 │   ├── data_downloader.py         # Crypto OHLCV (CCXT/Binance)

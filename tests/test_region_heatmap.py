@@ -25,6 +25,7 @@ import pandas as pd
 
 from backtest.region_heatmap import (
     build_region_grid,
+    build_region_grid_sharpe,
     plot_region_heatmap,
     region_summary,
 )
@@ -242,3 +243,213 @@ class TestPlot:
         out = tmp_path / "heatmap_empty.png"
         plot_region_heatmap(pd.DataFrame(), output_path=out, title="Empty")
         assert out.exists()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  build_region_grid_sharpe — v1.11 saturation-fix companion
+# ═══════════════════════════════════════════════════════════════════
+
+class TestBuildRegionGridSharpe:
+    def test_pivot_shape_matches_dsr_pivot(self):
+        df = _make_grid_df()
+        dsr_pivot = build_region_grid(
+            df, trial_sharpes=_trial_sharpes_from(df), observation_count=60,
+        )
+        sharpe_pivot = build_region_grid_sharpe(df)
+        assert sharpe_pivot.shape == dsr_pivot.shape
+        assert list(sharpe_pivot.index) == list(dsr_pivot.index)
+        assert list(sharpe_pivot.columns) == list(dsr_pivot.columns)
+
+    def test_empty_grid_returns_empty(self):
+        assert build_region_grid_sharpe(pd.DataFrame()).empty
+
+    def test_no_window_sharpe_cols_returns_empty(self):
+        df = pd.DataFrame(
+            {"alignment_threshold": [0.70, 0.80], "risk_reward": [1.5, 2.0]},
+        )
+        assert build_region_grid_sharpe(df).empty
+
+    def test_peak_cell_sharpe_gt_corner_sharpe(self):
+        df = _make_grid_df(seed=1)
+        pivot = build_region_grid_sharpe(df)
+        assert pivot.loc[2.0, 0.80] > pivot.loc[1.5, 0.70]
+        assert pivot.loc[2.0, 0.80] > pivot.loc[3.0, 0.90]
+
+    def test_sharpe_not_clipped_to_unit_interval(self):
+        """Sharpe can exceed 1.0 — that's the whole point (DSR cannot)."""
+        df = _make_grid_df(peak_sharpe=5.0, noise=0.05)
+        pivot = build_region_grid_sharpe(df)
+        values = pivot.values[~np.isnan(pivot.values)]
+        # peak ≈ 5.0 → allow cells above 1.0
+        assert values.max() > 1.0
+
+    def test_filter_mask_applied(self):
+        df = _make_grid_df()
+        mask = df["risk_reward"] >= 2.0
+        pivot = build_region_grid_sharpe(df, filter_mask=mask)
+        assert 1.5 not in pivot.index
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  region_summary — saturation-fix secondary Sharpe gate (v1.11)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestRegionSummarySaturationFix:
+    def test_backward_compat_without_sharpe_pivot(self):
+        """Without sharpe_region_df, behaviour matches the v1.10 single gate."""
+        pivot = pd.DataFrame(
+            np.full((4, 5), 0.90),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        s = region_summary(pivot, top_pct=0.10, gate_threshold=0.10)
+        assert s["sharpe_gate_enabled"] is False
+        assert s["dsr_gate_pass"] is True
+        assert s["gate_pass"] is True
+
+    def test_dsr_saturation_caught_by_sharpe_ridge(self):
+        """DSR all 1.0 (saturated) → DSR-spread=0 PASS.
+        But Sharpe landscape has a ridge → Sharpe-rel-spread high → combined FAIL.
+        This is exactly the v1.10 failure mode the fix addresses.
+        """
+        dsr_pivot = pd.DataFrame(
+            np.full((4, 5), 1.0),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        # Ridge: one cell Sharpe=3.0, rest Sharpe=1.0 → rel_spread ≫ 0.15
+        sharpe_vals = np.full((4, 5), 1.0)
+        sharpe_vals[1, 2] = 3.0  # rr=2.0, align=0.80
+        sharpe_pivot = pd.DataFrame(
+            sharpe_vals,
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        s = region_summary(
+            dsr_pivot, top_pct=0.50,  # top 50% to include the ridge cell
+            gate_threshold=0.10, sharpe_region_df=sharpe_pivot,
+            sharpe_rel_gate=0.15,
+        )
+        assert s["dsr_gate_pass"] is True
+        assert s["sharpe_gate_pass"] is False
+        assert s["gate_pass"] is False  # combined AND → FAIL
+
+    def test_plateau_both_gates_pass(self):
+        """DSR flat PLUS Sharpe flat → both gates PASS → combined PASS."""
+        dsr_pivot = pd.DataFrame(
+            np.full((4, 5), 0.90),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        sharpe_pivot = pd.DataFrame(
+            np.full((4, 5), 2.0),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        s = region_summary(
+            dsr_pivot, top_pct=0.10, gate_threshold=0.10,
+            sharpe_region_df=sharpe_pivot, sharpe_rel_gate=0.15,
+        )
+        assert s["dsr_gate_pass"] is True
+        assert s["sharpe_gate_pass"] is True
+        assert s["gate_pass"] is True
+        assert s["sharpe_rel_spread_q90_q10"] < 0.15
+
+    def test_dsr_failing_but_sharpe_flat_still_fail(self):
+        """DSR spread > threshold must FAIL regardless of Sharpe."""
+        rng = np.random.default_rng(0)
+        dsr_pivot = pd.DataFrame(
+            rng.uniform(0.0, 1.0, size=(4, 5)),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        sharpe_pivot = pd.DataFrame(
+            np.full((4, 5), 2.0),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        s = region_summary(
+            dsr_pivot, top_pct=0.50, gate_threshold=0.10,
+            sharpe_region_df=sharpe_pivot, sharpe_rel_gate=0.15,
+        )
+        # With uniform DSR on 20 cells and top 50% → spread ≈ 0.3+ → FAIL
+        assert s["dsr_gate_pass"] is False
+        assert s["gate_pass"] is False
+
+    def test_shape_mismatch_conservative_fail(self):
+        """If Sharpe pivot shape doesn't match DSR pivot, fail closed."""
+        dsr_pivot = pd.DataFrame(
+            np.full((4, 5), 1.0),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        sharpe_pivot = pd.DataFrame(
+            np.full((2, 2), 2.0),  # wrong shape
+            index=[1.5, 2.0],
+            columns=[0.70, 0.75],
+        )
+        s = region_summary(
+            dsr_pivot, top_pct=0.10, gate_threshold=0.10,
+            sharpe_region_df=sharpe_pivot, sharpe_rel_gate=0.15,
+        )
+        assert s["dsr_gate_pass"] is True
+        assert s["sharpe_gate_pass"] is False  # shape mismatch → closed
+        assert s["gate_pass"] is False
+
+    def test_sharpe_rel_spread_scale_invariant(self):
+        """Same *relative* spread at scale 1.0 and scale 10.0 → same rel_spread."""
+        dsr_pivot = pd.DataFrame(
+            np.full((4, 5), 1.0),
+            index=[1.5, 2.0, 2.5, 3.0],
+            columns=[0.70, 0.75, 0.80, 0.85, 0.90],
+        )
+        sharpe_small = np.full((4, 5), 1.0)
+        sharpe_small[1, 2] = 1.5
+        sharpe_big = sharpe_small * 10.0
+
+        s_small = region_summary(
+            dsr_pivot, top_pct=0.50, gate_threshold=0.10,
+            sharpe_region_df=pd.DataFrame(
+                sharpe_small, index=dsr_pivot.index, columns=dsr_pivot.columns,
+            ),
+            sharpe_rel_gate=0.50,
+        )
+        s_big = region_summary(
+            dsr_pivot, top_pct=0.50, gate_threshold=0.10,
+            sharpe_region_df=pd.DataFrame(
+                sharpe_big, index=dsr_pivot.index, columns=dsr_pivot.columns,
+            ),
+            sharpe_rel_gate=0.50,
+        )
+        assert abs(
+            s_small["sharpe_rel_spread_q90_q10"]
+            - s_big["sharpe_rel_spread_q90_q10"]
+        ) < 1e-9
+
+    def test_summary_output_keys_include_sharpe_fields(self):
+        dsr_pivot = pd.DataFrame([[0.9, 0.8]], index=[1.5], columns=[0.70, 0.75])
+        sharpe_pivot = pd.DataFrame([[2.0, 2.1]], index=[1.5], columns=[0.70, 0.75])
+        s = region_summary(
+            dsr_pivot, top_pct=0.50, gate_threshold=0.10,
+            sharpe_region_df=sharpe_pivot, sharpe_rel_gate=0.15,
+        )
+        expected = {
+            "sharpe_gate_enabled", "sharpe_rel_gate",
+            "sharpe_top_cells_median", "sharpe_top_cells_q10",
+            "sharpe_top_cells_q90", "sharpe_spread_q90_q10",
+            "sharpe_rel_spread_q90_q10", "sharpe_gate_pass",
+            "dsr_gate_pass",
+        }
+        assert expected.issubset(s.keys())
+
+    def test_json_roundtrip_with_sharpe_gate(self):
+        dsr_pivot = pd.DataFrame([[0.9, 0.8]], index=[1.5], columns=[0.70, 0.75])
+        sharpe_pivot = pd.DataFrame([[2.0, 2.1]], index=[1.5], columns=[0.70, 0.75])
+        s = region_summary(
+            dsr_pivot, top_pct=0.50, gate_threshold=0.10,
+            sharpe_region_df=sharpe_pivot, sharpe_rel_gate=0.15,
+        )
+        back = json.loads(json.dumps(s))
+        assert back["gate_pass"] == s["gate_pass"]
+        assert back["sharpe_gate_pass"] == s["sharpe_gate_pass"]
+        assert back["sharpe_rel_spread_q90_q10"] == s["sharpe_rel_spread_q90_q10"]

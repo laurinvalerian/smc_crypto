@@ -1,6 +1,7 @@
 """Parameter-landscape heatmap + top-region spread gate.
 
-Phase G of `.omc/plans/quality-upgrade-plan.md`.
+Phase G of `.omc/plans/quality-upgrade-plan.md` (v1.10), extended in
+v1.11 with a non-saturating Sharpe companion metric.
 
 Motivation
 ----------
@@ -8,16 +9,34 @@ PBO (Phase E) quantifies *selection* bias: how often the IS-best
 strategy loses OOS. A PBO ≈ 0 run can still pick a point that sits on
 a narrow ridge of the parameter landscape — small perturbations
 collapse the metric. Region-Heatmap closes that hole: it aggregates the
-full grid onto a 2-D ``(alignment_threshold × risk_reward)`` pivot of
-median DSR and measures the *spread* of the top-10% cells.
+full grid onto a 2-D ``(alignment_threshold × risk_reward)`` pivot and
+measures the *spread* of the top-``top_pct`` cells.
 
-  spread_q90_q10 on top-10% cells < 0.10  ⇒  plateau, deploy-safe.
-  spread_q90_q10 on top-10% cells ≥ 0.10  ⇒  ridge/cliff, reject.
+Saturation fix (v1.11)
+----------------------
+When the qualifying strategies are strong (mean Sharpe ≫ 0) the DSR
+null-hypothesis CDF saturates — many cells collapse to ``DSR ≈ 1.0`` and
+``spread_q90_q10`` reads exactly 0.000. The gate is technically PASS but
+uninformative because DSR has no headroom left to differentiate plateau
+from cliff.
 
-The DSR per grid row is computed from the row's mean window-Sharpe
-against the full trial-Sharpe null distribution — identical to the
-Phase-D CPCV / Phase-E PBO setup so the three gates share a common
-statistic (DSR ∈ [0, 1]).
+To keep the gate informative in that regime we additionally measure the
+*median window-Sharpe* per cell. Sharpe does not saturate at 1.0, so a
+ridge/cliff still opens a visible spread. The combined gate requires
+**BOTH**:
+
+  - ``dsr_spread_q90_q10 < dsr_gate``                  (default 0.10)
+  - ``sharpe_rel_spread_q90_q10 < sharpe_rel_gate``    (default 0.15)
+
+where ``sharpe_rel_spread = (q90 − q10) / |median(top_cells)|`` so the
+Sharpe gate is scale-invariant in absolute Sharpe magnitude.
+
+Interpretation
+--------------
+- Both gates PASS → plateau, deploy-safe.
+- DSR PASS but Sharpe rel-spread FAIL → DSR saturated, but the Sharpe
+  landscape shows a ridge/cliff. Reject.
+- DSR FAIL → ridge selection bias exists independent of saturation.
 
 Reference (DSR formula used per cell)
 -------------------------------------
@@ -132,6 +151,56 @@ def build_region_grid(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  build_region_grid_sharpe
+# ═══════════════════════════════════════════════════════════════════
+
+def build_region_grid_sharpe(
+    grid_df: pd.DataFrame,
+    window_sharpe_cols: list[str] | None = None,
+    param_x: str = "alignment_threshold",
+    param_y: str = "risk_reward",
+    filter_mask: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Return a ``(param_y × param_x)`` pivot of *median window-Sharpe* per cell.
+
+    Companion to ``build_region_grid``: DSR saturates at 1.0 on strong
+    grids which zeroes the DSR-spread gate. The median window-Sharpe
+    does not saturate and provides a second, independent view of the
+    parameter landscape's smoothness.
+
+    Per grid row we compute the mean window-Sharpe, then aggregate per
+    cell with ``median``.
+    """
+    if grid_df.empty:
+        return pd.DataFrame()
+
+    df = grid_df
+    if filter_mask is not None:
+        df = df[filter_mask].reset_index(drop=True)
+        if df.empty:
+            return pd.DataFrame()
+
+    if window_sharpe_cols is None:
+        window_sharpe_cols = [
+            c for c in df.columns
+            if c.startswith("w") and c.endswith("_sharpe")
+        ]
+    if not window_sharpe_cols:
+        return pd.DataFrame()
+
+    if param_x not in df.columns or param_y not in df.columns:
+        return pd.DataFrame()
+
+    mean_sharpes = df[window_sharpe_cols].mean(axis=1).to_numpy(dtype=float)
+    out = df[[param_x, param_y]].copy()
+    out["sharpe"] = mean_sharpes
+    pivot = out.pivot_table(
+        index=param_y, columns=param_x, values="sharpe", aggfunc="median",
+    )
+    return pivot
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  region_summary
 # ═══════════════════════════════════════════════════════════════════
 
@@ -139,17 +208,32 @@ def region_summary(
     region_df: pd.DataFrame,
     top_pct: float = 0.10,
     gate_threshold: float = 0.10,
+    sharpe_region_df: pd.DataFrame | None = None,
+    sharpe_rel_gate: float = 0.15,
 ) -> dict[str, Any]:
     """Summarise a region pivot into a JSON-safe dict with a gate_pass flag.
 
-    Gate: ``spread_q90_q10 < gate_threshold`` over the top ``top_pct``
-    cells, where ``spread_q90_q10`` is the inter-decile spread of the
-    top cells' DSRs. Using inter-decile (not max-min) keeps the gate
-    robust to a single outlier cell.
+    Primary gate (DSR): ``spread_q90_q10 < gate_threshold`` over the top
+    ``top_pct`` cells, where ``spread_q90_q10`` is the inter-decile
+    spread of the top cells' DSRs. Using inter-decile (not max-min)
+    keeps the gate robust to a single outlier cell.
+
+    Secondary gate (Sharpe, v1.11 saturation-fix): when
+    ``sharpe_region_df`` is supplied, additionally compute the *relative*
+    inter-decile spread of the top cells' median window-Sharpes,
+    ``sharpe_rel_spread = (q90 − q10) / max(|median(top)|, ε)``, and
+    require ``sharpe_rel_spread < sharpe_rel_gate``. Combined
+    ``gate_pass`` is the AND of both gates.
+
+    Sharpe does not saturate the way DSR does at 1.0, so on a strong
+    grid where DSR-spread trivially passes, the Sharpe gate still
+    distinguishes a plateau from a ridge.
 
     Empty or all-NaN regions are a conservative FAIL — no evidence
     cannot bless a deploy.
     """
+    _SHARPE_EPS = 1e-6
+
     n_total = int(region_df.size)
     default: dict[str, Any] = {
         "n_cells_total": n_total,
@@ -164,6 +248,16 @@ def region_summary(
         "top_pct": float(top_pct),
         "gate_threshold": float(gate_threshold),
         "gate_pass": False,
+        # Secondary (Sharpe) gate fields — filled in if sharpe_region_df supplied.
+        "sharpe_gate_enabled": sharpe_region_df is not None,
+        "sharpe_rel_gate": float(sharpe_rel_gate),
+        "sharpe_top_cells_median": 0.0,
+        "sharpe_top_cells_q10": 0.0,
+        "sharpe_top_cells_q90": 0.0,
+        "sharpe_spread_q90_q10": 0.0,
+        "sharpe_rel_spread_q90_q10": 0.0,
+        "sharpe_gate_pass": False,
+        "dsr_gate_pass": False,
     }
     if region_df.empty:
         return default
@@ -175,11 +269,55 @@ def region_summary(
         return default
 
     n_top = max(1, int(np.ceil(top_pct * valid.size)))
-    top_values = np.sort(valid)[::-1][:n_top]  # descending, take top-K
+
+    # Sort cells by DSR descending; remember the indices of the top-K cells
+    # so the Sharpe gate evaluates the *same* set of cells.
+    order = np.argsort(valid)[::-1]
+    top_idx = order[:n_top]
+    top_values = valid[top_idx]
 
     q10 = float(np.quantile(top_values, 0.10))
     q90 = float(np.quantile(top_values, 0.90))
     spread_q = q90 - q10
+    dsr_gate_pass = bool(spread_q < gate_threshold)
+
+    # Sharpe secondary gate — evaluate the DSR-top cells on the Sharpe pivot
+    # so we measure spread of *the actual deploy candidates*, not of a
+    # different top-set.
+    sharpe_gate_enabled = sharpe_region_df is not None
+    sharpe_top_median = 0.0
+    sharpe_top_q10 = 0.0
+    sharpe_top_q90 = 0.0
+    sharpe_spread = 0.0
+    sharpe_rel_spread = 0.0
+    sharpe_gate_pass = True  # if gate disabled, don't block combined pass
+
+    if sharpe_gate_enabled:
+        sh_values = sharpe_region_df.to_numpy(dtype=float).flatten()
+        # Align on the same flat index as `values` — the pivot columns/index
+        # must match for the indexing to be meaningful; we defensively
+        # require identical shape and fall back to invalid if not.
+        if sh_values.size == values.size:
+            # Only consider Sharpe cells that were both a) valid DSR cells
+            # and b) in the DSR top-K; drop any NaN Sharpe among those.
+            sh_valid_in_top = sh_values[mask][top_idx]
+            sh_non_nan = sh_valid_in_top[~np.isnan(sh_valid_in_top)]
+            if sh_non_nan.size >= 2:
+                sharpe_top_median = float(np.median(sh_non_nan))
+                sharpe_top_q10 = float(np.quantile(sh_non_nan, 0.10))
+                sharpe_top_q90 = float(np.quantile(sh_non_nan, 0.90))
+                sharpe_spread = sharpe_top_q90 - sharpe_top_q10
+                denom = max(abs(sharpe_top_median), _SHARPE_EPS)
+                sharpe_rel_spread = sharpe_spread / denom
+                sharpe_gate_pass = bool(sharpe_rel_spread < sharpe_rel_gate)
+            else:
+                # Degenerate Sharpe sample — conservative FAIL.
+                sharpe_gate_pass = False
+        else:
+            # Shape mismatch — conservative FAIL.
+            sharpe_gate_pass = False
+
+    combined_pass = dsr_gate_pass and sharpe_gate_pass
 
     return {
         "n_cells_total": n_total,
@@ -193,7 +331,16 @@ def region_summary(
         "spread_max_min": float(top_values.max() - top_values.min()),
         "top_pct": float(top_pct),
         "gate_threshold": float(gate_threshold),
-        "gate_pass": bool(spread_q < gate_threshold),
+        "gate_pass": bool(combined_pass),
+        "sharpe_gate_enabled": sharpe_gate_enabled,
+        "sharpe_rel_gate": float(sharpe_rel_gate),
+        "sharpe_top_cells_median": float(sharpe_top_median),
+        "sharpe_top_cells_q10": float(sharpe_top_q10),
+        "sharpe_top_cells_q90": float(sharpe_top_q90),
+        "sharpe_spread_q90_q10": float(sharpe_spread),
+        "sharpe_rel_spread_q90_q10": float(sharpe_rel_spread),
+        "sharpe_gate_pass": bool(sharpe_gate_pass),
+        "dsr_gate_pass": bool(dsr_gate_pass),
     }
 
 
@@ -251,6 +398,7 @@ def plot_region_heatmap(
 
 __all__ = [
     "build_region_grid",
+    "build_region_grid_sharpe",
     "region_summary",
     "plot_region_heatmap",
 ]

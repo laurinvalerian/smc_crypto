@@ -51,9 +51,9 @@ def test_commission_matches_in_generate_rl_data():
     assert gr.ASSET_SLIPPAGE["crypto"] == SLIPPAGE
 
 
-def test_commission_matches_in_optuna_backtester():
+def test_commission_matches_in_wf_bruteforce():
     from core.constants import COMMISSION, SLIPPAGE
-    from backtest import optuna_backtester as ob
+    from backtest import wf_bruteforce as ob
     assert ob.ASSET_COMMISSION["crypto"] == COMMISSION
     assert ob.ASSET_SLIPPAGE["crypto"] == SLIPPAGE
 
@@ -74,14 +74,14 @@ def test_commission_matches_in_replay_adapter():
 def test_asset_commission_is_crypto_only():
     """After Phase 1 strip, all ASSET_COMMISSION dicts contain only 'crypto'."""
     import live_multi_bot as lm
-    from backtest import generate_rl_data as gr, optuna_backtester as ob
+    from backtest import generate_rl_data as gr, wf_bruteforce as ob
     import paper_grid as pg
     from exchanges import replay_adapter as ra
 
     for name, d in [
         ("live_multi_bot.ASSET_COMMISSION", lm.ASSET_COMMISSION),
         ("generate_rl_data.ASSET_COMMISSION", gr.ASSET_COMMISSION),
-        ("optuna_backtester.ASSET_COMMISSION", ob.ASSET_COMMISSION),
+        ("wf_bruteforce.ASSET_COMMISSION", ob.ASSET_COMMISSION),
         ("paper_grid.ASSET_COMMISSION", pg.ASSET_COMMISSION),
         ("replay_adapter.DEFAULT_COMMISSION", ra.DEFAULT_COMMISSION),
     ]:

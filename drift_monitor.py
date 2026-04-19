@@ -99,11 +99,23 @@ def _psi(expected: np.ndarray, actual: np.ndarray, buckets: int = 10) -> float:
 # ════════════════════════════════════════════════════════════════════
 
 def _load_live_features(db_path: str, max_n: int = MAX_LIVE_SIGNALS) -> pd.DataFrame:
-    """Load live feature vectors from rejected_signals.entry_features."""
+    """Load live feature vectors from rejected_signals.entry_features.
+
+    Returns empty DataFrame when the DB exists but the ``rejected_signals``
+    table has not been created yet (fresh install, pre-bot-boot, or paper
+    session that never emitted a near-miss). This is a common case during
+    the pre-funded paper phase start-up; an empty return keeps the cron
+    wrapper from surfacing a spurious error.
+    """
     if not Path(db_path).exists():
         return pd.DataFrame()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='rejected_signals'"
+        ).fetchone() is not None
+        if not has_table:
+            return pd.DataFrame()
         rows = conn.execute(f"""
             SELECT symbol, asset_class, timestamp, entry_features
             FROM rejected_signals

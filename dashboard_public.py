@@ -340,8 +340,9 @@ def _aggregate_stats() -> dict:
     active_positions = 0
     per_class: dict[str, dict] = {}
 
-    # Per-broker: sum PnL from ALL bots, equity = initial + total PnL
-    # OANDA serves both forex AND commodities from one 100K account.
+    # Per-broker: sum PnL from ALL bots, equity = initial + total PnL.
+    # Crypto-only (2026-04-19): only Binance USDT-M Futures; legacy
+    # OANDA/Alpaca mappings removed in Phase-1 strip.
     _BROKER_MAP = {"crypto": "binance"}
     _INITIAL_EQUITY = 100_000.0  # all brokers normalized to 100K display
     broker_pnl: dict[str, float] = {}  # sum of display PnL per broker
@@ -465,10 +466,10 @@ def _get_rl_stats() -> dict:
 def _get_equity_curve() -> list[dict]:
     """Build portfolio equity curve from journal closed trades.
 
-    Starts at 300K (3 brokers × 100K), adds each trade's PnL chronologically.
-    PnL is display-adjusted (crypto ×20).
+    Crypto-only (2026-04-19): single Binance broker → 100K initial.
+    PnL is display-adjusted (crypto ×20 for testnet 5K → 100K display).
     """
-    _INITIAL_PORTFOLIO = 300_000.0  # 3 brokers × 100K
+    _INITIAL_PORTFOLIO = 100_000.0  # single binance broker
 
     if not _journal_has_table("trades"):
         return [{"timestamp": "", "equity": _INITIAL_PORTFOLIO, "pnl": 0.0}]
@@ -1150,7 +1151,6 @@ def api_trade_detail(trade_id: str):
 #  New API Endpoints (active trades, candles, trade history)
 # =====================================================================
 
-COMMODITY_SYMBOLS = {"BCO_USD", "WTICO_USD", "XAG_USD", "XAU_USD"}
 DATA_DIR = Path("data")
 
 
@@ -1297,29 +1297,14 @@ def api_candles(symbol: str):
 
 
 def _resolve_data_subdir(symbol: str) -> str | None:
-    """Map a symbol name to its data subdirectory."""
-    # Commodities (known set)
-    if symbol in COMMODITY_SYMBOLS:
-        return "commodities"
-    # Crypto: contains USDT
-    if "USDT" in symbol:
+    """Map a symbol name to its data subdirectory.
+
+    Crypto-only (2026-04-19, v1.11): only ``data/crypto/`` is probed.
+    Legacy forex/stocks/commodities fallbacks removed in Phase-1 strip.
+    """
+    sample = DATA_DIR / "crypto" / f"{symbol}_5m.parquet"
+    if sample.exists():
         return "crypto"
-    # Forex: pattern like XXX_YYY where YYY is a currency code (not USDT)
-    # Check forex dir first, then stocks
-    if (DATA_DIR / "forex").exists():
-        # Quick check: does a file with this symbol exist in forex?
-        sample = DATA_DIR / "forex" / f"{symbol}_5m.parquet"
-        if sample.exists():
-            return "forex"
-    if (DATA_DIR / "stocks").exists():
-        sample = DATA_DIR / "stocks" / f"{symbol}_5m.parquet"
-        if sample.exists():
-            return "stocks"
-    # Fallback: try all dirs
-    for subdir in ("forex", "crypto", "stocks", "commodities"):
-        sample = DATA_DIR / subdir / f"{symbol}_5m.parquet"
-        if sample.exists():
-            return subdir
     return None
 
 

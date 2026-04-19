@@ -4,7 +4,7 @@ core.constants — Trading constants as the Single Source of Truth.
 These values were previously duplicated across:
   - live_multi_bot.py (ASSET_COMMISSION, ASSET_SLIPPAGE, ASSET_SMC_PARAMS)
   - backtest/generate_rl_data.py (_TRAIN_COMMISSION, _TRAIN_SLIPPAGE)
-  - backtest/optuna_backtester.py (ASSET_COMMISSION, ASSET_SLIPPAGE)
+  - backtest/wf_bruteforce.py (ASSET_COMMISSION, ASSET_SLIPPAGE)
   - config/default_config.yaml (top_down.alignment_threshold)
   - CLAUDE.md (documentation)
 

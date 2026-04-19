@@ -11,7 +11,7 @@ echo "════════════════════════�
 echo "  Backtest Status ($(date '+%H:%M:%S'))"
 echo "═══════════════════════════════════════════"
 
-BT_PID=$(pgrep -f "optuna_backtester" 2>/dev/null | head -1)
+BT_PID=$(pgrep -f "wf_bruteforce\|optuna_backtester" 2>/dev/null | head -1)
 if [ -n "$BT_PID" ]; then
     echo "  Process: Running (PID $BT_PID)"
     ps -p "$BT_PID" -o %cpu,%mem,etime --no-headers 2>/dev/null | \

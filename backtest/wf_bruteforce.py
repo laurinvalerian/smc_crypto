@@ -1,29 +1,34 @@
 """
 ═══════════════════════════════════════════════════════════════════
- backtest/optuna_backtester.py
- ─────────────────────────────
- Walk-Forward Optimization with Optuna (Scalp-Day Hybrid, no tiers).
+ backtest/wf_bruteforce.py
+ ─────────────────────────
+ Walk-Forward Bruteforce Grid Search + Quant-Math Gate Stack
+ (Scalp-Day Hybrid, no tiers, crypto-only).
 
- Features:
-   • Rolling walk-forward windows (configurable train/test months)
-   • Optuna Bayesian optimisation (configurable trials per window)
-   • Single alignment-threshold gate (core.constants.ALIGNMENT_THRESHOLD)
-   • Confidence-based risk sizing (core.sizing.compute_risk_fraction)
-   • Circuit breaker simulation (daily -3%, weekly -5%, class -2%,
-     all-time -8%)
-   • REAL price-path simulation: walks candles forward to check
-     whether SL or TP is hit first (no synthetic win probability)
-   • Monte Carlo with compound equity (not simple PnL sum)
-   • 6-gate OOS validation: PF, trades, Sharpe, Monte Carlo,
-     max DD (-10%), parameter stability
-   • Extracts top 20% best parameter sets automatically
-   • Generates parameter-importance ranking (plot + CSV)
-   • All results stored in /backtest/results
+ Quality-upgrade plan Phases C–H (v1.7 → v1.11).
+ Renamed from optuna_backtester.py on 2026-04-19: bruteforce has been
+ the primary / only code path since Phase D; the Optuna TPE preview
+ was kept as `--fast` but overfit noisy 20–50-trade landscapes per
+ plan §3.1 and was removed alongside the rename.
+
+ Pipeline
+ --------
+   1. Rolling walk-forward windows (configurable train/test months)
+   2. Exhaustive grid search over alignment × RR × risk × be_ratchet
+      (V18 grid: 432 combos, 48 (alignment, RR) cells, crypto-only)
+   3. Evergreen filter: PF ≥ 1.5 + min trades + max DD on EVERY window
+   4. Rank by min(PF) — best worst-case candidate
+   5. Post-hoc gates (all must PASS to deploy to funded):
+        • CPCV  — DSR IQR tight across combinatorial OOS splits
+        • PBO   — IS-best wins OOS (selection-bias calibration)
+        • MC    — CVaR-95% max-DD tail-risk
+        • REG   — DSR-spread × Sharpe-rel-spread on top-10% cells
+        • COST  — baseline metrics survive 2× elevated cost shock
 
  Usage:
-     python -m backtest.optuna_backtester                 # default config
-     python -m backtest.optuna_backtester --config path   # custom config
-     python -m backtest.optuna_backtester --monte-carlo   # with MC check
+     python -m backtest.wf_bruteforce                     # default config
+     python -m backtest.wf_bruteforce --config path       # custom config
+     python -m backtest.wf_bruteforce --generate-paper-grid
 ═══════════════════════════════════════════════════════════════════
 """
 
@@ -44,7 +49,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import optuna
 import pandas as pd
 import yaml
 from joblib import Parallel, delayed
@@ -66,19 +70,19 @@ from core.metrics import (
 )
 from backtest.cpcv import run_cpcv, cpcv_summary
 from backtest.pbo import compute_pbo
+from backtest.cost_stress import compute_cost_stress
 from backtest.monte_carlo import compute_mc_cvar_dd
 from backtest.region_heatmap import (
     build_region_grid,
+    build_region_grid_sharpe,
     plot_region_heatmap,
     region_summary,
 )
 
-# Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS, BACKTEST_OPTUNA_WORKERS).
+# Parallelism budget (override via env: BACKTEST_SIGNAL_WORKERS).
 # Signal precompute is numpy-heavy → scales with physical cores.
-# Optuna trials share one SQLite store → cap conservatively to avoid write contention.
 _CPU_COUNT = os.cpu_count() or 4
 _SIGNAL_WORKERS = int(os.environ.get("BACKTEST_SIGNAL_WORKERS", max(2, _CPU_COUNT - 2)))
-_OPTUNA_WORKERS = int(os.environ.get("BACKTEST_OPTUNA_WORKERS", max(1, _CPU_COUNT // 2)))
 
 # ── Logging ───────────────────────────────────────────────────────
 _results_dir = Path("backtest/results")
@@ -93,7 +97,6 @@ _console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(m
 
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 logger = logging.getLogger(__name__)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -896,66 +899,8 @@ def validate_oos_results(
     }
 
 
-def compute_dsr_for_oos(
-    study: optuna.Study,
-    oos_metrics: dict[str, float],
-) -> dict[str, Any] | None:
-    """Post-Optuna DSR for the selected OOS run.
-
-    Collects the Sharpe of every completed trial to estimate the null
-    distribution's variance, then applies the Bailey & Lopez de Prado
-    (2014) haircut to the OOS-Sharpe using the return moments computed
-    in `compute_metrics`.
-
-    Returns `None` when the study has <2 completed trials with positive
-    Sharpe, or when variance collapses to 0 — both signals that DSR
-    cannot be meaningfully computed.
-    """
-    trial_sharpes: list[float] = []
-    for t in study.trials:
-        if t.state.name != "COMPLETE":
-            continue
-        sr = t.user_attrs.get("sharpe")
-        if sr is not None and not np.isnan(sr):
-            trial_sharpes.append(float(sr))
-
-    if len([s for s in trial_sharpes if s > 0]) < 2:
-        return None
-
-    trial_var = _trial_sharpe_variance(trial_sharpes)
-    if trial_var <= 0:
-        return None
-
-    n_obs = int(oos_metrics.get("n_obs_daily", 0))
-    if n_obs < 2:
-        return None
-
-    observed = float(oos_metrics.get("sharpe", 0.0))
-    skew = float(oos_metrics.get("skew", 0.0))
-    kurt = float(oos_metrics.get("kurt_nonexcess", 3.0))
-
-    dsr = _deflated_sharpe(
-        observed_sharpe=observed,
-        sharpe_variance=trial_var,
-        n_trials=len(trial_sharpes),
-        observation_count=n_obs,
-        skewness=skew,
-        kurtosis=kurt,
-    )
-
-    return {
-        "dsr": dsr,
-        "observed_sharpe": observed,
-        "trial_sharpe_variance": trial_var,
-        "n_trials": len(trial_sharpes),
-        "n_obs_daily": n_obs,
-        "skew": skew,
-        "kurt_nonexcess": kurt,
-    }
-
-
 # ═══════════════════════════════════════════════════════════════════
-#  Optuna objective
+#  Signal cache
 # ═══════════════════════════════════════════════════════════════════
 
 # Bump this version whenever signal generation logic changes (TP calc, filters, etc.)
@@ -1090,208 +1035,10 @@ def _precompute_window_signals(
     return all_signals
 
 
-def _build_objective(
-    config: dict[str, Any],
-    precomputed_signals: list[TradeSignal],
-    window_index: int = 0,
-    results_dir: Path | None = None,
-    symbol_to_asset: dict[str, str] | None = None,
-):
-    """Return an Optuna objective function that filters precomputed signals."""
-
-    # Pre-group signals by asset class (once, not per trial)
-    signals_by_class: dict[str, list[TradeSignal]] = {}
-    for sig in precomputed_signals:
-        ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
-        signals_by_class.setdefault(ac, []).append(sig)
-
-    def objective(trial: optuna.Trial) -> float:
-        # Only tune filtering + trading params (signals are precomputed)
-        tuning = config.get("tuning", {})
-        alignment_threshold = trial.suggest_float(
-            "alignment_threshold",
-            tuning.get("alignment_threshold_min", 0.60),
-            tuning.get("alignment_threshold_max", 0.90),
-            step=0.05,
-        )
-        min_rr = trial.suggest_categorical(
-            "risk_reward", config["risk_reward"]["options"]
-        )
-        leverage = trial.suggest_int(
-            "leverage", config["leverage"]["min"], config["leverage"]["max"]
-        )
-        risk_per_trade = trial.suggest_float(
-            "risk_per_trade",
-            config["risk_per_trade"]["min"],
-            config["risk_per_trade"]["max"],
-            step=0.001,
-        )
-
-        # Filter precomputed signals by alignment threshold and min RR
-        # TP is structure-based (from signal generation) — NOT overridden
-        filtered: list[TradeSignal] = []
-        for sig in precomputed_signals:
-            if sig.alignment_score < alignment_threshold:
-                continue
-            if sig.risk_reward < min_rr:
-                continue
-            # Keep original structure-based TP, only override leverage
-            filtered.append(TradeSignal(
-                timestamp=sig.timestamp,
-                symbol=sig.symbol,
-                direction=sig.direction,
-                style=sig.style,
-                entry_price=sig.entry_price,
-                stop_loss=sig.stop_loss,
-                take_profit=sig.take_profit,
-                risk_reward=sig.risk_reward,
-                position_size=sig.position_size,
-                leverage=leverage,
-                alignment_score=sig.alignment_score,
-                meta=sig.meta,
-            ))
-
-        if not filtered:
-            return 0.0
-
-        # Re-group filtered signals
-        filt_by_class: dict[str, list[TradeSignal]] = {}
-        for sig in filtered:
-            ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
-            filt_by_class.setdefault(ac, []).append(sig)
-
-        # Equity cap: 2× initial account prevents unrealistic compound growth
-        max_eq = config["account"]["size"] * 2
-
-        all_trades: list[pd.DataFrame] = []
-        for ac, sigs in filt_by_class.items():
-            t = simulate_trades(
-                sigs,
-                commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
-                slippage_pct=ASSET_SLIPPAGE.get(ac, config["backtest"]["slippage_pct"]),
-                account_size=config["account"]["size"],
-                use_circuit_breaker=True,
-                asset_class=ac,
-                risk_per_trade_override=risk_per_trade,
-                max_equity_for_sizing=max_eq,
-            )
-            if not t.empty:
-                all_trades.append(t)
-
-        trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-        if not trades.empty:
-            trades = trades.sort_values("timestamp").reset_index(drop=True)
-        metrics = compute_metrics(trades, account_size=config["account"]["size"])
-
-        # Save trades for this trial (only first 10 trials to save disk)
-        if results_dir is not None and not trades.empty and trial.number < 10:
-            trades_sorted = trades.sort_values("timestamp")
-            trades_sorted.to_csv(
-                results_dir / f"trades_window{window_index}_trial{trial.number}.csv",
-                index=False,
-            )
-
-        # Phase-C objective (2026-04-19): daily Sharpe with hard quality guards.
-        # Replaces the pre-Phase-B composite (pf × sharpe × dd × trades × wr),
-        # which was a data-mining invitation — no theoretical grounding.
-        #
-        # DSR is computed post-hoc on best_trial (gates deploy, not optimization).
-        # Here we only need a noise-robust score surface for Optuna to navigate.
-        trades_count = metrics["total_trades"]
-        pf_real = metrics["pf_real"]
-        max_dd = metrics["max_drawdown"]
-        sharpe = metrics["sharpe"]
-
-        # Hard guards — insufficient evidence fails the trial outright.
-        # Thresholds calibrated to Lopez de Prado "minimum track record" (Ch. 14):
-        #   - 20 trades below any robust Sharpe estimate
-        #   - PF<1.3 is indistinguishable from noise at this sample size
-        #   - DD>15% violates funded-account compliance envelope (-8% all-time).
-        if trades_count < 20:
-            return 0.0
-        if pf_real < 1.3:
-            return 0.0
-        if max_dd < -0.15:
-            return 0.0
-
-        # Soft winrate penalty — real-WR > 80 % on this regime is almost
-        # always a BE-ratchet/TP-hit artefact, not genuine edge.
-        wr = metrics.get("winrate_real", 0.5)
-        wr_factor = 1.0 if wr <= 0.80 else max(0.3, 1.0 - (wr - 0.80) * 5)
-
-        score = max(0.0, sharpe) * wr_factor
-
-        for k, v in metrics.items():
-            trial.set_user_attr(k, v)
-
-        return score
-
-    return objective
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Top-20 % extraction
-# ═══════════════════════════════════════════════════════════════════
-
-def extract_top_params(
-    study: optuna.Study,
-    top_pct: float = 0.20,
-) -> pd.DataFrame:
-    """Extract the top fraction of trials sorted by objective value."""
-    trials_data: list[dict[str, Any]] = []
-    for t in study.trials:
-        if t.state != optuna.trial.TrialState.COMPLETE:
-            continue
-        row = {"trial": t.number, "value": t.value}
-        row.update(t.params)
-        row.update(t.user_attrs)
-        trials_data.append(row)
-
-    if not trials_data:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(trials_data).sort_values("value", ascending=False).reset_index(drop=True)
-    n_top = max(1, int(len(df) * top_pct))
-    return df.head(n_top)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Parameter importance
-# ═══════════════════════════════════════════════════════════════════
-
-def compute_param_importance(study: optuna.Study, results_dir: Path) -> pd.DataFrame:
-    """Use Optuna's fANOVA importance evaluator."""
-    try:
-        importance = optuna.importance.get_param_importances(study)
-    except Exception as exc:
-        logger.warning("Could not compute parameter importance: %s", exc)
-        return pd.DataFrame()
-
-    imp_df = (
-        pd.DataFrame(
-            list(importance.items()), columns=["parameter", "importance"]
-        )
-        .sort_values("importance", ascending=False)
-        .reset_index(drop=True)
-    )
-    csv_path = results_dir / "param_importance.csv"
-    imp_df.to_csv(csv_path, index=False)
-    logger.info("Parameter importance saved → %s", csv_path)
-
-    try:
-        import plotly.express as px
-        fig = px.bar(
-            imp_df, x="importance", y="parameter", orientation="h",
-            title="Parameter Importance (fANOVA)",
-        )
-        fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        plot_path = results_dir / "param_importance.html"
-        fig.write_html(str(plot_path))
-        logger.info("Importance plot saved → %s", plot_path)
-    except ImportError:
-        logger.warning("plotly not installed – skipping importance plot")
-
-    return imp_df
+# Region A removed (v1.11, 2026-04-19): _build_objective +
+# extract_top_params + compute_param_importance were Optuna-study
+# utilities, unused after the Optuna pipeline removal. Bruteforce
+# enumerates the grid directly without an objective function.
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1350,520 +1097,9 @@ ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
 ASSET_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Parameter Stability Check
-# ═══════════════════════════════════════════════════════════════════
-
-def check_parameter_stability(
-    study: optuna.Study,
-    best_params: dict[str, Any],
-    config: dict[str, Any],
-    precomputed_signals: list[TradeSignal],
-    perturbation_pct: float = 0.10,
-    n_perturbations: int = 5,
-    asset_class: str = "crypto",
-) -> dict[str, Any]:
-    """
-    Check if small parameter changes (±10%) drastically change performance.
-    Uses precomputed signals — only perturbs filtering/trading params.
-    """
-
-    def _run_with_params(params):
-        alignment_th = params.get("alignment_threshold", 0.65)
-        min_rr = params.get("risk_reward", 2.0)
-        rpt = params.get("risk_per_trade", None)
-        max_eq = config["account"]["size"] * 2
-        filtered = []
-        for sig in precomputed_signals:
-            if sig.alignment_score < alignment_th:
-                continue
-            if sig.risk_reward < min_rr:
-                continue
-            filtered.append(TradeSignal(
-                timestamp=sig.timestamp, symbol=sig.symbol,
-                direction=sig.direction, style=sig.style,
-                entry_price=sig.entry_price, stop_loss=sig.stop_loss,
-                take_profit=sig.take_profit, risk_reward=sig.risk_reward,
-                position_size=sig.position_size,
-                leverage=params.get("leverage", 10),
-                alignment_score=sig.alignment_score, meta=sig.meta,
-            ))
-        trades = simulate_trades(
-            filtered,
-            commission_pct=ASSET_COMMISSION.get(asset_class, config["backtest"]["commission_pct"]),
-            slippage_pct=ASSET_SLIPPAGE.get(asset_class, config["backtest"]["slippage_pct"]),
-            account_size=config["account"]["size"],
-            risk_per_trade_override=rpt,
-            max_equity_for_sizing=max_eq,
-        )
-        return compute_metrics(trades, account_size=config["account"]["size"])
-
-    base_metrics = _run_with_params(best_params)
-    base_pf = base_metrics.get("pf_real", base_metrics["profit_factor"])
-
-    perturbed_pfs: list[float] = []
-    rng = np.random.RandomState(123)
-
-    for _ in range(n_perturbations):
-        perturbed = dict(best_params)
-        for key, val in perturbed.items():
-            if isinstance(val, dict):
-                continue  # skip nested dicts (style_weights)
-            if isinstance(val, (int, float)):
-                factor = 1.0 + rng.uniform(-perturbation_pct, perturbation_pct)
-                if isinstance(val, int):
-                    # Use ceil/floor to ensure integer params actually change
-                    new_val = val * factor
-                    perturbed[key] = max(1, int(round(new_val)))
-                else:
-                    perturbed[key] = val * factor
-
-        metrics = _run_with_params(perturbed)
-        perturbed_pfs.append(metrics.get("pf_real", metrics["profit_factor"]))
-
-    # Check stability: if any perturbation drops PF by >50%, it's unstable
-    pf_changes = [abs(pf - base_pf) / max(base_pf, 0.01) for pf in perturbed_pfs]
-    max_change = max(pf_changes) if pf_changes else 0
-    is_stable = max_change < 0.50  # Less than 50% change
-
-    return {
-        "stable": is_stable,
-        "base_pf": base_pf,
-        "perturbed_pfs": perturbed_pfs,
-        "max_pf_change_pct": max_change * 100,
-        "warning": "" if is_stable else f"Parameter sensitivity: ±10% change causes {max_change*100:.0f}% PF shift",
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Main pipeline
-# ═══════════════════════════════════════════════════════════════════
-
-def run(
-    config_path: str = "config/default_config.yaml",
-) -> None:
-    """
-    Full walk-forward Optuna backtest pipeline (alignment-threshold gate).
-
-    All validation gates (Monte Carlo, stability, max DD) always run.
-    """
-    cfg = load_config(config_path)
-    data_dir = Path(cfg["data"]["data_dir"])
-    results_dir = Path(cfg["backtest"]["results_dir"])
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    train_months = cfg["backtest"]["train_months"]
-    test_months = cfg["backtest"]["test_months"]
-    n_trials = cfg["backtest"]["n_trials"]
-    top_pct = cfg["backtest"]["top_percent"]
-    study_name = cfg["backtest"]["study_name"]
-    storage = cfg["backtest"]["storage"]
-    account_size = cfg["account"]["size"]
-
-    start = pd.Timestamp(cfg["data"]["start_date"], tz="UTC")
-    end = pd.Timestamp(datetime.now(timezone.utc))
-
-    # Multi-asset: discover symbols from all asset-class directories
-    multi_assets = get_multi_asset_symbols(cfg)
-    all_symbols_flat: list[str] = []
-    symbol_to_asset: dict[str, str] = {}
-    for ac, syms in multi_assets.items():
-        for s in syms:
-            all_symbols_flat.append(s)
-            symbol_to_asset[s] = ac
-
-    total_instruments = sum(len(v) for v in multi_assets.values())
-    logger.info(
-        "Multi-asset universe: %d instruments (crypto=%d, forex=%d, stocks=%d, commodities=%d)",
-        total_instruments,
-        len(multi_assets.get("crypto", [])),
-        len(multi_assets.get("forex", [])),
-        len(multi_assets.get("stocks", [])),
-        len(multi_assets.get("commodities", [])),
-    )
-
-    # Fallback: legacy single data_dir if no multi-asset dirs
-    if not all_symbols_flat:
-        all_symbols_flat = get_available_symbols(data_dir)
-        for s in all_symbols_flat:
-            symbol_to_asset[s] = "crypto"
-
-    windows = generate_wf_windows(start, end, train_months, test_months)
-    logger.info("Walk-forward windows: %d", len(windows))
-
-    # Pre-load 5m/1m price data for all symbols (real price-path simulation)
-    logger.info("Loading price data for %d instruments...", len(all_symbols_flat))
-    load_price_data_for_symbols(all_symbols_flat, cfg)
-    logger.info("Price data loaded for %d instruments", len(_price_cache))
-
-    all_window_results: list[pd.DataFrame] = []
-    all_validations: list[dict[str, Any]] = []
-    per_window_best_params: list[dict[str, Any]] = []  # Phase D — kept verbatim for CPCV
-    per_window_study_names: list[str] = []             # Phase D — re-open best window's study
-
-    for wi, window in enumerate(tqdm(windows, desc="Walk-forward windows")):
-        logger.info(
-            "Window %d: Train %s → %s | Test %s → %s",
-            wi,
-            window["train_start"].date(),
-            window["train_end"].date(),
-            window["test_start"].date(),
-            window["test_end"].date(),
-        )
-
-        symbols = all_symbols_flat
-        if not symbols:
-            logger.warning("No symbols for window %d – skipping", wi)
-            continue
-
-        # ── Precompute signals once for this window ────────────────
-        train_signals = _precompute_window_signals(
-            cfg, symbols, window["train_start"], window["train_end"],
-            symbol_to_asset=symbol_to_asset,
-        )
-
-        if not train_signals:
-            logger.warning("Window %d: 0 precomputed signals – skipping", wi)
-            continue
-
-        # ── Optuna study (training phase) ─────────────────────────
-        window_study_name = f"{study_name}_w{wi}"
-        study = optuna.create_study(
-            study_name=window_study_name,
-            storage=storage,
-            direction="maximize",
-            load_if_exists=True,
-        )
-        objective = _build_objective(
-            cfg, train_signals,
-            window_index=wi, results_dir=results_dir,
-            symbol_to_asset=symbol_to_asset,
-        )
-        study.optimize(objective, n_trials=n_trials, n_jobs=_OPTUNA_WORKERS, show_progress_bar=True)
-
-        # ── Out-of-sample test with best params ──────────────────
-        best_params = study.best_trial.params
-        best_params["style_weights"] = {
-            "day": best_params.pop("weight_day", 1.0),
-        }
-        per_window_best_params.append(dict(best_params))  # snapshot for Phase-D CPCV
-        per_window_study_names.append(window_study_name)
-
-        # ── Precompute OOS signals ──────────────────────────────────
-        oos_all_signals = _precompute_window_signals(
-            cfg, symbols, window["test_start"], window["test_end"],
-            symbol_to_asset=symbol_to_asset,
-        )
-
-        # Filter OOS signals with best params (structure TP preserved)
-        best_alignment = best_params.get("alignment_threshold", 0.65)
-        best_min_rr = best_params.get("risk_reward", 2.0)
-        oos_signals: list[TradeSignal] = []
-        for sig in oos_all_signals:
-            if sig.alignment_score < best_alignment:
-                continue
-            if sig.risk_reward < best_min_rr:
-                continue
-            oos_signals.append(TradeSignal(
-                timestamp=sig.timestamp, symbol=sig.symbol,
-                direction=sig.direction, style=sig.style,
-                entry_price=sig.entry_price, stop_loss=sig.stop_loss,
-                take_profit=sig.take_profit, risk_reward=sig.risk_reward,
-                position_size=sig.position_size,
-                leverage=best_params.get("leverage", 10),
-                alignment_score=sig.alignment_score, meta=sig.meta,
-            ))
-
-        # Group OOS signals by asset class for correct commissions
-        oos_by_class: dict[str, list[TradeSignal]] = {}
-        for sig in oos_signals:
-            ac = symbol_to_asset.get(sig.symbol, "crypto")
-            oos_by_class.setdefault(ac, []).append(sig)
-
-        best_rpt = best_params.get("risk_per_trade", None)
-        max_eq = account_size * 2  # Cap compound growth at 2× initial
-
-        oos_parts: list[pd.DataFrame] = []
-        for ac, sigs in oos_by_class.items():
-            t = simulate_trades(
-                sigs,
-                commission_pct=ASSET_COMMISSION.get(ac, cfg["backtest"]["commission_pct"]),
-                slippage_pct=cfg["backtest"]["slippage_pct"],
-                account_size=account_size,
-                use_circuit_breaker=True,
-                asset_class=ac,
-                risk_per_trade_override=best_rpt,
-                max_equity_for_sizing=max_eq,
-            )
-            if not t.empty:
-                oos_parts.append(t)
-
-        oos_trades = pd.concat(oos_parts, ignore_index=True) if oos_parts else pd.DataFrame()
-        if not oos_trades.empty:
-            oos_trades = oos_trades.sort_values("timestamp").reset_index(drop=True)
-        oos_metrics = compute_metrics(oos_trades, account_size=account_size)
-
-        # Save OOS trades
-        if not oos_trades.empty:
-            oos_trades.sort_values("timestamp").to_csv(
-                results_dir / f"oos_trades_w{wi}.csv", index=False,
-            )
-
-        # ── Monte Carlo check (always — it's a hard gate) ─────────
-        mc_result = None
-        if not oos_trades.empty:
-            mc_result = monte_carlo_check(oos_trades, account_size)
-            mc_path = results_dir / f"monte_carlo_w{wi}.json"
-            with open(mc_path, "w") as fh:
-                json.dump(mc_result, fh, indent=2, default=str)
-            logger.info(
-                "Monte Carlo W%d: robust=%s median_pnl=%.0f CI=[%.0f, %.0f] profitable=%.1f%% worst_dd_95=%.1f%%",
-                wi, mc_result["robust"], mc_result["median_pnl"],
-                mc_result["ci_lower"], mc_result["ci_upper"],
-                mc_result["pct_profitable"] * 100,
-                mc_result.get("worst_dd_95pct", 0) * 100,
-            )
-
-        # ── Parameter stability check (always — it's a hard gate) ─
-        stability_result = check_parameter_stability(
-            study, best_params, cfg, oos_all_signals,
-            asset_class="crypto",  # Global mode defaults to crypto
-        )
-        logger.info(
-            "Stability W%d: stable=%s max_change=%.1f%%",
-            wi, stability_result["stable"],
-            stability_result["max_pf_change_pct"],
-        )
-
-        # ── Deflated Sharpe Ratio (post-Optuna selection-bias haircut) ─
-        dsr_result = compute_dsr_for_oos(study, oos_metrics)
-        if dsr_result is not None:
-            logger.info(
-                "DSR W%d: %.3f (observed SR=%.2f, trial_var=%.3f, n_trials=%d, n_obs=%d)",
-                wi, dsr_result["dsr"], dsr_result["observed_sharpe"],
-                dsr_result["trial_sharpe_variance"], dsr_result["n_trials"],
-                dsr_result["n_obs_daily"],
-            )
-
-        # ── Validation gates (8 gates: PF, trades, Sharpe, MC, DD, stability, quality, DSR) ──
-        validation = validate_oos_results(
-            oos_metrics, mc_result,
-            stability_result=stability_result,
-            dsr_result=dsr_result,
-            max_dd_limit=-0.10,  # Funded account: max -10% all-time DD
-            dsr_threshold=0.70,  # Research phase; 0.95 required before funded deploy
-            asset_class="crypto",  # Global mode — default to crypto trade gate
-        )
-        validation["window"] = wi
-        validation["stability"] = stability_result
-        validation["dsr"] = dsr_result
-        all_validations.append(validation)
-
-        logger.info(
-            "Window %d OOS: PF=%.2f(real) Sharpe=%.2f WR=%.1f%%(real) BE=%.0f%% "
-            "Trades=%d(%dW/%dL/%dBE) DD=%.2f%% | %s",
-            wi, oos_metrics.get("pf_real", oos_metrics["profit_factor"]),
-            oos_metrics["sharpe"],
-            oos_metrics.get("winrate_real", oos_metrics["winrate"]) * 100,
-            oos_metrics.get("be_rate", 0) * 100,
-            oos_metrics["total_trades"],
-            oos_metrics.get("n_wins", 0), oos_metrics.get("n_losses", 0),
-            oos_metrics.get("n_breakeven", 0),
-            oos_metrics["max_drawdown"] * 100,
-            validation["verdict"],
-        )
-
-        # Save window results
-        window_result = {"window": wi, **oos_metrics, **best_params}
-        all_window_results.append(pd.DataFrame([window_result]))
-
-        # ── Top 20% extraction ─────────────────────────────────────
-        top_df = extract_top_params(study, top_pct=top_pct)
-        if not top_df.empty:
-            top_df.to_csv(results_dir / f"top_params_w{wi}.csv", index=False)
-
-        # ── Parameter importance ───────────────────────────────────
-        compute_param_importance(study, results_dir)
-
-        # ── Free memory between windows ──────────────────────────
-        del train_signals, oos_all_signals, oos_signals
-        del oos_by_class, oos_parts, oos_trades, study
-        gc.collect()
-
-    # ── Aggregate results ─────────────────────────────────────────
-    if all_window_results:
-        summary = pd.concat(all_window_results, ignore_index=True)
-        summary.to_csv(results_dir / "wfo_summary.csv", index=False)
-
-        global_top = summary.nlargest(
-            max(1, int(len(summary) * top_pct)), "total_pnl"
-        )
-        global_top.to_csv(results_dir / "global_top_params.csv", index=False)
-
-        # Summary stats
-        stats = {
-            "total_windows": len(windows),
-            "mean_pnl": float(summary["total_pnl"].mean()),
-            "mean_sharpe": float(summary["sharpe"].mean()),
-            "mean_winrate": float(summary["winrate"].mean()),
-            "mean_winrate_real": float(summary["winrate_real"].mean()) if "winrate_real" in summary.columns else 0.0,
-            "mean_profit_factor": float(summary["profit_factor"].mean()),
-            "mean_pf_real": float(summary["pf_real"].mean()) if "pf_real" in summary.columns else 0.0,
-            "mean_be_rate": float(summary["be_rate"].mean()) if "be_rate" in summary.columns else 0.0,
-            "worst_drawdown": float(summary["max_drawdown"].min()),
-            "mean_trades_per_window": float(summary["total_trades"].mean()),
-            "total_trades_all_windows": int(summary["total_trades"].sum()),
-        }
-
-        # Add validation summary
-        n_passed = sum(1 for v in all_validations if v["passed"])
-        stats["validation_passed"] = n_passed
-        stats["validation_total"] = len(all_validations)
-        stats["validation_pass_rate"] = n_passed / len(all_validations) if all_validations else 0
-
-        with open(results_dir / "backtest_stats.json", "w") as fh:
-            json.dump(stats, fh, indent=2)
-
-        # Save validation results
-        with open(results_dir / "validation_results.json", "w") as fh:
-            json.dump(all_validations, fh, indent=2, default=str)
-
-        logger.info("Summary stats: %s", json.dumps(stats, indent=2))
-
-        # ── Phase D: CPCV post-WF validation ─────────────────────────
-        # Lopez de Prado (2018), Ch. 7. Multiplies OOS evaluations from
-        # N=len(windows) to C(N, k). Fixed-parameter evaluation: tests the
-        # deployment-candidate across every combinatorial choice of test
-        # windows. Tight DSR IQR across splits → parameters are not
-        # split-specific. Disable by setting `cpcv.enabled: false` in config.
-        cpcv_cfg = cfg.get("cpcv", {}) or {}
-        cpcv_enabled = cpcv_cfg.get("enabled", True)
-        cpcv_k = int(cpcv_cfg.get("k", 2))
-        cpcv_min_windows = int(cpcv_cfg.get("min_windows", 4))
-        cpcv_embargo = int(cpcv_cfg.get("embargo_bars", 288))
-        cpcv_funded = float(cpcv_cfg.get("funded_threshold", 0.95))
-        cpcv_research = float(cpcv_cfg.get("research_threshold", 0.70))
-
-        if (
-            cpcv_enabled
-            and len(per_window_best_params) >= cpcv_min_windows
-            and len(all_validations) == len(per_window_best_params)
-        ):
-            try:
-                # Pick best window by OOS DSR (fall back to OOS Sharpe if DSR missing).
-                def _cpcv_window_score(v: dict[str, Any]) -> float:
-                    d = v.get("dsr") or {}
-                    if d:
-                        return float(d.get("dsr", 0.0))
-                    # No DSR → rank by raw Sharpe as last-resort tie-breaker.
-                    w = v.get("window", 0)
-                    row = summary.iloc[w] if w < len(summary) else None
-                    return float(row["sharpe"]) if row is not None and "sharpe" in row else 0.0
-
-                best_wi = max(
-                    range(len(all_validations)),
-                    key=lambda i: _cpcv_window_score(all_validations[i]),
-                )
-                best_params = per_window_best_params[best_wi]
-                best_score = _cpcv_window_score(all_validations[best_wi])
-
-                # Collect trial Sharpes from the best window's study — the
-                # null-distribution sample for the DSR haircut.
-                best_study = optuna.load_study(
-                    study_name=per_window_study_names[best_wi],
-                    storage=storage,
-                )
-                trial_sharpes: list[float] = []
-                for t in best_study.trials:
-                    if t.state.name != "COMPLETE":
-                        continue
-                    sr = t.user_attrs.get("sharpe")
-                    if sr is not None and not (isinstance(sr, float) and np.isnan(sr)):
-                        trial_sharpes.append(float(sr))
-
-                # Re-load OOS signals per window (disk cache → fast).
-                logger.info(
-                    "CPCV: reloading OOS signals for %d windows from disk cache...",
-                    len(windows),
-                )
-                signals_per_window: dict[int, list[TradeSignal]] = {}
-                for wi, window in enumerate(windows):
-                    signals_per_window[wi] = _precompute_window_signals(
-                        cfg, all_symbols_flat,
-                        window["test_start"], window["test_end"],
-                        symbol_to_asset=symbol_to_asset,
-                    )
-
-                n_splits_expected = math.comb(len(windows), cpcv_k)
-                logger.info(
-                    "CPCV: running C(%d, %d) = %d splits | best_params=window%d "
-                    "(DSR/Sharpe-score=%.3f) | trial_sharpes=%d",
-                    len(windows), cpcv_k, n_splits_expected,
-                    best_wi, best_score, len(trial_sharpes),
-                )
-
-                cpcv_df = run_cpcv(
-                    params=best_params,
-                    windows=windows,
-                    signals_per_window=signals_per_window,
-                    simulate_fn=_simulate_with_params,
-                    config=cfg,
-                    symbol_to_asset=symbol_to_asset,
-                    trial_sharpes=trial_sharpes,
-                    k=cpcv_k,
-                    embargo_bars=cpcv_embargo,
-                    max_hold_bars=SCALP_MAX_HOLD_BARS,
-                )
-
-                # Persist — tuple test_idx is not CSV-friendly.
-                cpcv_df_csv = cpcv_df.copy()
-                cpcv_df_csv["test_idx"] = cpcv_df_csv["test_idx"].apply(
-                    lambda t: "|".join(map(str, t))
-                )
-                cpcv_df_csv.to_csv(results_dir / "cpcv_results.csv", index=False)
-
-                cpcv_sum = cpcv_summary(
-                    cpcv_df,
-                    funded_threshold=cpcv_funded,
-                    research_threshold=cpcv_research,
-                )
-                # Serializable extras for reproducibility.
-                cpcv_sum["best_params_source_window"] = int(best_wi)
-                cpcv_sum["best_params"] = {
-                    k: (list(v) if isinstance(v, tuple) else v)
-                    for k, v in best_params.items()
-                    if not isinstance(v, dict)  # drop style_weights — dashboard/sim-only
-                }
-                cpcv_sum["n_trials_in_sharpe_variance"] = len(trial_sharpes)
-                cpcv_sum["k"] = cpcv_k
-                cpcv_sum["embargo_bars"] = cpcv_embargo
-                cpcv_sum["n_windows"] = len(windows)
-
-                with open(results_dir / "cpcv_summary.json", "w") as fh:
-                    json.dump(cpcv_sum, fh, indent=2, default=str)
-
-                logger.info(
-                    "CPCV complete: %d splits | median DSR=%.3f | IQR=%.3f | "
-                    "funded-pass=%.1f%% | research-pass=%.1f%%",
-                    cpcv_sum["n_splits"], cpcv_sum["median_dsr"],
-                    cpcv_sum["dsr_iqr"],
-                    cpcv_sum["percent_passing_funded"] * 100,
-                    cpcv_sum["percent_passing_research"] * 100,
-                )
-
-                # Phase-D robustness gate: IQR < 0.30 (plan Section 2.4).
-                if cpcv_sum["dsr_iqr"] >= 0.30:
-                    logger.warning(
-                        "CPCV IQR %.3f >= 0.30: params are NOT split-robust. "
-                        "PBO check (Phase E) will likely fail. Investigate "
-                        "per-window param drift before funded deploy.",
-                        cpcv_sum["dsr_iqr"],
-                    )
-
-            except Exception as exc:
-                logger.error("CPCV post-WF validation failed: %s", exc, exc_info=True)
-
-    logger.info("Walk-forward backtest complete. Results in %s", results_dir)
+# Region B removed (v1.11, 2026-04-19): check_parameter_stability +
+# run() — the Optuna walk-forward pipeline. Bruteforce grid+gates
+# (run_bruteforce) is the only supported entry point since Phase D.
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1918,12 +1154,30 @@ def _simulate_with_params(
         ac = (symbol_to_asset or {}).get(sig.symbol, "crypto")
         by_class.setdefault(ac, []).append(sig)
 
+    # Cost-stress escape hatch (v1.11): when set, ignore ASSET_COMMISSION /
+    # ASSET_SLIPPAGE module defaults and use the values explicitly set in
+    # `config["backtest"]`. Lets compute_cost_stress inject elevated costs
+    # without monkey-patching module globals across process boundaries.
+    force_cfg_costs = bool(
+        config.get("backtest", {}).get("force_backtest_costs", False)
+    )
+
     all_trades: list[pd.DataFrame] = []
     for ac, sigs in by_class.items():
+        if force_cfg_costs:
+            commission_pct = float(config["backtest"]["commission_pct"])
+            slippage_pct = float(config["backtest"]["slippage_pct"])
+        else:
+            commission_pct = ASSET_COMMISSION.get(
+                ac, config["backtest"]["commission_pct"],
+            )
+            slippage_pct = ASSET_SLIPPAGE.get(
+                ac, config["backtest"]["slippage_pct"],
+            )
         t = simulate_trades(
             sigs,
-            commission_pct=ASSET_COMMISSION.get(ac, config["backtest"]["commission_pct"]),
-            slippage_pct=ASSET_SLIPPAGE.get(ac, config["backtest"]["slippage_pct"]),
+            commission_pct=commission_pct,
+            slippage_pct=slippage_pct,
             account_size=account_size,
             use_circuit_breaker=True,
             asset_class=ac,
@@ -1943,98 +1197,9 @@ def _simulate_with_params(
     return trades, metrics
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  Cross-Window Evergreen Validation
-# ═══════════════════════════════════════════════════════════════════
-
-def cross_window_validate(
-    candidate_params: list[dict[str, Any]],
-    oos_signals_per_window: list[list[TradeSignal]],
-    asset_class: str,
-    config: dict[str, Any],
-    min_pf: float = 1.5,
-) -> dict[str, Any] | None:
-    """
-    Test each candidate param set on ALL OOS windows.
-
-    Only params with pf_real >= min_pf on EVERY window qualify as "evergreen".
-    Returns the best evergreen set (highest min PF across windows), or None.
-    """
-    symbol_to_asset: dict[str, str] = {}
-    for window_sigs in oos_signals_per_window:
-        for sig in window_sigs:
-            symbol_to_asset[sig.symbol] = asset_class
-
-    results: list[dict[str, Any]] = []
-
-    for params in candidate_params:
-        window_metrics: list[dict[str, float]] = []
-        all_pass = True
-
-        for wi, oos_sigs in enumerate(oos_signals_per_window):
-            if not oos_sigs:
-                all_pass = False
-                break
-            _, metrics = _simulate_with_params(
-                params, oos_sigs, config,
-                symbol_to_asset=symbol_to_asset,
-            )
-            pf = metrics.get("pf_real", metrics.get("profit_factor", 0))
-            trades = metrics.get("total_trades", 0)
-            # Reject: too few trades (metrics unreliable)
-            if trades < 5:
-                all_pass = False
-                break
-            if pf < min_pf:
-                all_pass = False
-            window_metrics.append(metrics)
-
-        if not all_pass or not window_metrics:
-            continue
-
-        pf_values = [m.get("pf_real", m.get("profit_factor", 0)) for m in window_metrics]
-        results.append({
-            "params": params,
-            "window_metrics": {
-                f"w{i}": {
-                    "pf_real": m.get("pf_real", 0),
-                    "winrate_real": m.get("winrate_real", 0),
-                    "trades": m.get("total_trades", 0),
-                    "dd": m.get("max_drawdown", 0),
-                    "sharpe": m.get("sharpe", 0),
-                }
-                for i, m in enumerate(window_metrics)
-            },
-            "min_pf": min(pf_values),
-            "mean_pf": sum(pf_values) / len(pf_values),
-        })
-
-    if not results:
-        return None
-
-    # Best = highest minimum PF across all windows
-    results.sort(key=lambda r: r["min_pf"], reverse=True)
-    best = results[0]
-
-    # Confidence: low if any window has < 10 trades
-    min_trades = min(
-        m.get("trades", 0)
-        for wm in best["window_metrics"].values()
-        for m in [wm]
-    )
-    confidence = "low" if min_trades < 10 else ("medium" if min_trades < 20 else "high")
-
-    return {
-        "asset_class": asset_class,
-        "params": best["params"],
-        "cross_window_metrics": best["window_metrics"],
-        "min_pf": best["min_pf"],
-        "mean_pf": best["mean_pf"],
-        "is_evergreen": True,
-        "confidence": confidence,
-        "n_candidates_tested": len(candidate_params),
-        "n_evergreen_found": len(results),
-    }
+# Region C removed (v1.11, 2026-04-19): cross_window_validate was
+# used only by run_per_asset_class (also removed). run_bruteforce
+# inlines the evergreen PF-min gate per combo in _eval_combo_worker.
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2050,348 +1215,9 @@ _DEFAULT_CONSERVATIVE_PARAMS = {
 }
 
 
-def run_per_asset_class(
-    config_path: str = "config/default_config.yaml",
-) -> dict[str, dict[str, Any]]:
-    """
-    Walk-Forward Optuna backtest per asset class.
-
-    For each class: optimize params independently, then cross-validate
-    across ALL windows to find evergreen params.
-
-    Returns: {asset_class: evergreen_result_dict}
-    """
-    cfg = load_config(config_path)
-    results_dir = Path(cfg["backtest"]["results_dir"])
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    train_months = cfg["backtest"]["train_months"]
-    test_months = cfg["backtest"]["test_months"]
-    n_trials = cfg["backtest"]["n_trials"]
-    top_pct = cfg["backtest"]["top_percent"]
-    study_name = cfg["backtest"]["study_name"]
-    storage = cfg["backtest"]["storage"]
-    account_size = cfg["account"]["size"]
-
-    start = pd.Timestamp(cfg["data"]["start_date"], tz="UTC")
-    end = pd.Timestamp(datetime.now(timezone.utc))
-
-    # Per-class tuning ranges
-    tuning_per_class = cfg.get("tuning_per_class", {})
-
-    # Discover symbols per class
-    multi_assets = get_multi_asset_symbols(cfg)
-    if not multi_assets:
-        logger.error("No instruments found in any data directory")
-        return {}
-
-    windows = generate_wf_windows(start, end, train_months, test_months)
-    if not windows:
-        logger.error("No walk-forward windows generated")
-        return {}
-    logger.info("Walk-forward windows: %d", len(windows))
-
-    evergreen_results: dict[str, dict[str, Any]] = {}
-
-    for ac, symbols in multi_assets.items():
-        logger.info(
-            "═══ Asset Class: %s (%d instruments) ═══",
-            ac.upper(), len(symbols),
-        )
-
-        ac_results_dir = results_dir / ac
-        ac_results_dir.mkdir(parents=True, exist_ok=True)
-
-        # Symbol-to-asset mapping (single class)
-        symbol_to_asset = {s: ac for s in symbols}
-
-        # Pre-load price data for this class
-        logger.info("Loading price data for %d %s instruments...", len(symbols), ac)
-        load_price_data_for_symbols(symbols, cfg)
-
-        # Per-class leverage range
-        class_tuning = tuning_per_class.get(ac, {})
-        lev_min = class_tuning.get("leverage_min", cfg["leverage"]["min"])
-        lev_max = class_tuning.get("leverage_max", cfg["leverage"]["max"])
-
-        # Collect best params + OOS signals per window for cross-validation
-        best_params_per_window: list[dict[str, Any]] = []
-        top_params_per_window: list[list[dict[str, Any]]] = []
-        oos_signals_per_window: list[list[TradeSignal]] = []
-
-        for wi, window in enumerate(windows):
-            logger.info(
-                "%s Window %d: Train %s → %s | Test %s → %s",
-                ac.upper(), wi,
-                window["train_start"].date(), window["train_end"].date(),
-                window["test_start"].date(), window["test_end"].date(),
-            )
-
-            # ── Signal precomputation (per-class, fewer symbols = less RAM) ──
-            train_signals = _precompute_window_signals(
-                cfg, symbols, window["train_start"], window["train_end"],
-                symbol_to_asset=symbol_to_asset,
-            )
-
-            if len(train_signals) < 50:
-                logger.warning(
-                    "%s W%d: Only %d signals (< 50) — using conservative defaults",
-                    ac, wi, len(train_signals),
-                )
-                best_params_per_window.append(dict(_DEFAULT_CONSERVATIVE_PARAMS))
-
-                # Still precompute OOS signals for cross-validation
-                oos_sigs = _precompute_window_signals(
-                    cfg, symbols, window["test_start"], window["test_end"],
-                    symbol_to_asset=symbol_to_asset,
-                )
-                oos_signals_per_window.append(oos_sigs)
-                top_params_per_window.append([dict(_DEFAULT_CONSERVATIVE_PARAMS)])
-                del train_signals
-                gc.collect()
-                continue
-
-            # ── Optuna study (per-class, per-window) ─────────────────
-            window_study_name = f"{study_name}_{ac}_w{wi}"
-
-            # Build objective with per-class leverage range
-            def _make_objective(cfg, train_sigs, wi, res_dir, s2a, lmin, lmax):
-                """Create objective with class-specific leverage range."""
-                signals_by_class: dict[str, list[TradeSignal]] = {}
-                for sig in train_sigs:
-                    c = (s2a or {}).get(sig.symbol, "crypto")
-                    signals_by_class.setdefault(c, []).append(sig)
-
-                def objective(trial: optuna.Trial) -> float:
-                    tuning = cfg.get("tuning", {})
-                    alignment_threshold = trial.suggest_float(
-                        "alignment_threshold",
-                        tuning.get("alignment_threshold_min", 0.60),
-                        tuning.get("alignment_threshold_max", 0.90),
-                        step=0.05,
-                    )
-                    min_rr = trial.suggest_categorical(
-                        "risk_reward", cfg["risk_reward"]["options"],
-                    )
-                    leverage = trial.suggest_int("leverage", lmin, lmax)
-                    risk_per_trade = trial.suggest_float(
-                        "risk_per_trade",
-                        cfg["risk_per_trade"]["min"],
-                        cfg["risk_per_trade"]["max"],
-                        step=0.001,
-                    )
-
-                    params = {
-                        "alignment_threshold": alignment_threshold,
-                        "risk_reward": min_rr,
-                        "leverage": leverage,
-                        "risk_per_trade": risk_per_trade,
-                    }
-                    _, metrics = _simulate_with_params(
-                        params, train_sigs, cfg,
-                        symbol_to_asset=s2a,
-                    )
-
-                    if res_dir is not None and trial.number < 10:
-                        pass  # skip per-trial CSV saves for per-class mode
-
-                    # Phase-C objective (2026-04-19): daily Sharpe + hard guards.
-                    # See _build_objective for the rationale (same contract).
-                    trades_count = metrics["total_trades"]
-                    pf_real = metrics["pf_real"]
-                    max_dd = metrics["max_drawdown"]
-                    sharpe = metrics["sharpe"]
-
-                    if trades_count < 20:
-                        score = 0.0
-                    elif pf_real < 1.3:
-                        score = 0.0
-                    elif max_dd < -0.15:
-                        score = 0.0
-                    else:
-                        wr = metrics.get("winrate_real", 0.5)
-                        wr_factor = 1.0 if wr <= 0.80 else max(0.3, 1.0 - (wr - 0.80) * 5)
-                        score = max(0.0, sharpe) * wr_factor
-
-                    for k, v in metrics.items():
-                        trial.set_user_attr(k, v)
-                    return score
-
-                return objective
-
-            study = optuna.create_study(
-                study_name=window_study_name,
-                storage=storage,
-                direction="maximize",
-                load_if_exists=True,
-            )
-            objective = _make_objective(
-                cfg, train_signals, wi, ac_results_dir,
-                symbol_to_asset, lev_min, lev_max,
-            )
-            study.optimize(objective, n_trials=n_trials, n_jobs=_OPTUNA_WORKERS, show_progress_bar=True)
-
-            best = study.best_trial.params
-            best_params_per_window.append(dict(best))
-
-            # Collect top-20% param sets for cross-validation
-            top_df = extract_top_params(study, top_pct=top_pct)
-            top_sets: list[dict[str, Any]] = []
-            if not top_df.empty:
-                for _, row in top_df.iterrows():
-                    p = {}
-                    for col in ("alignment_threshold", "risk_reward", "leverage", "risk_per_trade"):
-                        if col in row:
-                            p[col] = row[col]
-                    top_sets.append(p)
-                top_df.to_csv(ac_results_dir / f"top_params_w{wi}.csv", index=False)
-            top_params_per_window.append(top_sets)
-
-            # ── OOS signals ──────────────────────────────────────────
-            oos_sigs = _precompute_window_signals(
-                cfg, symbols, window["test_start"], window["test_end"],
-                symbol_to_asset=symbol_to_asset,
-            )
-            oos_signals_per_window.append(oos_sigs)
-
-            # ── OOS evaluation with best params ──────────────────────
-            oos_trades, oos_metrics = _simulate_with_params(
-                best, oos_sigs, cfg,
-                symbol_to_asset=symbol_to_asset,
-            )
-
-            if not oos_trades.empty:
-                oos_trades.to_csv(ac_results_dir / f"oos_trades_w{wi}.csv", index=False)
-
-            # Monte Carlo
-            mc_result = None
-            if not oos_trades.empty:
-                mc_result = monte_carlo_check(oos_trades, account_size)
-
-            # Stability
-            stability_result = check_parameter_stability(
-                study, best, cfg, oos_sigs,
-                asset_class=ac,
-            )
-
-            # DSR haircut + Validation (per-class min trade gates)
-            dsr_result = compute_dsr_for_oos(study, oos_metrics)
-            validation = validate_oos_results(
-                oos_metrics, mc_result,
-                stability_result=stability_result,
-                dsr_result=dsr_result,
-                dsr_threshold=0.70,  # Research phase; 0.95 required before funded deploy
-                asset_class=ac,
-            )
-            validation["dsr"] = dsr_result
-
-            logger.info(
-                "%s W%d OOS: PF=%.2f(real) WR=%.1f%%(real) BE=%.0f%% "
-                "Trades=%d DD=%.2f%% Stability=%.1f%% | %s",
-                ac.upper(), wi,
-                oos_metrics.get("pf_real", 0),
-                oos_metrics.get("winrate_real", 0) * 100,
-                oos_metrics.get("be_rate", 0) * 100,
-                oos_metrics.get("total_trades", 0),
-                oos_metrics.get("max_drawdown", 0) * 100,
-                stability_result.get("max_pf_change_pct", 0),
-                validation["verdict"],
-            )
-
-            # Param importance
-            compute_param_importance(study, ac_results_dir)
-
-            # Cleanup
-            del train_signals, oos_sigs, oos_trades, study
-            gc.collect()
-
-        # ── Cross-window validation ──────────────────────────────────
-        # Collect ALL unique candidate param sets from all windows
-        all_candidates: list[dict[str, Any]] = []
-        seen_keys: set[str] = set()
-        for params_list in [best_params_per_window] + top_params_per_window:
-            for p in (params_list if isinstance(params_list, list) else [params_list]):
-                key = json.dumps(p, sort_keys=True)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    all_candidates.append(p)
-
-        logger.info(
-            "%s: Cross-window validation with %d candidates on %d OOS windows",
-            ac.upper(), len(all_candidates), len(oos_signals_per_window),
-        )
-
-        evergreen = cross_window_validate(
-            all_candidates, oos_signals_per_window, ac, cfg,
-        )
-
-        if evergreen is not None:
-            # Save evergreen params
-            eg_path = ac_results_dir / "evergreen_params.json"
-            with open(eg_path, "w") as f:
-                json.dump(evergreen, f, indent=2, default=str)
-            logger.info(
-                "✓ %s EVERGREEN: alignment=%.2f rr=%.1f lev=%d risk=%.3f | min_PF=%.2f (%d/%d candidates)",
-                ac.upper(),
-                evergreen["params"]["alignment_threshold"],
-                evergreen["params"]["risk_reward"],
-                evergreen["params"]["leverage"],
-                evergreen["params"]["risk_per_trade"],
-                evergreen["min_pf"],
-                evergreen["n_evergreen_found"],
-                evergreen["n_candidates_tested"],
-            )
-            evergreen_results[ac] = evergreen
-        else:
-            # No evergreen found — use conservative defaults
-            logger.warning(
-                "✗ %s: No evergreen params found! Using conservative defaults.",
-                ac.upper(),
-            )
-            default_result = {
-                "asset_class": ac,
-                "params": dict(_DEFAULT_CONSERVATIVE_PARAMS),
-                "cross_window_metrics": {},
-                "min_pf": 0.0,
-                "mean_pf": 0.0,
-                "is_evergreen": False,
-                "n_candidates_tested": len(all_candidates),
-                "n_evergreen_found": 0,
-            }
-            eg_path = ac_results_dir / "evergreen_params.json"
-            with open(eg_path, "w") as f:
-                json.dump(default_result, f, indent=2, default=str)
-            evergreen_results[ac] = default_result
-
-        # Free OOS signals memory
-        del oos_signals_per_window
-        gc.collect()
-
-    # ── Summary ──────────────────────────────────────────────────────
-    summary = {}
-    for ac, eg in evergreen_results.items():
-        summary[ac] = {
-            "is_evergreen": eg.get("is_evergreen", False),
-            "params": eg["params"],
-            "min_pf": eg.get("min_pf", 0),
-        }
-    with open(results_dir / "evergreen_summary.json", "w") as f:
-        json.dump(summary, f, indent=2, default=str)
-
-    logger.info("Per-asset-class backtest complete. Results in %s", results_dir)
-    for ac, s in summary.items():
-        status = "EVERGREEN" if s["is_evergreen"] else "DEFAULT"
-        logger.info(
-            "  %s: [%s] alignment=%.2f rr=%.1f lev=%d risk=%.3f min_pf=%.2f",
-            ac, status,
-            s["params"]["alignment_threshold"],
-            s["params"]["risk_reward"],
-            s["params"]["leverage"],
-            s["params"]["risk_per_trade"],
-            s["min_pf"],
-        )
-
-    return evergreen_results
+# Region D removed (v1.11, 2026-04-19): run_per_asset_class was the
+# Optuna per-asset-class pipeline. Replaced by run_bruteforce which
+# iterates asset classes inline using the exhaustive grid.
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2505,12 +1331,24 @@ def _eval_combo_worker(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str
 def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]]:
     """Build exhaustive parameter grid for a given asset class.
 
-    V17: Optimized grid — removed parameters with zero PF impact:
-    - leverage: fixed per class (doesn't affect PF, only position sizing)
+    V18 (2026-04-19): Denser ``alignment × risk_reward`` sampling to give
+    the Phase-G Region-Heatmap usable landscape resolution. The v1.10
+    grid of 6×4 cells (24) left top-10% = 2–3 cells — too few to
+    distinguish a plateau from a cliff. Here we expand to 8×6 cells
+    (48) so top-10% ≈ 5 cells and the Sharpe rel-spread gate has real
+    discriminating power.
+
+    Kept unchanged (fixed per class or zero PF impact, per V17 audit):
+    - leverage: fixed per class (affects position sizing, not PF)
     - max_hold_bars: fixed at SCALP_MAX_HOLD_BARS (Scalp-Day Hybrid: 4h on 5m)
-    - timeout_rr_threshold: fixed at 0.5 (no PF difference)
-    - alignment 0.92 removed (produces 0% evergreen across all classes)
-    - be_ratchet_r floor raised to 1.5 (1.0R too easily triggered = inflated WR)
+    - timeout_rr_threshold: fixed at 0.5 (measured zero PF impact in V17)
+
+    Dimensionality (8 × 6 × 3 × 3 = 432 combos, 2.0× v1.10):
+    - alignment_threshold: fine sweep in the 0.70–0.88 live-relevant band.
+    - risk_reward:         includes 2.25/2.75 so the min-RR sensitivity
+                           curve has interior samples.
+    - risk_per_trade:      unchanged (0.5 / 1.0 / 1.5 % mirrors live).
+    - be_ratchet_r:        unchanged floor 1.5 (1.0R over-triggers BE).
     """
     # Fixed leverage per class (conservative — tune in Paper Grid instead)
     FIXED_LEVERAGE = {"crypto": 5, "stocks": 1, "commodities": 5, "forex": 10}
@@ -2518,9 +1356,11 @@ def _build_grid(asset_class: str, config: dict[str, Any]) -> list[dict[str, Any]
 
     grid = []
     for align, rr, risk, be_r in itertools.product(
-        [0.70, 0.75, 0.80, 0.85, 0.88, 0.90],  # 6 values (dropped 0.92)
-        [2.0, 2.5, 3.0, 3.5],                    # 4 values
-        [0.005, 0.010, 0.015],                    # 3 values
+        # 8 alignment values — dense in the 0.70–0.88 funded-live band.
+        [0.70, 0.72, 0.75, 0.78, 0.80, 0.82, 0.85, 0.88],
+        # 6 RR values — interior samples at 2.25/2.75 reveal sensitivity.
+        [2.0, 2.25, 2.5, 2.75, 3.0, 3.5],
+        [0.005, 0.010, 0.015],                    # 3 risk bands
         [1.5, 2.0, 2.5],                          # 3 BE ratchet R (floor 1.5)
     ):
         grid.append({
@@ -2994,6 +1834,11 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
             rh_enabled = rh_cfg.get("enabled", True)
             rh_top_pct = float(rh_cfg.get("top_pct", 0.10))
             rh_gate = float(rh_cfg.get("gate_threshold", 0.10))
+            # v1.11 saturation-fix: relative Sharpe-spread gate on the
+            # DSR-top cells. DSR saturates at 1.0 on strong grids and
+            # loses headroom to differentiate plateau vs ridge — Sharpe
+            # does not. The combined gate is AND of both spreads.
+            rh_sharpe_rel_gate = float(rh_cfg.get("sharpe_rel_gate", 0.15))
             rh_param_x = rh_cfg.get("param_x", "alignment_threshold")
             rh_param_y = rh_cfg.get("param_y", "risk_reward")
             rh_obs_count = int(rh_cfg.get("observation_count", 60))
@@ -3038,10 +1883,21 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                         param_x=rh_param_x,
                         param_y=rh_param_y,
                     )
+                    # v1.11: non-saturating companion metric — median
+                    # mean-window-Sharpe per cell. Same pivot axes so the
+                    # combined gate evaluates the *same* DSR-top cells.
+                    region_pivot_sharpe = build_region_grid_sharpe(
+                        grid_df,
+                        window_sharpe_cols=rh_sharpe_cols,
+                        param_x=rh_param_x,
+                        param_y=rh_param_y,
+                    )
                     region_sum = region_summary(
                         region_pivot,
                         top_pct=rh_top_pct,
                         gate_threshold=rh_gate,
+                        sharpe_region_df=region_pivot_sharpe,
+                        sharpe_rel_gate=rh_sharpe_rel_gate,
                     )
                     region_sum["asset_class"] = ac
                     region_sum["param_x"] = rh_param_x
@@ -3051,6 +1907,10 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                     if not region_pivot.empty:
                         region_pivot.to_csv(
                             ac_results_dir / "region_heatmap.csv"
+                        )
+                    if not region_pivot_sharpe.empty:
+                        region_pivot_sharpe.to_csv(
+                            ac_results_dir / "region_heatmap_sharpe.csv"
                         )
 
                     with open(ac_results_dir / "region_heatmap.json", "w") as f:
@@ -3062,6 +1922,11 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                             output_path=ac_results_dir / "region_heatmap.png",
                             title=f"{ac.upper()} parameter region — median DSR",
                         )
+                        plot_region_heatmap(
+                            region_pivot_sharpe,
+                            output_path=ac_results_dir / "region_heatmap_sharpe.png",
+                            title=f"{ac.upper()} parameter region — median Sharpe",
+                        )
                     except Exception as plot_exc:
                         logger.warning(
                             "%s REGION heatmap PNG render failed: %s",
@@ -3072,28 +1937,111 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
                     with open(eg_path, "w") as f:
                         json.dump(evergreen, f, indent=2, default=str)
 
+                    dsr_msg = "PASS" if region_sum["dsr_gate_pass"] else "FAIL"
+                    sh_msg = "PASS" if region_sum["sharpe_gate_pass"] else "FAIL"
                     gate_msg = (
                         "PASS" if region_sum["gate_pass"]
                         else "FAIL — funded-deploy blocked"
                     )
                     logger.info(
-                        "%s REGION: top-%.0f%% spread_q90_q10=%.3f "
-                        "(gate < %.2f, top_cells=%d/%d, n_trials=%d) | %s",
+                        "%s REGION: top-%.0f%% DSR spread=%.3f (gate<%.2f, %s) "
+                        "| Sharpe rel_spread=%.3f of median=%.2f "
+                        "(rel_gate<%.2f, %s) | n_trials=%d | COMBINED %s",
                         ac.upper(), rh_top_pct * 100,
-                        region_sum["spread_q90_q10"], rh_gate,
-                        region_sum["n_cells_top"],
-                        region_sum["n_cells_valid"],
+                        region_sum["spread_q90_q10"], rh_gate, dsr_msg,
+                        region_sum["sharpe_rel_spread_q90_q10"],
+                        region_sum["sharpe_top_cells_median"],
+                        rh_sharpe_rel_gate, sh_msg,
                         len(rh_trial_sharpes), gate_msg,
                     )
                     if not region_sum["gate_pass"]:
+                        reasons: list[str] = []
+                        if not region_sum["dsr_gate_pass"]:
+                            reasons.append(
+                                f"DSR spread {region_sum['spread_q90_q10']:.3f} "
+                                f">= {rh_gate:.2f}"
+                            )
+                        if not region_sum["sharpe_gate_pass"]:
+                            reasons.append(
+                                f"Sharpe rel_spread "
+                                f"{region_sum['sharpe_rel_spread_q90_q10']:.3f} "
+                                f">= {rh_sharpe_rel_gate:.2f}"
+                            )
                         logger.warning(
-                            "%s REGION spread %.3f >= gate %.2f: landscape "
-                            "not plateau-like. Do NOT deploy to funded account.",
-                            ac.upper(), region_sum["spread_q90_q10"], rh_gate,
+                            "%s REGION landscape not plateau-like (%s). "
+                            "Do NOT deploy to funded account.",
+                            ac.upper(), "; ".join(reasons),
                         )
                 except Exception as exc:
                     logger.error(
                         "%s REGION post-bruteforce validation failed: %s",
+                        ac.upper(), exc, exc_info=True,
+                    )
+
+            # ── Phase H: Transaction-cost stress test ───────────────
+            # Funded accounts face real-fill cost that can exceed
+            # the Binance-taker assumption under volatile regimes.
+            # Re-simulate best_params at a pessimistic cost scenario
+            # and require PF/Sharpe/DD to stay above a funded floor.
+            cs_cfg = cfg.get("cost_stress", {}) or {}
+            cs_enabled = cs_cfg.get("enabled", True)
+            if cs_enabled:
+                try:
+                    union_sigs_cs: list[Any] = []
+                    for sigs in oos_signals_per_window:
+                        union_sigs_cs.extend(sigs)
+
+                    cs_result = compute_cost_stress(
+                        best_params=best["params"],
+                        oos_signals_union=union_sigs_cs,
+                        cfg=cfg,
+                        symbol_to_asset=symbol_to_asset,
+                        simulate_fn=_simulate_with_params,
+                        account_size=account_size,
+                    )
+                    cs_result["asset_class"] = ac
+
+                    with open(
+                        ac_results_dir / "cost_stress_summary.json", "w",
+                    ) as f:
+                        json.dump(cs_result, f, indent=2, default=str)
+
+                    evergreen["cost_stress"] = cs_result
+                    with open(eg_path, "w") as f:
+                        json.dump(evergreen, f, indent=2, default=str)
+
+                    pf_msg = "PASS" if cs_result["gate_pf_pass"] else "FAIL"
+                    sh_msg = "PASS" if cs_result["gate_sharpe_pass"] else "FAIL"
+                    dd_msg = "PASS" if cs_result["gate_dd_pass"] else "FAIL"
+                    gate_msg = (
+                        "PASS" if cs_result["gate_pass"]
+                        else "FAIL — funded-deploy blocked"
+                    )
+                    logger.info(
+                        "%s COST-STRESS: @ commission=%.2fbp slippage=%.2fbp | "
+                        "PF %.2f→%.2f (gate>=%.2f, %s) | "
+                        "Sharpe %.2f→%.2f (gate>=%.2f, %s) | "
+                        "DD %.2f%%→%.2f%% (gate>=%.2f%%, %s) | COMBINED %s",
+                        ac.upper(),
+                        cs_result["stressed_commission_pct"] * 10000,
+                        cs_result["stressed_slippage_pct"] * 10000,
+                        cs_result["baseline_pf"], cs_result["stressed_pf"],
+                        cs_result["gate_pf"], pf_msg,
+                        cs_result["baseline_sharpe"], cs_result["stressed_sharpe"],
+                        cs_result["gate_sharpe"], sh_msg,
+                        cs_result["baseline_dd"] * 100,
+                        cs_result["stressed_dd"] * 100,
+                        cs_result["gate_dd"] * 100, dd_msg, gate_msg,
+                    )
+                    if not cs_result["gate_pass"]:
+                        logger.warning(
+                            "%s COST-STRESS collapsed at 2× conservative "
+                            "cost model. Do NOT deploy to funded account.",
+                            ac.upper(),
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "%s COST-STRESS post-bruteforce validation failed: %s",
                         ac.upper(), exc, exc_info=True,
                     )
         else:
@@ -3155,9 +2103,11 @@ def run_bruteforce(config_path: str = "config/default_config.yaml") -> dict[str,
 #  Paper Grid Variant Generator
 # ═══════════════════════════════════════════════════════════════════
 
-# Asset-class leverage caps (must match live_multi_bot.py)
+# Asset-class leverage caps (must match live_multi_bot.py).
+# Crypto-only (2026-04-19, v1.11): only crypto is active. Keeping the dict
+# keyed by asset class for forward-compat if ever re-expanded.
 _ASSET_MAX_LEVERAGE = {
-    "crypto": 20, "forex": 30, "stocks": 4, "commodities": 20,
+    "crypto": 20,
 }
 
 
@@ -3168,13 +2118,16 @@ def generate_paper_grid_variants(
     """
     Generate 20 parameter variants per asset class from evergreen params.
 
-    Reads evergreen_params.json from each class's results directory,
-    creates 20 variants spanning conservative to aggressive.
+    Crypto-only (2026-04-19, v1.11): only the crypto evergreen is consumed.
+    Legacy forex/stocks/commodities classes were stripped in Phase 1.
+
+    Reads evergreen_params.json from the class results directory, creates
+    20 variants spanning conservative to aggressive.
     """
     results_path = Path(results_dir)
     all_variants: list[dict[str, Any]] = []
 
-    for ac in ("crypto", "forex", "stocks", "commodities"):
+    for ac in ("crypto",):
         eg_file = results_path / ac / "evergreen_params.json"
         if not eg_file.exists():
             logger.warning("No evergreen params for %s — skipping", ac)
@@ -3243,30 +2196,19 @@ def generate_paper_grid_variants(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Optuna Walk-Forward Backtester (Scalp-Day Hybrid, alignment-threshold gate)",
+        description=(
+            "Walk-Forward Bruteforce Backtester + Quant-Math Gate Stack "
+            "(Scalp-Day Hybrid, crypto-only, alignment-threshold gate)."
+        ),
     )
     parser.add_argument(
         "--config", default="config/default_config.yaml",
         help="Path to YAML config file",
     )
     parser.add_argument(
-        "--per-class", action="store_true",
-        help="Run per-asset-class optimization (separate Optuna per class + cross-window evergreen)",
-    )
-    parser.add_argument(
         "--generate-paper-grid", action="store_true",
-        help="Generate 20 paper grid variants per asset class from evergreen params",
-    )
-    parser.add_argument(
-        "--bruteforce", action="store_true",
-        help="[DEPRECATED — now the default] Exhaustive grid search on ALL "
-             "OOS windows. Kept for backwards compatibility.",
-    )
-    parser.add_argument(
-        "--fast", action="store_true",
-        help="Optuna TPE (fast preview, NOT robust — TPE overfits noisy "
-             "landscapes per quality-upgrade plan §3.1). Use for "
-             "sanity-checking new config changes; never for deploy-candidates.",
+        help="Generate paper-grid variants for live A/B testing from "
+             "the crypto evergreen params (requires a prior default run).",
     )
     args = parser.parse_args()
 
@@ -3275,11 +2217,6 @@ if __name__ == "__main__":
         generate_paper_grid_variants(
             results_dir=cfg["backtest"]["results_dir"],
         )
-    elif args.fast:
-        # Optuna preview — overfitting-prone, no deploy-gate weight
-        run(config_path=args.config)
-    elif args.per_class:
-        run_per_asset_class(config_path=args.config)
     else:
-        # Default: Bruteforce grid + CPCV (Phase D+F, quality-upgrade plan)
+        # Only entry point: bruteforce grid + full gate stack (Phases C–H).
         run_bruteforce(config_path=args.config)

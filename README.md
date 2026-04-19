@@ -32,7 +32,8 @@ smc_crypto/
 ├── strategies/
 │   └── smc_multi_style.py       # Core SMC multi-style strategy
 ├── backtest/
-│   ├── optuna_backtester.py     # Walk-forward Optuna optimiser
+│   ├── wf_bruteforce.py         # Walk-forward bruteforce + gate stack (renamed 2026-04-19)
+│   ├── cpcv.py / pbo.py / monte_carlo.py / region_heatmap.py / cost_stress.py
 │   └── results/                 # CSV, JSON, plots
 ├── utils/
 │   └── data_downloader.py       # CCXT downloader + volume ranking
@@ -157,14 +158,13 @@ python -m utils.data_downloader
 ### Run the backtest
 
 ```bash
-python -m backtest.optuna_backtester
+python -m backtest.wf_bruteforce
 ```
 
-### Optuna Dashboard
-
-```bash
-optuna-dashboard sqlite:///backtest/results/optuna_study.db
-```
+The pipeline is bruteforce grid search + a five-gate quant-math stack
+(DSR · CPCV · PBO · MC-CVaR · Region-Heatmap · Cost-Stress). The prior
+Optuna walk-forward path was removed on 2026-04-19 (v1.11) — it overfit
+noisy 20–50-trade landscapes and was redundant with bruteforce.
 
 ---
 
