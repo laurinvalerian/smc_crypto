@@ -158,12 +158,16 @@ def _resolve_smc_params(symbol: str, asset_class: str) -> dict[str, Any]:
 
 # Phase 2.1 SSOT (2026-04-18): values imported from core.constants.
 # Crypto-only after Phase 1 strip — dict form retained for caller compatibility.
-from core.constants import COMMISSION, SLIPPAGE
+from core.constants import COMMISSION, SLIPPAGE, SCALP_MAX_HOLD_BARS
 ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
 ASSET_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
 
-# Max bars to simulate forward for outcome (48h of 5m bars)
-MAX_FORWARD_BARS = 576
+# Max bars to simulate forward for outcome. Aligned with SCALP_MAX_HOLD_BARS
+# (48 bars = 4h on 5m) per 2026-04-20 Track B0 horizon fix: Teacher v2 labels
+# must reflect the same hold window the live bot enforces, otherwise Student
+# learns to take setups whose favorable excursion materialises far past the
+# live time-out (architect R1 delta #3).
+MAX_FORWARD_BARS = SCALP_MAX_HOLD_BARS
 # Max bars to continue tracking after TP hit (raw MFE only, ~17h)
 MAX_POST_TP_BARS = 200
 
