@@ -209,7 +209,10 @@ def _get_near_misses(n: int = 50) -> list[dict]:
         return []
 
     _PAT_ALIGNMENT = re.compile(
-        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS ALIGNMENT (\S+) \| class=(\w+) score=([\d.]+) thresh=([\d.]+) dir=(\w+)"
+        # `score=` is the SSOT gate score; `rich=` is the continuous live score
+        # appended 2026-04-20 as a diagnostic. Kept optional so both pre- and
+        # post-fix log lines parse cleanly.
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS ALIGNMENT (\S+) \| class=(\w+) score=([\d.]+)(?: rich=([\d.]+))? thresh=([\d.]+) dir=(\w+)"
     )
     _PAT_XGB = re.compile(
         r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS XGB (\S+) conf=([\d.]+) score=([\d.]+) thresh=([\d.]+) \| (\w+) (\w+)"
@@ -228,17 +231,21 @@ def _get_near_misses(n: int = 50) -> list[dict]:
                 m = _PAT_ALIGNMENT.search(line)
                 if m:
                     score_val = float(m.group(4))
-                    thresh_val = float(m.group(5))
-                    hits.append({
+                    rich_val = float(m.group(5)) if m.group(5) else None
+                    thresh_val = float(m.group(6))
+                    entry = {
                         "time": _to_swiss(m.group(1)),
                         "symbol": m.group(2),
                         "type": "ALIGNMENT",
                         "score": round(score_val, 3),
                         "threshold": round(thresh_val, 2),
                         "gap": round(thresh_val - score_val, 3),
-                        "direction": m.group(6),
+                        "direction": m.group(7),
                         "asset_class": m.group(3),
-                    })
+                    }
+                    if rich_val is not None:
+                        entry["rich_score"] = round(rich_val, 3)
+                    hits.append(entry)
                     continue
 
                 m = _PAT_XGB.search(line)

@@ -2196,7 +2196,7 @@ class PaperBot:
             _near_miss_floor = max(0.40, self.alignment_threshold - 0.15)
             if score >= _near_miss_floor:
                 self.logger.info(
-                    "NEAR-MISS ALIGNMENT %s | class=%s gate=%.3f rich=%.3f thresh=%.2f dir=%s | flags=%s",
+                    "NEAR-MISS ALIGNMENT %s | class=%s score=%.3f rich=%.3f thresh=%.2f dir=%s | flags=%s",
                     symbol, self.asset_class, score, rich_score,
                     self.alignment_threshold, direction,
                     {k: v for k, v in components.items() if not k.startswith("_")},
