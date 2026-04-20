@@ -138,10 +138,16 @@ live:
   max_open_trades: 5
 
 # ── RL Brain (XGBoost Models) ──────────────────────────────────
+# 2026-04-20: Master switch flipped OFF for Backtest/Live parity during
+# paper-validation phase. Backtest (strategies/smc_multi_style.py +
+# wf_bruteforce.py) gates on pure SMC alignment, no ML in the signal path.
+# Any RL re-activation must be backtest-validated WITH the model in the
+# evergreen pipeline, not just in isolation. Student brain (below) also
+# disabled — its v1 retrain failed QA 2026-04-20.
 rl_brain:
-  enabled: true              # Master switch for all RL models
+  enabled: false             # Master switch OFF — strict gate parity vs backtest
   entry_filter:
-    enabled: true            # Filter entries by predicted win probability
+    enabled: false           # 2026-04-20: disabled for gate parity (backtest has no XGB entry filter)
     confidence_threshold: 0.55     # Backtest C optimal (was 0.6)
     model_path: "models/rl_entry_filter.pkl"
   position_sizer:
@@ -159,7 +165,11 @@ rl_brain:
     max_tp_extension: 0.5    # Max 50% TP extension from planned
     min_tp_rr: 0.5           # Never set TP below 0.5R
   be_manager:
-    enabled: true             # GATE PASSED: PF +33%, DD -35% — only exit-model with verified positive evidence
+    enabled: false           # 2026-04-20: disabled for strict parity. Backtest uses fixed
+                             # be_ratchet_r=2.5 from evergreen params — not an ML BE manager.
+                             # Backtest audit claimed PF +33% but that was measured in isolation,
+                             # not as a net effect vs the fixed rule. Re-enable only after a joint
+                             # backtest that compares (fixed-2.5) vs (ML be_manager) head-to-head.
     model_path: "models/rl_be_manager.pkl"
     min_be_rr: 0.5           # Don't trigger BE below 0.5R favorable
     fee_buffer: true         # Add fee buffer when moving to BE
@@ -189,8 +199,10 @@ rl_brain:
 # (see teacher/teacher_v2.py). BE manager stays active — orthogonal.
 # ═══════════════════════════════════════════════════════
 student_brain:
-  enabled: true                     # ACTIVATED 2026-04-17: training done, test AUC 0.74 stable over 5 folds (vs old 0.66).
-                                    # Replaces entry_filter + tp_optimizer + sl_adjuster + position_sizer.
+  enabled: false                    # 2026-04-20: disabled — v1 retrain failed QA gate
+                                    # (entry AUC 0.630 < 0.70, size RMSE 0.667 > 0.50). Archived to
+                                    # archive/student_v1_qa_failed_20260420/. Also disabled for
+                                    # strict Backtest/Live parity during paper-validation phase.
   models_dir: "models"              # Looks for student_entry.pkl / _sl / _tp / _size
   accept_threshold: 0.55            # P(worth_taking) gate — tune per-class if needed
   min_rr: 1.5                       # Reject if predicted TP/SL < 1.5R (replaces hardcoded MIN_RR=3.0)
