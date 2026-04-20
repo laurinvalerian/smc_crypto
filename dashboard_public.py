@@ -209,10 +209,12 @@ def _get_near_misses(n: int = 50) -> list[dict]:
         return []
 
     _PAT_ALIGNMENT = re.compile(
-        # `score=` is the SSOT gate score; `rich=` is the continuous live score
-        # appended 2026-04-20 as a diagnostic. Kept optional so both pre- and
-        # post-fix log lines parse cleanly.
-        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS ALIGNMENT (\S+) \| class=(\w+) score=([\d.]+)(?: rich=([\d.]+))? thresh=([\d.]+) dir=(\w+)"
+        # Accept both `score=` (post-fix, SSOT gate score) and `gate=`
+        # (transient label that existed in the 08:12-08:41 UTC window on
+        # 2026-04-20 before the dashboard regex was aligned). Both mean the
+        # SSOT gate score. `rich=` is the continuous live score appended as a
+        # diagnostic; kept optional so pre- and post-fix lines both parse.
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS ALIGNMENT (\S+) \| class=(\w+) (?:score|gate)=([\d.]+)(?: rich=([\d.]+))? thresh=([\d.]+) dir=(\w+)"
     )
     _PAT_XGB = re.compile(
         r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*NEAR-MISS XGB (\S+) conf=([\d.]+) score=([\d.]+) thresh=([\d.]+) \| (\w+) (\w+)"
