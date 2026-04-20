@@ -124,10 +124,20 @@ backtest:
 
 # ── Exchange / Broker Configuration ─────────────────────────────
 # API keys are loaded from .env (never store keys in this file!)
+#
+# Three supported modes (exchanges.binance):
+#   testnet: true                          → Binance Futures Testnet (fake
+#                                            volume feed — distorts signals).
+#   testnet: false, paper_only: true       → Mainnet public data + local paper
+#                                            execution (2026-04-20 default).
+#                                            Real volume, no real orders.
+#   testnet: false, paper_only: false      → Mainnet LIVE (real money).
 exchanges:
   binance:
     enabled: true
-    testnet: true            # Use Binance Futures Testnet
+    testnet: false           # Mainnet for real volume/spread feed
+    paper_only: true         # Local simulated orders, no real submission
+    paper_balance: 5000.0    # Synthetic USDT starting balance
     env_key: "BINANCE_API_KEY"
     env_secret: "BINANCE_SECRET"
 

@@ -4081,12 +4081,25 @@ async def create_adapters(config: dict[str, Any]) -> dict[str, ExchangeAdapter]:
     # ── Binance (crypto) ────────────────────────────────────────
     bk = os.getenv("BINANCE_API_KEY", "")
     bs = os.getenv("BINANCE_SECRET", "")
+    _binance_cfg = (config.get("exchanges", {}) or {}).get("binance", {}) or {}
+    _testnet = bool(_binance_cfg.get("testnet", True))
+    _paper_only = bool(_binance_cfg.get("paper_only", False))
+    _paper_balance = float(_binance_cfg.get("paper_balance", 5000.0))
     if bk and bs:
         try:
-            adapter = BinanceAdapter(api_key=bk, api_secret=bs, testnet=True)
+            adapter = BinanceAdapter(
+                api_key=bk,
+                api_secret=bs,
+                testnet=_testnet,
+                paper_only=_paper_only,
+                paper_balance=_paper_balance,
+            )
             await adapter.connect()
             adapters["crypto"] = adapter
-            logger.info("Binance (crypto): connected ✓")
+            logger.info(
+                "Binance (crypto): connected ✓ (testnet=%s, paper_only=%s)",
+                _testnet, _paper_only,
+            )
         except Exception as exc:
             logger.warning("Binance connect failed: %s", exc)
     else:
