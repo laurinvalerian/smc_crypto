@@ -164,14 +164,17 @@ class BinanceAdapter(ExchangeAdapter):
     async def connect(self) -> None:
         """Create ccxt.pro exchange and optionally enable demo trading.
 
-        In paper_only mode we still connect with keys so public data works
-        reliably (some public endpoints rate-limit anonymous users), but all
-        order-submission and account methods are short-circuited to
-        synthetic results (see `_synthetic_order` + auth-method overrides).
+        In paper_only mode the client is created WITHOUT API keys so ccxt
+        never attaches auth headers to public-endpoint requests. Passing
+        Testnet keys to the Mainnet endpoint causes `-2008 Invalid Api-Key
+        ID` rejections on otherwise-public history/OHLCV calls (observed
+        2026-04-20 during the initial paper-shadow deploy).
         """
+        _api_key = "" if self._paper_only else self._api_key
+        _api_secret = "" if self._paper_only else self._api_secret
         self._exchange = ccxtpro.binanceusdm({
-            "apiKey": self._api_key,
-            "secret": self._api_secret,
+            "apiKey": _api_key,
+            "secret": _api_secret,
             "enableRateLimit": True,
             "options": {"defaultType": "future"},
         })
