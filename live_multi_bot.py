@@ -278,9 +278,20 @@ MIN_SL_ATR_MULT = 2.5
 # Minimum SL expressed as number of "ticks" (estimated from price magnitude)
 # Prevents 1-2 tick SLs that are pure noise on low-priced coins
 MIN_SL_TICKS = 5
+# Absolute minimum SL as % of entry price — avoids 1-bar SLs on very calm markets.
+# Scalp-Day Hybrid 2026-04-20: replaces the per-style `min_sl_pct` that was
+# pulled from STYLE_CONFIG (0.2% matches the old DAY floor).
+MIN_SL_PCT_FLOOR = 0.002
 
 # ── Trade Style Configuration ────────────────────────────────────
-# Styles are STRICTLY separated – no mixing of entry/exit tactics
+# Scalp-Day Hybrid (2026-04-20): style classification is NEUTRALIZED.
+# `_classify_trade_style` returns STYLE_DAY unconditionally and
+# `_validate_style_constraints` returns (True, ""). STYLE_CONFIG and the
+# SCALP/SWING constants are kept only for backward compatibility with
+# historical code (journal `style` column, XGB feature `style_id`, old
+# REJECTION_HORIZON_* lookups). Do NOT re-introduce style-based clamping
+# without data-driven validation — 63% of profitable backtest setups were
+# blocked by the old clamping logic (see data/style_kill_analysis_2026-04-20.md).
 STYLE_SCALP = "scalp"
 STYLE_DAY = "day"
 STYLE_SWING = "swing"
@@ -1471,7 +1482,9 @@ class PaperBot:
                         bars_count = int(trade.get("_bars_held_count", bars_held))
                         unrealized_rr = bar_features.get("bar_unrealized_rr", 0)
                         be_trig = bool(trade.get("be_triggered", False))
-                        be_ratchet_r = self.rl_suite.min_be_rr if self.rl_suite.be_enabled else 1.5
+                        # Scalp-Day Hybrid parity (2026-04-20): fallback 2.5 matches
+                        # backtest evergreen_params.json be_ratchet_r=2.5 (was 1.5).
+                        be_ratchet_r = self.rl_suite.min_be_rr if self.rl_suite.be_enabled else 2.5
 
                         gate_pass = (
                             should_exit
@@ -2256,6 +2269,10 @@ class PaperBot:
         _htf_4h = _precompute_htf_arrays(self.buffer_4h, self.swing_length) if not self.buffer_4h.empty else None
         _htf_1h = _precompute_htf_arrays(self.buffer_1h, self.swing_length) if not self.buffer_1h.empty else None
         bias = "bullish" if direction == "long" else "bearish"
+        # Scalp-Day Hybrid (2026-04-20): min_rr=2.0 matches backtest
+        # (strategies/smc_multi_style.py:1710) — was 1.0 historically with a
+        # separate `rr < 1.0` check after TP clamping. Since TP clamping is
+        # removed, a single 2.0 upfront gate is cleaner AND parity-matched.
         tp, _tp_source = _find_structure_tp_safe(
             _htf_4h, _htf_1h,
             vlen_4h=len(self.buffer_4h) if not self.buffer_4h.empty else 0,
@@ -2263,7 +2280,7 @@ class PaperBot:
             entry_price=price,
             bias=bias,
             sl_dist=sl_dist,
-            min_rr=1.0,
+            min_rr=2.0,
         )
 
         # Classify style from the resulting SL/TP
@@ -2297,13 +2314,23 @@ class PaperBot:
         # Uses MAX of: fixed % floor, ATR-multiple floor, AND tick floor
         # This ensures SL is beyond noise for THIS specific coin
         atr_min_sl = fivem_atr * price * MIN_SL_ATR_MULT if fivem_atr > 0 else 0
-        style_cfg = STYLE_CONFIG[style]
-        pct_min_sl = price * style_cfg["min_sl_pct"]
+        # Scalp-Day Hybrid (2026-04-20): replaced style_cfg["min_sl_pct"] with constant.
+        # Backtest min SL floor comes from SMC structure, not a per-style config.
+        # 0.2% is a sensible absolute floor to avoid 1-bar SLs on very calm markets.
+        pct_min_sl = price * MIN_SL_PCT_FLOOR
         min_sl_dist = max(atr_min_sl, pct_min_sl, tick_min_sl)
 
         if sl_dist < min_sl_dist:
+            old_sl_pct = sl_dist / price * 100 if price > 0 else 0
             sl_dist = min_sl_dist
             sl = (price - sl_dist) if direction == "long" else (price + sl_dist)
+            self.logger.info(
+                "[SL WIDENED] %s %s | from %.3f%% → %.3f%% | reason=min_sl floor (atr=%.3f%% pct=%.3f%% tick=%.3f%%)",
+                direction.upper(), symbol, old_sl_pct, sl_dist / price * 100,
+                (atr_min_sl / price * 100) if price > 0 else 0,
+                (pct_min_sl / price * 100) if price > 0 else 0,
+                (tick_min_sl / price * 100) if price > 0 else 0,
+            )
 
         # ── SL safety cap (training has no style-based SL limits) ──
         # Just cap at swing max (5%) as safety — no style upgrades needed
@@ -2311,25 +2338,38 @@ class PaperBot:
         max_sl_dist = price * max_sl_pct
         if sl_dist > max_sl_dist:
             self._pending_signal = None
-            self.logger.debug("SL CAPPED %s | sl=%.2f%% > max 5%%", symbol, sl_dist / price * 100)
+            self.logger.info(
+                "[SL REJECT] %s %s | style=%s | sl=%.3f%% > max_cap=5.000%% | price=%.6f sl=%.6f",
+                direction.upper(), symbol, style,
+                sl_dist / price * 100, price, sl,
+            )
             return
 
         if tp_dist <= 0:
             self._pending_signal = None
-            self.logger.debug("TP_DIST<=0 %s | style=%s", symbol, style)
+            self.logger.info(
+                "[TP REJECT] %s %s | style=%s | tp_dist<=0 (price=%.6f tp=%.6f)",
+                direction.upper(), symbol, style, price, tp,
+            )
             return
 
-        # ── TP clamping (training has no min_tp — RR check handles bad TPs) ──
-        tp_pct = tp_dist / price
-        if tp_pct > style_cfg["max_tp_pct"]:
-            tp_dist = price * style_cfg["max_tp_pct"]
-            tp = (price + tp_dist) if direction == "long" else (price - tp_dist)
+        # ── TP clamping REMOVED 2026-04-20 (Scalp-Day Hybrid data-driven fix) ──
+        # Backtest has no TP clamping — structural SMC TP is authoritative.
+        # Data showed 63% of profitable backtest setups (86 of 136 trades) would have
+        # been killed by the old max_tp_pct=6% (DAY) / 1.5% (SCALP) clamps.
+        # Safety net: 5% max-SL cap above + min_rr=2.0 below.
 
-        # ── RR check (global minimum, matching training pipeline) ──
+        # ── RR check (matches backtest min_rr=2.0 + post-widening safety) ──
+        # _find_structure_tp_safe already enforces min_rr=2.0 at TP selection,
+        # but ATR-floor SL-widening above can reduce effective RR. Re-check.
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
-        if rr < 1.0:  # training uses global 1.0, not per-style
+        if rr < 2.0:
             self._pending_signal = None
-            self.logger.debug("RR TOO LOW %s | rr=%.2f min=1.0", symbol, rr)
+            self.logger.info(
+                "[RR REJECT] %s %s | style=%s | rr=%.2f < 2.0 | sl_pct=%.3f%% tp_pct=%.3f%% | reason=sl_widened_by_floor",
+                direction.upper(), symbol, style, rr,
+                sl_dist / price * 100, tp_dist / price * 100,
+            )
             return
 
         # ── Signal rate limiting (per-class safety throttle) ──────
@@ -2350,11 +2390,16 @@ class PaperBot:
             return
 
         # ── Final style constraint validation ─────────────────────
-        if not self._validate_style_constraints(style, price, sl, tp):
+        ok, reject_reason = self._validate_style_constraints(style, price, sl, tp)
+        if not ok:
             self._pending_signal = None
-            self.logger.debug(
-                "STYLE MISMATCH %s %s | SL/TP don't conform to %s constraints",
-                direction.upper(), symbol, style,
+            sl_pct_log = abs(price - sl) / price if price > 0 else 0
+            tp_pct_log = abs(tp - price) / price if price > 0 else 0
+            rr_log = tp_pct_log / sl_pct_log if sl_pct_log > 0 else 0
+            self.logger.info(
+                "[STYLE REJECT] %s %s | style=%s | price=%.6f sl=%.6f tp=%.6f | sl_pct=%.3f%% tp_pct=%.3f%% rr=%.2f | fail=%s",
+                direction.upper(), symbol, style, price, sl, tp,
+                sl_pct_log * 100, tp_pct_log * 100, rr_log, reject_reason,
             )
             return
 
@@ -3511,44 +3556,45 @@ class PaperBot:
         self, price: float, sl: float, tp: float,
     ) -> str:
         """
-        Classify trade as scalp, day, or swing based on SL distance.
+        Scalp-Day Hybrid (2026-04-20): hardcoded `day` for backtest parity.
 
-        SL distance is more stable than TP distance (TP may be adjusted
-        by XGBoost TP model after classification). Matches training data
-        classifier in generate_rl_data.py.
+        Data-driven decision (136 OOS backtest trades):
+          - Backtest: 100% style="day", median TP=8%, 95p TP=61%, max=79%
+          - No style classification in backtest — structural SMC TP/SL is authoritative
+          - Old dynamic classifier (scalp<0.5% SL, swing>2%) would have REJECTED 63%
+            of profitable setups via max_tp_pct=6% clamping
+
+        Safety is enforced elsewhere:
+          - ATR-min-SL floor (adaptive to volatility)
+          - tick-min-SL floor (precision safety)
+          - 5% absolute max-SL cap
+          - min_rr=2.0 global gate
+          - 48-bar max_hold timeout
         """
         sl_dist_pct = abs(price - sl) / price if price > 0 else 0
+        tp_dist_pct = abs(tp - price) / price if price > 0 else 0
 
-        if sl_dist_pct < 0.005:  # < 0.5% SL
-            return STYLE_SCALP
-        elif sl_dist_pct > 0.02:  # > 2% SL
-            return STYLE_SWING
-        else:
-            return STYLE_DAY
+        self.logger.info(
+            "[STYLE CLASSIFY] %s | price=%.6f sl=%.6f tp=%.6f | sl_pct=%.3f%% tp_pct=%.3f%% → style=day (hardcoded, Scalp-Day Hybrid)",
+            self.symbol, price, sl, tp,
+            sl_dist_pct * 100, tp_dist_pct * 100,
+        )
+        return STYLE_DAY
 
     def _validate_style_constraints(
         self, style: str, price: float, sl: float, tp: float,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """
-        Validate that SL/TP conform to the detected trade style.
-        Prevents mixing (e.g. swing TP with scalp SL).
+        Scalp-Day Hybrid (2026-04-20): neutralized — returns always (True, "").
+
+        Backtest has NO style constraint validation (strategies/smc_multi_style.py:1742
+        hardcodes style="day" without max_tp_pct/min_tp_pct/max_sl_pct bounds).
+
+        Safety is enforced at the caller: ATR floor + tick floor + 5% SL cap + min_rr.
+        Removing this filter restored 86 of 136 profitable backtest setups (63%)
+        that would have been rejected by the old max_tp_pct=6% clamping.
         """
-        cfg = STYLE_CONFIG.get(style)
-        if cfg is None:
-            return False
-
-        sl_pct = abs(price - sl) / price if price > 0 else 0
-        tp_pct = abs(tp - price) / price if price > 0 else 0
-        rr = tp_pct / sl_pct if sl_pct > 0 else 0
-
-        if sl_pct < cfg["min_sl_pct"] or sl_pct > cfg["max_sl_pct"]:
-            return False
-        if tp_pct < cfg["min_tp_pct"] or tp_pct > cfg["max_tp_pct"]:
-            return False
-        if rr < cfg["min_rr"]:
-            return False
-
-        return True
+        return (True, "")
 
     # Risk sizing is 100% confidence-based. No tier gates.
 
