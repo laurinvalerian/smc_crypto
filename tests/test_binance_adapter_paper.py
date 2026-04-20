@@ -258,3 +258,156 @@ def test_non_paper_mode_still_calls_exchange_for_orders():
     r = _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.001))
     a._exchange.create_order.assert_called_once()
     assert r.order_id == "real-123"
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Paper SL/TP trigger simulation (regression for the 2026-04-20
+#  ghost_exit bug — see binance_adapter.py::_check_paper_triggers).
+# ════════════════════════════════════════════════════════════════════
+
+def test_paper_market_entry_tracks_position():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    assert "BTC/USDT:USDT" in a._paper_positions
+    pos = a._paper_positions["BTC/USDT:USDT"]
+    assert pos["side"] == "long"
+    assert pos["qty"] == 0.1
+    assert pos["entry_price"] == 50000.0
+    assert pos["sl_price"] is None
+    assert pos["tp_price"] is None
+
+
+def test_paper_bracket_attaches_sl_tp_to_position():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "sell", 0.1, 49000.0))
+    _run(a.create_take_profit("BTC/USDT:USDT", "sell", 0.1, 52000.0))
+    pos = a._paper_positions["BTC/USDT:USDT"]
+    assert pos["sl_price"] == 49000.0
+    assert pos["tp_price"] == 52000.0
+
+
+def test_paper_fetch_positions_returns_tracked_position():
+    """Before any trigger, fetch_positions exposes the open paper position so
+    the bot's _poll_positions doesn't declare ghost_exit after 60s."""
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "sell", 0.1, 49000.0))
+    _run(a.create_take_profit("BTC/USDT:USDT", "sell", 0.1, 52000.0))
+    # Ticker still at entry — no SL/TP cross
+    positions = _run(a.fetch_positions())
+    assert len(positions) == 1
+    assert positions[0].symbol == "BTC/USDT:USDT"
+    assert positions[0].qty == 0.1
+    assert positions[0].side == "long"
+    assert positions[0].entry_price == 50000.0
+
+
+def test_paper_tp_triggers_on_long_when_ticker_crosses_up():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "sell", 0.1, 49000.0))
+    _run(a.create_take_profit("BTC/USDT:USDT", "sell", 0.1, 52000.0))
+    # Ticker crosses TP
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 52100.0}}
+    positions = _run(a.fetch_positions())
+    assert positions == []  # position closed
+    # Exit fill is now recorded
+    fills = _run(a.fetch_my_trades("BTC/USDT:USDT"))
+    assert len(fills) == 1
+    assert fills[0]["side"] == "sell"
+    assert fills[0]["price"] == 52000.0  # filled at TP, not 52100
+    assert fills[0]["amount"] == 0.1
+
+
+def test_paper_sl_triggers_on_long_when_ticker_crosses_down():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "sell", 0.1, 49000.0))
+    _run(a.create_take_profit("BTC/USDT:USDT", "sell", 0.1, 52000.0))
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 48500.0}}
+    positions = _run(a.fetch_positions())
+    assert positions == []
+    fills = _run(a.fetch_my_trades("BTC/USDT:USDT"))
+    assert len(fills) == 1
+    assert fills[0]["side"] == "sell"
+    assert fills[0]["price"] == 49000.0  # filled at SL
+
+
+def test_paper_short_triggers_sl_and_tp_mirror_long():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "sell", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "buy", 0.1, 51000.0))
+    _run(a.create_take_profit("BTC/USDT:USDT", "buy", 0.1, 48000.0))
+    # Ticker crosses TP (short profits on down move)
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 47800.0}}
+    positions = _run(a.fetch_positions())
+    assert positions == []
+    fills = _run(a.fetch_my_trades("BTC/USDT:USDT"))
+    assert len(fills) == 1
+    assert fills[0]["side"] == "buy"
+    assert fills[0]["price"] == 48000.0
+
+
+def test_paper_position_remains_open_when_no_cross():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "sell", 0.1, 49000.0))
+    _run(a.create_take_profit("BTC/USDT:USDT", "sell", 0.1, 52000.0))
+    # Price drifts but never reaches SL or TP
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50500.0}}
+    positions = _run(a.fetch_positions())
+    assert len(positions) == 1
+    fills = _run(a.fetch_my_trades("BTC/USDT:USDT"))
+    assert fills == []
+
+
+def test_paper_reduce_only_market_closes_position():
+    """ML-exit / manual close path goes through create_market_order
+    with reduceOnly=True. Must remove the paper position."""
+    a = _make_paper_adapter()
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 50000.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    # Price moved in profit
+    a._exchange.tickers = {"BTC/USDT:USDT": {"last": 51500.0}}
+    _run(a.create_market_order("BTC/USDT:USDT", "sell", 0.1, {"reduceOnly": True}))
+    assert "BTC/USDT:USDT" not in a._paper_positions
+    fills = _run(a.fetch_my_trades("BTC/USDT:USDT"))
+    assert len(fills) == 1
+    assert fills[0]["price"] == 51500.0  # closed at ticker
+
+
+def test_paper_last_price_falls_back_to_ohlcv_cache():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {}
+    # ccxt.pro style OHLCV cache: {symbol: {timeframe: [[ts,o,h,l,c,v], ...]}}
+    a._exchange.ohlcvs = {
+        "BTC/USDT:USDT": {"5m": [[0, 0, 0, 0, 49800.0, 0]]}
+    }
+    assert a._paper_last_price("BTC/USDT:USDT") == 49800.0
+
+
+def test_paper_fetch_my_trades_filters_by_symbol_and_since():
+    a = _make_paper_adapter()
+    a._exchange.tickers = {
+        "BTC/USDT:USDT": {"last": 50000.0},
+        "ETH/USDT:USDT": {"last": 3000.0},
+    }
+    _run(a.create_market_order("BTC/USDT:USDT", "buy", 0.1))
+    _run(a.create_stop_loss("BTC/USDT:USDT", "sell", 0.1, 49000.0))
+    _run(a.create_market_order("ETH/USDT:USDT", "buy", 1.0))
+    _run(a.create_stop_loss("ETH/USDT:USDT", "sell", 1.0, 2900.0))
+    # Trigger BTC SL
+    a._exchange.tickers["BTC/USDT:USDT"] = {"last": 48500.0}
+    _run(a.fetch_positions())  # triggers
+    btc_trades = _run(a.fetch_my_trades("BTC/USDT:USDT"))
+    eth_trades = _run(a.fetch_my_trades("ETH/USDT:USDT"))
+    assert len(btc_trades) == 1
+    assert eth_trades == []  # no eth trigger yet

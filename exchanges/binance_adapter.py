@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 import ccxt as ccxt_sync
@@ -79,6 +80,16 @@ class BinanceAdapter(ExchangeAdapter):
         # Paper-only mode: synthetic order ID counter so each simulated order
         # has a unique, stable, reconcilable ID in the bot + journal.
         self._paper_order_counter = 0
+
+        # Paper-only mode: local position + fill state.
+        # Without this the bot's _poll_positions sees fetch_positions=[] and
+        # fetch_my_trades=[], causing every paper trade to trip the
+        # ghost_exit safety (trade-age > 60s + not-in-pos_map) and close at
+        # the SL price — a pauschal fake -1R loss. These dicts let the
+        # adapter simulate SL/TP triggers off the real ticker feed.
+        self._paper_positions: dict[str, dict[str, Any]] = {}
+        self._paper_fills: list[dict[str, Any]] = []
+        self._paper_fill_counter = 0
 
         # Prominent mode log so operators see how the adapter will behave.
         if self._testnet:
@@ -136,6 +147,80 @@ class BinanceAdapter(ExchangeAdapter):
                 "type": order_type,
             },
         )
+
+    def _paper_last_price(self, symbol: str) -> float:
+        """Best-effort last price for paper SL/TP trigger checks.
+
+        Tries ccxt.pro's ticker cache first (populated by watch_ticker/
+        watch_ohlcv subscriptions), falls back to the last 5m ohlcv close
+        in the ccxt.pro cache. Returns 0.0 if neither is available — the
+        caller must treat 0.0 as "no price yet, skip trigger check".
+        """
+        try:
+            tickers = getattr(self._exchange, "tickers", None) or {}
+            tk = tickers.get(symbol)
+            if tk:
+                last = float(tk.get("last") or tk.get("close") or 0.0)
+                if last > 0:
+                    return last
+        except Exception:
+            pass
+        try:
+            ohlcvs = getattr(self._exchange, "ohlcvs", None) or {}
+            per_sym = ohlcvs.get(symbol) or {}
+            for tf in ("5m", "1m", "15m"):
+                bars = per_sym.get(tf)
+                if bars:
+                    close = float(bars[-1][4])
+                    if close > 0:
+                        return close
+        except Exception:
+            pass
+        return 0.0
+
+    def _check_paper_triggers(self) -> None:
+        """Scan paper positions and trigger SL/TP if the last price has
+        crossed either level since entry. Emits synthetic fill records
+        that fetch_my_trades then replays to the bot's exit-matching
+        logic — mirroring how real Binance fills propagate.
+        """
+        if not self._paper_positions:
+            return
+        to_remove: list[str] = []
+        for symbol, pos in self._paper_positions.items():
+            last = self._paper_last_price(symbol)
+            if last <= 0:
+                continue
+            sl = pos.get("sl_price")
+            tp = pos.get("tp_price")
+            side = pos["side"]  # "long" or "short"
+            trigger_price: float | None = None
+            if side == "long":
+                if tp is not None and last >= tp:
+                    trigger_price = float(tp)
+                elif sl is not None and last <= sl:
+                    trigger_price = float(sl)
+            else:  # short
+                if tp is not None and last <= tp:
+                    trigger_price = float(tp)
+                elif sl is not None and last >= sl:
+                    trigger_price = float(sl)
+            if trigger_price is None:
+                continue
+            self._paper_fill_counter += 1
+            exit_side = "sell" if side == "long" else "buy"
+            self._paper_fills.append({
+                "id": f"pap-fill-{self._paper_fill_counter:08d}",
+                "symbol": symbol,
+                "side": exit_side,
+                "price": trigger_price,
+                "amount": float(pos["qty"]),
+                "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "order": f"pap-fill-{self._paper_fill_counter:08d}",
+            })
+            to_remove.append(symbol)
+        for sym in to_remove:
+            self._paper_positions.pop(sym, None)
 
     # ── Identity ────────────────────────────────────────────────────
 
@@ -343,13 +428,34 @@ class BinanceAdapter(ExchangeAdapter):
             # Use last known ticker mid as fill price estimate (same source the
             # bot already uses for the entry-touch check). Price will be refined
             # by the bot's own slippage model at fill time.
-            px = 0.0
-            try:
-                ticker = self._exchange.tickers.get(symbol) if hasattr(self._exchange, "tickers") else None
-                if ticker:
-                    px = float(ticker.get("last") or ticker.get("close") or 0.0)
-            except Exception:
-                px = 0.0
+            px = self._paper_last_price(symbol)
+            reduce_only = bool((params or {}).get("reduceOnly"))
+            if reduce_only:
+                # Closing fill (ML exit, manual close). Remove the local
+                # position so subsequent poll cycles don't re-trigger it.
+                pos = self._paper_positions.pop(symbol, None)
+                if pos:
+                    self._paper_fill_counter += 1
+                    self._paper_fills.append({
+                        "id": f"pap-fill-{self._paper_fill_counter:08d}",
+                        "symbol": symbol,
+                        "side": side,
+                        "price": float(px or pos["entry_price"]),
+                        "amount": float(pos["qty"]),
+                        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                        "order": f"pap-fill-{self._paper_fill_counter:08d}",
+                    })
+            else:
+                # Opening fill. Track position locally; SL/TP levels are
+                # populated by subsequent create_stop_loss/create_take_profit.
+                self._paper_positions[symbol] = {
+                    "side": "long" if side.lower() == "buy" else "short",
+                    "qty": float(qty),
+                    "entry_price": float(px),
+                    "entry_time_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    "sl_price": None,
+                    "tp_price": None,
+                }
             return self._synthetic_order(symbol, side, qty, "market", px)
         result = await self._exchange.create_order(
             symbol, "market", side, qty, params=params or {},
@@ -374,6 +480,9 @@ class BinanceAdapter(ExchangeAdapter):
         params: dict[str, Any] | None = None,
     ) -> OrderResult:
         if self._paper_only:
+            pos = self._paper_positions.get(symbol)
+            if pos is not None:
+                pos["sl_price"] = float(stop_price)
             return self._synthetic_order(symbol, side, qty, "stop_market", stop_price)
         # closePosition: Binance closes the entire position when triggered,
         # ignoring qty. Eliminates qty-mismatch bugs from partial fills.
@@ -407,6 +516,9 @@ class BinanceAdapter(ExchangeAdapter):
         params: dict[str, Any] | None = None,
     ) -> OrderResult:
         if self._paper_only:
+            pos = self._paper_positions.get(symbol)
+            if pos is not None:
+                pos["tp_price"] = float(stop_price)
             return self._synthetic_order(symbol, side, qty, "take_profit_market", stop_price)
         # closePosition: see create_stop_loss comment (reduceOnly removed for testnet compat)
         merged = {"stopPrice": stop_price, "closePosition": True}
@@ -464,7 +576,23 @@ class BinanceAdapter(ExchangeAdapter):
 
     async def fetch_positions(self) -> list[PositionInfo]:
         if self._paper_only:
-            return []  # PaperBot tracks active trades locally.
+            # Run SL/TP trigger check off the live ticker feed first — any
+            # crossed positions are removed from _paper_positions and
+            # recorded in _paper_fills for fetch_my_trades to return.
+            self._check_paper_triggers()
+            result: list[PositionInfo] = []
+            for sym, pos in self._paper_positions.items():
+                result.append(PositionInfo(
+                    symbol=sym,
+                    side=pos["side"],
+                    qty=float(pos["qty"]),
+                    entry_price=float(pos["entry_price"]),
+                    unrealized_pnl=0.0,
+                    leverage=1,
+                    margin_mode="cross",
+                    raw={"paper_only": True, **pos},
+                ))
+            return result
         raw_positions = await self._exchange.fetch_positions()
         result: list[PositionInfo] = []
         for p in raw_positions:
@@ -490,7 +618,16 @@ class BinanceAdapter(ExchangeAdapter):
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         if self._paper_only:
-            return []  # No fills on the real exchange in paper-only mode.
+            # Trigger-check first: if the SL/TP was crossed between the
+            # previous poll and this one, _paper_fills will have the new
+            # record before we filter/return.
+            self._check_paper_triggers()
+            since_ms = int(since or 0)
+            return [
+                dict(f)
+                for f in self._paper_fills
+                if f["symbol"] == symbol and f["timestamp"] >= since_ms
+            ][-limit:]
         return await self._exchange.fetch_my_trades(symbol, since=since, limit=limit)
 
     # ── Leverage & Margin ───────────────────────────────────────────

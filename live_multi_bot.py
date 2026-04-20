@@ -2500,7 +2500,12 @@ class PaperBot:
         rl_tracked = False
         rl_trade_id: str | None = None
         take_trade = True
-        rl_confidence = 1.0
+        # 0.0 = "no ML model voted on this signal" sentinel. Student/rl_suite
+        # blocks below overwrite with real probabilities when enabled. Keeping
+        # the historical 1.0 default was misleading — the journal showed
+        # xgb_confidence=1.0 for every trade even when all ML gates were
+        # disabled (strict parity mode, 2026-04-20+).
+        rl_confidence = 0.0
 
         # Student-brain overrides populated iff student is enabled.
         # When `student_used` is True the legacy rl_suite entry/SL/TP/size
