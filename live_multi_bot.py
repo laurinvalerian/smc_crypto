@@ -34,7 +34,7 @@ import signal
 import sys
 import time
 import weakref
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -420,6 +420,15 @@ class PaperBot:
       – Volume filter: skip bar if volume < 1.0× average(20)
       – Exit detection via exchange position polling (no candle-based exits)
     """
+
+    # Class-level prefilter telemetry. Shared across all PaperBot instances
+    # in the same process (asyncio is single-threaded so += is safe). The
+    # Runner._heartbeat_loop reads these counters every HEARTBEAT_SEC,
+    # logs an aggregated PREFILTER-STATS line, then resets them. Purpose:
+    # diagnose which stage of _prepare_signal blocks most 5m candles when
+    # the gate-crossing rate is suspiciously low. Added 2026-04-20 during
+    # the signal-drought investigation.
+    _prefilter_stats: dict[str, int] = defaultdict(int)
 
     def __init__(
         self,
@@ -2134,10 +2143,12 @@ class PaperBot:
         """
         # ── Pause flag check ──────────────────────────────────────────
         if Path("live_results/.pause_flag").exists():
+            PaperBot._prefilter_stats["paused"] += 1
             return  # Paused — don't generate new signals
 
         # ── Trading hours check (forex/stocks have limited hours) ────
         if self.adapter is not None and not self.adapter.is_market_open(self.symbol):
+            PaperBot._prefilter_stats["market_closed"] += 1
             self._pending_signal = None
             return
 
@@ -2147,6 +2158,7 @@ class PaperBot:
         if self.circuit_breaker is not None:
             can_trade, cb_reason = self.circuit_breaker.can_trade(self.asset_class)
             if not can_trade:
+                PaperBot._prefilter_stats["circuit_breaker"] += 1
                 self._pending_signal = None
                 self.logger.info("CIRCUIT BREAKER SKIP %s: %s", symbol, cb_reason)
                 return
@@ -2161,6 +2173,7 @@ class PaperBot:
         volumes = [c["volume"] for c in buf[-20:]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
         if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
+            PaperBot._prefilter_stats["volume_too_low"] += 1
             self._pending_signal = None
             return
 
@@ -2194,15 +2207,21 @@ class PaperBot:
         components["gate_score"] = score
         if score < self.alignment_threshold:
             _near_miss_floor = max(0.40, self.alignment_threshold - 0.15)
-            if score >= _near_miss_floor:
+            if _daily_bias == "neutral":
+                PaperBot._prefilter_stats["neutral_bias"] += 1
+            elif score >= _near_miss_floor:
+                PaperBot._prefilter_stats["near_miss_logged"] += 1
                 self.logger.info(
                     "NEAR-MISS ALIGNMENT %s | class=%s score=%.3f rich=%.3f thresh=%.2f dir=%s | flags=%s",
                     symbol, self.asset_class, score, rich_score,
                     self.alignment_threshold, direction,
                     {k: v for k, v in components.items() if not k.startswith("_")},
                 )
+            else:
+                PaperBot._prefilter_stats["low_score"] += 1
             self._pending_signal = None
             return
+        PaperBot._prefilter_stats["gate_passed"] += 1
 
         price = candle["close"]
         if price <= 0:
@@ -4852,6 +4871,25 @@ class LiveMultiBotRunner:
                 "HEARTBEAT: candles_5m=[%s] total=[%s] | trades=%d pnl=%.2f positions=%d | rest_fallbacks=%d",
                 counts, totals, total_trades, total_pnl, active_positions, rest_fallbacks,
             )
+            # Aggregated prefilter telemetry — diagnose where _prepare_signal
+            # blocks candles during drought periods. Reset each heartbeat so
+            # the numbers reflect the last HEARTBEAT_SEC window.
+            _stats = PaperBot._prefilter_stats
+            _total = sum(_stats.values())
+            if _total > 0:
+                logger.info(
+                    "PREFILTER-STATS (%d events): paused=%d mkt_closed=%d cb=%d vol_low=%d neutral_bias=%d low_score=%d near_miss=%d gate_passed=%d",
+                    _total,
+                    _stats.get("paused", 0),
+                    _stats.get("market_closed", 0),
+                    _stats.get("circuit_breaker", 0),
+                    _stats.get("volume_too_low", 0),
+                    _stats.get("neutral_bias", 0),
+                    _stats.get("low_score", 0),
+                    _stats.get("near_miss_logged", 0),
+                    _stats.get("gate_passed", 0),
+                )
+            PaperBot._prefilter_stats.clear()
             # Reset per-heartbeat counters
             for ac in self._candles_since_heartbeat:
                 self._candles_since_heartbeat[ac] = 0
