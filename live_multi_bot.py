@@ -221,12 +221,6 @@ ASSET_MAX_LEVERAGE: dict[str, int] = {
     "crypto": 10,
 }
 
-# ── Per-Class Flag Configuration ─────────────────────────────────
-# Flags to SKIP for alignment checks (still contribute to alignment score).
-CLASS_SKIP_FLAGS: dict[str, list[str]] = {
-    "crypto": [],
-}
-
 # Max new signals per SYMBOL per 4-hour window, by asset class (safety throttle).
 # Portfolio-level protection comes from circuit breakers (daily -3%, weekly -5%).
 MAX_SIGNALS_PER_SYMBOL_4H: dict[str, int] = {
@@ -501,13 +495,7 @@ class PaperBot:
         # Pending signal for real-time entry (set by on_candle, consumed by on_tick)
         self._pending_signal: dict[str, Any] | None = None
 
-        # Per-class flag skip list and signal rate limiting
-        # On testnet, skip volume_ok for crypto (unrealistic testnet volumes)
-        _skip = list(CLASS_SKIP_FLAGS.get(asset_class, []))
-        if asset_class == "crypto" and getattr(adapter, "_testnet", False):
-            if "volume_ok" not in _skip:
-                _skip.append("volume_ok")
-        self._class_skip_flags: set[str] = set(_skip)
+        # Per-symbol signal rate limit throttle
         self._max_signals_per_4h: int = MAX_SIGNALS_PER_SYMBOL_4H.get(asset_class, 5)
         self._recent_signal_bars: list[int] = []  # bar counts of accepted signals (candle-time)
 

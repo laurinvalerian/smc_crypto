@@ -65,18 +65,6 @@ top_down:
   decision_tf: "5m"        # 5m bar-by-bar iteration (crypto sweet spot)
   alignment_threshold: 0.78 # Konsolidiert 2026-04-18: 0.78 ist Live-Wert. Vorher 3-fach Diskrepanz (0.65 config / 0.78 code / 0.88 CLAUDE.md)
 
-# ── Quality Floor Filters ───────────────────────────────────────
-# Hard minimums that must pass regardless of alignment score.
-# Risk sizing scales linearly with alignment_score (see core/sizing.py) —
-# no more AAA++/AAA+ tier system (killed 2026-04-19).
-quality_filters:
-  min_adx: 25              # ADX floor (1H) – below this = choppy/ranging
-  min_session_score: 0.8   # Only trade in optimal sessions
-  min_zone_quality: 0.7    # Zone must be fresh, unmitigated, well-formed
-  min_volume_score: 0.6    # 3-layer volume must pass
-  require_momentum: true   # RSI + MACD must be confluent
-  require_all_tf_aligned: true  # 4/4 timeframes must agree on direction
-
 # ── Multi-Asset SMC Profiles ────────────────────────────────────
 smc_profiles:
   crypto:
@@ -87,16 +75,12 @@ smc_profiles:
     min_daily_atr_pct: 0.008
     min_5m_atr_pct: 0.0015
 
-# ── Per-Class Tier Flag Configuration ──────────────────────────────
-# Flags to SKIP per asset class for AAA++ / AAA+ tier gates.
-# Skipped flags still contribute to the alignment SCORE (weighted),
-# but are not required as boolean gates for tier classification.
-tier_flags:
-  skip_flags:
-    crypto: []                    # Real volume — all flags required
-  # Safety throttle: max new signals per SYMBOL per 4-hour window (by asset class).
-  # Note: Python module constants (TIER_SKIP_FLAGS, MAX_SIGNALS_PER_SYMBOL_4H) are
-  # the runtime source of truth. Edit those in live_multi_bot.py if tuning.
+# ── Per-Symbol Signal Rate Limit ─────────────────────────────────
+# Safety throttle: max new signals per SYMBOL per 4-hour window (by asset
+# class). The Python module constant MAX_SIGNALS_PER_SYMBOL_4H in
+# live_multi_bot.py is the runtime SSOT. This YAML value is documentation
+# only — tune the constant if needed.
+signal_rate_limit:
   max_signals_per_symbol_4h:
     crypto: 5
 
