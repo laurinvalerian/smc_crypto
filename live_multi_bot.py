@@ -62,6 +62,7 @@ from strategies.smc_multi_style import (
     _precompute_5m_trigger_mask,
     _find_structure_tp_safe,
     _precompute_htf_arrays,
+    _check_volume_ok,
 )
 from filters.trend_strength import compute_adx, check_momentum_confluence, multi_tf_trend_agreement
 from filters.volume_liquidity import compute_volume_score
@@ -1190,7 +1191,19 @@ class PaperBot:
                     direction=direction,
                 )
                 vol_score = vol_result.get("volume_score", 0.0)
-                comp["volume_ok"] = vol_result.get("volume_ok", False)
+                # SSOT volume_ok flag must match the backtest path
+                # (strategies/smc_multi_style.py:1648 calls _check_volume_ok with
+                # a simple 1.2× relative-ratio check). The 3-layer compute_volume_score
+                # above stays as a continuous rich feature (volume_score), but the
+                # binary gate flag is computed identically to the backtest to
+                # keep the alignment-score distribution 1:1 across both paths.
+                try:
+                    _vol_ok_ssot = _check_volume_ok(
+                        self.buffer_5m, len(self.buffer_5m) - 1,
+                    )
+                except Exception:
+                    _vol_ok_ssot = bool(vol_result.get("volume_ok", False))
+                comp["volume_ok"] = _vol_ok_ssot
                 comp["volume_score"] = vol_score
                 comp["volume_details"] = vol_result
                 score += _w_volume * vol_score
