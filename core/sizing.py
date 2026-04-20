@@ -32,8 +32,8 @@ def compute_risk_fraction(alignment_score: float) -> float:
     """
     Return risk as a fraction of equity for a given alignment score.
 
-    Scales linearly from DEFAULT_RISK_PER_TRADE (0.5% at score 0.78)
-    to MAX_RISK_PER_TRADE (1.5% at score 1.0). Returns 0.0 below the
+    Scales linearly from DEFAULT_RISK_PER_TRADE (0.25% at score 0.78)
+    to MAX_RISK_PER_TRADE (1.0% at score 1.0). Returns 0.0 below the
     entry gate — callers should never reach sizing for rejected signals
     but we fail safely.
     """

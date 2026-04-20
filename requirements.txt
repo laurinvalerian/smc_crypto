@@ -35,3 +35,10 @@ requests>=2.31.0
 
 # RL Brain (per-bot PPO)
 torch>=2.2.0
+
+# XGBoost — Student-Brain + legacy rl_suite tree models.
+# Pinned 2026-04-20: both MacBook + server on 3.2.0; allow 3.x minor upgrades.
+xgboost>=3.0,<4.0
+
+# scikit-learn — used by train_student for walk-forward splits + metrics.
+scikit-learn>=1.4.0

@@ -150,7 +150,8 @@ TOP_100_COINS = TOP_30_CRYPTO
 # Values previously duplicated here AND in backtest/generate_rl_data.py +
 # backtest/optuna_backtester.py + paper_grid.py + exchanges/replay_adapter.py.
 # Authoritative source is now core.constants.{COMMISSION, SLIPPAGE}.
-from core.constants import COMMISSION, SLIPPAGE
+from core.constants import COMMISSION, SLIPPAGE, DEFAULT_RISK_PER_TRADE, MAX_RISK_PER_TRADE
+from core.sizing import compute_risk_fraction
 ASSET_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
 _TRAIN_COMMISSION: dict[str, float] = {"crypto": COMMISSION}
 _TRAIN_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
@@ -262,8 +263,6 @@ WARMUP_TRADES = 100
 COMMISSION_RATE = 0.0004
 COMMISSION_MULTIPLIER = 2
 MAX_RISK_REDUCTION_STEP = 9  # 0.9% risk when stepping in 0.1% increments
-MIN_DYNAMIC_RISK_PCT = 0.0025  # 0.25 % floor for dynamic sizing
-MAX_DYNAMIC_RISK_PCT = 0.015   # 1.5 % cap for dynamic sizing
 RR_DIVISOR = 3.0               # RR contribution scaled down (RR / 3) to avoid aggressive sizing
 RR_CONTRIBUTION_CAP = 2.0      # RR contribution capped at +2.0 to bound boost from extreme RR setups
 EPSILON_SL_DIST = 1e-6         # Minimum SL distance tolerance to avoid divide-by-zero
@@ -343,8 +342,9 @@ STYLE_CONFIG: dict[str, dict[str, Any]] = {
     },
 }
 
-# Risk sizing is 100% confidence-based via core.sizing.compute_risk_fraction
-# (linear scale 0.5% -> 1.5% between ALIGNMENT_THRESHOLD and score 1.0).
+# Risk sizing uses core.sizing.compute_risk_fraction as SSOT:
+# linear 0.25% at ALIGNMENT_THRESHOLD to 1.0% at score 1.0, multiplied by the
+# Student size-head when present (defaults to 1.0 when Student is disabled).
 # Leverage capped by ASSET_MAX_LEVERAGE. No AAA++/AAA+ tier dispatch.
 
 # (removed: _history_exchange / _get_history_exchange — history now loaded via adapter)
@@ -2827,25 +2827,23 @@ class PaperBot:
         Returns:
             tuple: (order_id, sl_order_id, tp_order_id, quantity, used_risk_pct, applied_leverage)
         """
-        # === CONFIDENCE-BASED DYNAMIC RISK ===
+        # === ALIGNMENT-BASED DYNAMIC RISK (core.sizing SSOT) ===
+        # base_risk scales linearly with alignment_score (0.25% at threshold,
+        # 1.0% at score 1.0). Student size-head multiplies on top when active.
+        # Result is clamped into [DEFAULT_RISK_PER_TRADE, MAX_RISK_PER_TRADE]
+        # for funded-compliance.
         rr = tp_dist / sl_dist if sl_dist > EPSILON_SL_DIST else 0.0
-        conf_floor = self.rl_suite.confidence_threshold if self.rl_suite else 0.55
-        min_risk = 0.002    # 0.20%
-        max_risk = 0.015    # 1.50%
+        base_risk = compute_risk_fraction(score)
+        dynamic_risk = base_risk * float(size_multiplier)
+        dynamic_risk = max(DEFAULT_RISK_PER_TRADE, min(dynamic_risk, MAX_RISK_PER_TRADE))
 
-        # Granular linear scaling: conf_floor→1.0 mapped to min_risk→max_risk
-        conf_range = max(1.0 - conf_floor, 0.01)
-        conf_factor = max(0.0, min(1.0, (xgb_confidence - conf_floor) / conf_range))
-        dynamic_risk = min_risk + (max_risk - min_risk) * conf_factor
-        # Apply Student's size multiplier (1.0 when disabled), then clamp.
-        if size_multiplier != 1.0:
-            dynamic_risk = dynamic_risk * float(size_multiplier)
-        dynamic_risk = max(min_risk, min(dynamic_risk, max_risk))
-
+        risk_source = "alignment" if size_multiplier == 1.0 else "alignment+student"
         self.logger.info(
-            "[RISK] %s | conf=%.3f score=%.2f RR=%.1f → risk=%.3f%% (range %.2f%%–%.2f%%)",
-            style.upper(), xgb_confidence, score, rr,
-            dynamic_risk * 100, min_risk * 100, max_risk * 100,
+            "[RISK] %s | source=%s score=%.3f size_mult=%.2f RR=%.1f conf=%.3f"
+            " → risk=%.3f%% (bounds %.2f%%–%.2f%%)",
+            style.upper(), risk_source, score, size_multiplier, rr, xgb_confidence,
+            dynamic_risk * 100,
+            DEFAULT_RISK_PER_TRADE * 100, MAX_RISK_PER_TRADE * 100,
         )
 
         if self.adapter is None:
@@ -5523,6 +5521,16 @@ class LiveMultiBotRunner:
                         rl_suite.check_and_reload_models()
                     except Exception as exc:
                         logger.debug("Model reload check error: %s", exc)
+
+                # Student-Brain reload — all bots share the same StudentBrain
+                # instance, so a single call covers all. Break after first bot.
+                for bot in self.bots:
+                    if bot.student_brain is not None and hasattr(bot.student_brain, "check_and_reload_models"):
+                        try:
+                            bot.student_brain.check_and_reload_models()
+                        except Exception as exc:
+                            logger.warning("Student model reload failed: %s", exc)
+                        break
 
                 # Periodic state persistence (every 60s, crash-safe)
                 # Also export candle buffers for dashboard charts

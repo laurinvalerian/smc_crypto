@@ -86,3 +86,23 @@ def test_asset_commission_is_crypto_only():
         ("replay_adapter.DEFAULT_COMMISSION", ra.DEFAULT_COMMISSION),
     ]:
         assert set(d.keys()) == {"crypto"}, f"{name} should be crypto-only, got {list(d.keys())}"
+
+
+def test_live_bot_no_hardcoded_risk_bounds():
+    """Regression: live_multi_bot must not re-introduce inline risk bounds.
+
+    Track A1 (2026-04-20) replaced the hardcoded 0.002/0.015 block in
+    _execute_bracket_order_with_risk_reduction with a core.sizing SSOT
+    call. This test grep-guards the whole file against the old pattern
+    coming back via a copy-paste or merge.
+    """
+    from pathlib import Path as _P
+    src = _P("live_multi_bot.py").read_text()
+    # Old inline assignments must not reappear anywhere.
+    assert "min_risk = 0.002" not in src, "hardcoded min_risk reappeared"
+    assert "max_risk = 0.015" not in src, "hardcoded max_risk reappeared"
+    # Old module-level duplicates must stay deleted.
+    assert "MIN_DYNAMIC_RISK_PCT" not in src, "MIN_DYNAMIC_RISK_PCT resurrected"
+    assert "MAX_DYNAMIC_RISK_PCT" not in src, "MAX_DYNAMIC_RISK_PCT resurrected"
+    # Old comment header must stay replaced.
+    assert "CONFIDENCE-BASED DYNAMIC RISK" not in src, "old confidence-only header back"

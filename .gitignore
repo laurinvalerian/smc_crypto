@@ -30,8 +30,12 @@ data/
 *.parquet
 *.h5
 
-# Models (regenerable from training)
-models/
+# Models (regenerable from training) — use `models/*` (not `models/`) so
+# code files like student_brain.py can be re-included below. Git refuses to
+# re-include files whose parent directory is itself excluded.
+models/*
+# Exceptions: loader + wrapper code is versioned (the trained .pkl stay ignored).
+!models/student_brain.py
 
 # Binary / data artifacts
 *.pkl

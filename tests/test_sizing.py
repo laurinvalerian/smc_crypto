@@ -111,3 +111,36 @@ def test_max_risk_override_caps_fraction():
         1.0, equity, max_risk_override=0.005
     )
     assert math.isclose(capped, equity * 0.005, abs_tol=1e-9)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Track A1 regression — live_multi_bot must use core.sizing SSOT
+#  (added 2026-04-20; replaces the hardcoded 0.2%-1.5% block that
+#  produced 1.5% unconditional risk when Student/XGB were absent).
+# ═══════════════════════════════════════════════════════════════════
+
+def test_live_bot_uses_core_sizing_import():
+    """live_multi_bot must import compute_risk_fraction from core.sizing.
+
+    Regression guard: if someone reverts to an inline implementation,
+    the import dependency disappears and this test fails loudly.
+    """
+    import live_multi_bot
+    from core.sizing import compute_risk_fraction as _cr
+    assert getattr(live_multi_bot, "compute_risk_fraction", None) is _cr
+
+
+def test_sizing_at_current_live_params_alignment_082():
+    """Pin the exact risk value at the v1.11 evergreen alignment (0.82).
+
+    (0.82 - 0.78) / (1.0 - 0.78) = 0.181818..., so
+    risk = 0.0025 + 0.0075 * 0.181818 = 0.00386363..., i.e. ~0.3864%.
+
+    Before Track A1, the live bot produced 1.5% at every score because
+    the hardcoded conf_factor=1.0 (no model → xgb_confidence=1.0) bypassed
+    alignment entirely. This test pins the post-fix behaviour.
+    """
+    expected = DEFAULT_RISK_PER_TRADE + (MAX_RISK_PER_TRADE - DEFAULT_RISK_PER_TRADE) * (0.04 / 0.22)
+    assert math.isclose(compute_risk_fraction(0.82), expected, rel_tol=1e-9)
+    # Sanity: in [0.3%, 0.4%] window
+    assert 0.003 < compute_risk_fraction(0.82) < 0.004
