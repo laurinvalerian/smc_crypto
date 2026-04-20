@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.live import Live
 
-from core.alignment import CORE_WEIGHTS_CRYPTO
+from core.alignment import CORE_WEIGHTS_CRYPTO, compute_alignment_score
 from rl_brain_v2 import RLBrainSuite
 from models.student_brain import StudentBrain
 from trade_journal import TradeJournal
@@ -1004,9 +1004,11 @@ class PaperBot:
 
         if daily_bias == "neutral":
             direction = "long"
+            comp["daily_bias"] = "neutral"
             return 0.0, direction, comp
 
         direction = "long" if daily_bias == "bullish" else "short"
+        comp["daily_bias"] = daily_bias
 
         # ═══ STEP 2: 4H – Structure + POI (0.08 + 0.08) ═════════
         htf_zones = []
@@ -2162,15 +2164,41 @@ class PaperBot:
             self._pending_signal = None
             return
 
-        # ── Multi-TF alignment score (granular) ───────────────────
-        score, direction, components = self._multi_tf_alignment_score(candle)
-        score -= _vol_penalty  # apply volatility penalty (training has no vol gate)
+        # ── Multi-TF alignment score (granular for features, SSOT for gate) ──
+        # The rich 13-component score (continuous multipliers on zone_quality,
+        # volume_score, D/P penalty, volatility penalty) diverges ~0.07 below
+        # the SSOT formula that the backtest + training parquet use
+        # (strategies/smc_multi_style.py:1651, backtest/generate_rl_data.py).
+        # See .omc/research/alignment_drought_probe.py for the 43205-bar
+        # calibration run showing ~36 projected triggers/day on 30 symbols
+        # under SSOT vs 0 observed under Live-formula over 16h.
+        # Fix: gate on SSOT formula (identical to backtest), keep rich score
+        # as feature for dashboard/XGB context.
+        rich_score, direction, components = self._multi_tf_alignment_score(candle)
+        rich_score -= _vol_penalty  # vol penalty preserved on rich score
+        components["rich_score"] = rich_score
+        _daily_bias = components.get("daily_bias", "neutral")
+        score = compute_alignment_score(
+            daily_bias=_daily_bias,
+            h1_confirms=bool(components.get("h1_confirms")),
+            entry_zone=components.get("entry_zone"),
+            precision_trigger=bool(components.get("precision_trigger")),
+            style_weight=1.0,
+            bias_strong=bool(components.get("bias_strong")),
+            h4_confirms=bool(components.get("h4_confirms")),
+            h4_poi=bool(components.get("h4_poi")),
+            h1_choch=bool(components.get("h1_choch")),
+            volume_ok=bool(components.get("volume_ok")),
+            asset_class=self.asset_class,
+        )
+        components["gate_score"] = score
         if score < self.alignment_threshold:
             _near_miss_floor = max(0.40, self.alignment_threshold - 0.15)
             if score >= _near_miss_floor:
                 self.logger.info(
-                    "NEAR-MISS ALIGNMENT %s | class=%s score=%.3f thresh=%.2f dir=%s | flags=%s",
-                    symbol, self.asset_class, score, self.alignment_threshold, direction,
+                    "NEAR-MISS ALIGNMENT %s | class=%s gate=%.3f rich=%.3f thresh=%.2f dir=%s | flags=%s",
+                    symbol, self.asset_class, score, rich_score,
+                    self.alignment_threshold, direction,
                     {k: v for k, v in components.items() if not k.startswith("_")},
                 )
             self._pending_signal = None

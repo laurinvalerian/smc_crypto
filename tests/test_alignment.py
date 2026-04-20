@@ -317,3 +317,104 @@ def test_core_package_exports_compute_alignment_score():
     import core
     assert core.compute_alignment_score is compute_alignment_score
     assert core.CORE_WEIGHTS_CRYPTO is CORE_WEIGHTS_CRYPTO
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Live-gate SSOT routing (regression for 2026-04-20 signal-drought fix)
+# ════════════════════════════════════════════════════════════════════
+#
+# Before 2026-04-20 the live bot (PaperBot._prepare_signal) gated on the
+# continuous 13-component _multi_tf_alignment_score, while the backtest and
+# training parquet both gated on core.alignment.compute_alignment_score.
+# The continuous multipliers (0.15×zone_quality instead of 0.15, 0.10×
+# volume_score instead of 0.10, plus D/P and volatility penalties) dropped
+# the live score ~0.07 below the SSOT form, causing 0 trades in 16h on 30
+# symbols while SSOT-calibration projected ~24 gate-triggers in the same
+# window. Fix: route live gate through core.alignment.compute_alignment_score.
+# See .omc/research/alignment_drought_probe.py for the empirical evidence.
+
+def test_live_bot_imports_compute_alignment_score():
+    """PaperBot must import compute_alignment_score from core.alignment SSOT."""
+    from live_multi_bot import compute_alignment_score as live_alias
+    assert live_alias is compute_alignment_score
+
+
+def test_live_bot_gate_matches_smc_strategy_gate():
+    """
+    The function used by live gate and the function used by backtest gate
+    must be the same object — no drift, no divergent re-implementation.
+    """
+    from live_multi_bot import compute_alignment_score as live_f
+    from strategies.smc_multi_style import _compute_alignment_score as bt_f
+    assert live_f is bt_f is compute_alignment_score
+
+
+def test_prepare_signal_gate_uses_ssot_not_rich_score():
+    """
+    Regression guard: the fix wired `score` (gate variable) to the SSOT
+    function call, not the continuous rich_score. If someone reverts this,
+    the gate-crossing drought returns. Check by reading the source file.
+    """
+    from pathlib import Path
+    import re
+
+    src = (Path(__file__).resolve().parents[1] / "live_multi_bot.py").read_text()
+    # Find _prepare_signal method body
+    m = re.search(r"def _prepare_signal\(.*?\n(?=    def )", src, re.DOTALL)
+    assert m is not None, "could not locate _prepare_signal in live_multi_bot.py"
+    body = m.group(0)
+
+    # Must contain the SSOT call for the gate.
+    assert "compute_alignment_score(" in body, (
+        "live _prepare_signal must call compute_alignment_score (SSOT gate)"
+    )
+    # Must use `score = compute_alignment_score(...)` as the gate-score bind.
+    assert re.search(r"score\s*=\s*compute_alignment_score\(", body), (
+        "SSOT result must be assigned to `score` (the gate-check variable)"
+    )
+    # Rich score kept separately as a feature; sanity-check it is retained.
+    assert "rich_score" in body, (
+        "rich_score must be preserved for dashboard/XGB features"
+    )
+
+
+def test_gate_score_under_expected_distribution_scenarios():
+    """
+    Sanity scenarios that mimic the 2 observed NEAR-MISS events from
+    2026-04-19/20 (APT score=0.700, INJ score=0.645). With the SSOT formula
+    on the SAME boolean flags, APT should rise closer to the gate — proving
+    the SSOT routing is what unblocks the drought, not any gate-lowering.
+    """
+    # APT NEAR-MISS flags: bias=T, bias_strong=T, h4_confirms=F, h4_poi=T,
+    #   h1_confirms=T, h1_choch=F, entry_zone=exists, precision_trigger=T,
+    #   volume_ok=T
+    # Expected SSOT: 0.12 + 0.08 + 0 + 0.08 + 0.08 + 0 + 0.15 + 0.15 + 0.10 = 0.76
+    apt_like = compute_alignment_score(
+        "bearish", True, {"top": 0.937, "bottom": 0.932}, True,
+        bias_strong=True,
+        h4_confirms=False,
+        h4_poi=True,
+        h1_choch=False,
+        volume_ok=True,
+    )
+    assert math.isclose(apt_like, 0.76, abs_tol=1e-12)
+    # Below 0.78 — still a legitimate reject under SSOT, but 0.76 is closer
+    # than the 0.70 that the continuous live score reported.
+    assert apt_like < 0.78
+
+    # If the same setup had either h4_confirms=True OR h1_choch=True,
+    # the SSOT gate would fire.
+    apt_with_h4 = compute_alignment_score(
+        "bearish", True, {"top": 0.937, "bottom": 0.932}, True,
+        bias_strong=True, h4_confirms=True, h4_poi=True,
+        h1_choch=False, volume_ok=True,
+    )
+    assert apt_with_h4 >= 0.78
+
+    apt_with_choch = compute_alignment_score(
+        "bearish", True, {"top": 0.937, "bottom": 0.932}, True,
+        bias_strong=True, h4_confirms=False, h4_poi=True,
+        h1_choch=True, volume_ok=True,
+    )
+    assert math.isclose(apt_with_choch, 0.82, abs_tol=1e-12)
+    assert apt_with_choch >= 0.78
