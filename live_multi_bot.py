@@ -2167,15 +2167,16 @@ class PaperBot:
         tradeable, daily_atr, fivem_atr = self._check_volatility()
         _vol_penalty = 0.05 if not tradeable else 0.0
 
-        # ── Volume filter (basic pre-check – detailed scoring in alignment) ─
-        # Quick reject if volume is clearly dead (< 0.5x avg)
-        # The full 3-layer volume scoring happens in _multi_tf_alignment_score
-        volumes = [c["volume"] for c in buf[-20:]]
-        avg_vol = sum(volumes) / len(volumes) if volumes else 0.0
-        if avg_vol > 0 and candle["volume"] < 0.5 * avg_vol:
-            PaperBot._prefilter_stats["volume_too_low"] += 1
-            self._pending_signal = None
-            return
+        # NOTE 2026-04-20: The 0.5×avg(20) volume pre-filter that used to live
+        # here was removed as part of the Backtest/Live parity restore. The
+        # backtest path (strategies/smc_multi_style.py) has no such hard gate
+        # — it uses only the binary `volume_ok` flag inside the alignment
+        # score (weight 0.10). On live Binance Testnet the 0.5×avg threshold
+        # was rejecting ~95 % of candles before they ever reached the SSOT
+        # gate (PREFILTER-STATS: vol_low=57/60 within 5 min of the first
+        # heartbeat after the SSOT-routing fix). Volume quality is already
+        # captured by the continuous `volume_ok` / volume_score inside
+        # _multi_tf_alignment_score + compute_alignment_score.
 
         # ── Multi-TF alignment score (granular for features, SSOT for gate) ──
         # The rich 13-component score (continuous multipliers on zone_quality,
