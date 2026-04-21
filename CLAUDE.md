@@ -41,22 +41,30 @@ Crypto-Only Trading Bot basierend auf Smart Money Concepts (SMC/ICT) auf Binance
 ```
 5m Candle → _prepare_signal() → Circuit Breaker → Volatility/Volume Gates
   → Discount/Premium Filter → Alignment Score (0.0-1.0)
-  → alignment ≥ 0.78? → Student/XGB Gate → Confidence-Sizing → Bracket Order
+  → alignment ≥ 0.78? → (Student/RL Gates ALL DISABLED 2026-04-20) → Confidence-Sizing → Bracket Order
 ```
 
 Vollständiger Signal-Flow: siehe `@agents/smc-strategist.md`. Phase 2.1 ✅ hat `core/alignment.py` als Single Source of Truth etabliert (Tag `v1.3-ssot-alignment`).
 
-### Gate + Sizing (no tiers, 2026-04-19)
+### Gate + Sizing (strict Backtest/Live parity, 2026-04-20)
 
 - **Einziger Entry-Gate**: `alignment_score ≥ 0.78` + `rr ≥ 2.0`
 - **Risk-Sizing linear**: `core/sizing.py::compute_risk_fraction(score)`
   - At score 0.78 → 0.25% of equity (`DEFAULT_RISK_PER_TRADE`)
   - At score 1.00 → 1.00% of equity (`MAX_RISK_PER_TRADE`)
-  - Linear interpolation dazwischen (2026-04-19: lowered from 0.5%/1.5% for Scalp-Day Hybrid more-trades regime)
-- **Live-Multiplikator**: Student size-Head Prediction (clamped zu `size_floor/size_cap`)
-- **Backtest**: `student_size_multiplier = 1.0`, sonst identisch
+  - Linear interpolation dazwischen
+- **BE-Manager**: fixed `be_ratchet_r = 2.5` (evergreen param, kein ML)
+- **ML-Brain (Student, RL-Suite, BE-Manager-ML, DQN)**: **NICHT AKTIV in Backtest noch Live** seit Commit `b0a58d5` (2026-04-20). `backtest/wf_bruteforce.py` importiert keinen Student/RLBrainSuite — verifiziert 2026-04-21 via grep. Das "Training" im Evergreen-Backtest = Bruteforce-Grid-Search über SMC-Parameter, OOS-validated (PBO/CPCV/DSR gates), **kein ML-Model**.
+- **Paper-Validation** spiegelt damit exakt was der Evergreen-Backtest validiert hat.
 
-**History**: AAA++/AAA+ Tier-System (2026-04-18 konsolidiert auf 0.78/0.88 Schwellen) am 2026-04-19 komplett entfernt — redundant zu Student size-Head + linear scaling.
+**Roadmap für ML-Brain Reaktivierung**: siehe `.omc/plans/student-brain-integration.md`. Student darf NIEMALS Live aktiv sein bevor `wf_bruteforce.py` ihn integriert hat und joint-backtest (SMC-only vs Student-gated) in ALLEN 3 WF-Windows PF-Uplift zeigt.
+
+**History**:
+- AAA++/AAA+ Tier-System am 2026-04-19 komplett entfernt — redundant zu linear scaling.
+- Student-Brain v1 am 2026-04-20 QA-failed (entry AUC 0.630 < 0.70) → archived.
+- Alle RL-Gates am 2026-04-20 (`b0a58d5`) disabled für strict parity.
+- Live-style-filter am 2026-04-20 (`2436e9e`) entfernt — hätte 63% der profitablen Backtest-Setups geblockt.
+- paper_only Adapter am 2026-04-21 (`053a7fa`) mit SL/TP-Trigger-Simulation + ghost_exit fix.
 
 ## Roadmap (Crypto-Only Refocus)
 
