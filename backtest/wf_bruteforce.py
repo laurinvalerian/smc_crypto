@@ -54,6 +54,17 @@ import yaml
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
+# Student Brain integration (Phase 1 of student-brain-integration.md, 2026-04-21).
+# Optional — only loaded when the caller opts in via --with-student MODEL_DIR.
+# When absent, the evergreen bruteforce is bit-identical to v1.11-robustness-plus
+# (regression guard). See tests/test_wf_student_gate.py.
+try:
+    from models.student_brain import StudentBrain as _StudentBrain
+    _STUDENT_BRAIN_AVAILABLE = True
+except Exception:
+    _StudentBrain = None  # type: ignore
+    _STUDENT_BRAIN_AVAILABLE = False
+
 from strategies.smc_multi_style import SMCMultiStyleStrategy, TradeSignal
 from filters.trend_strength import compute_adx, check_momentum_confluence
 from filters.volume_liquidity import compute_volume_score
@@ -1107,16 +1118,123 @@ ASSET_SLIPPAGE: dict[str, float] = {"crypto": SLIPPAGE}
 #  OOS evaluation, stability, cross-window validation)
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════
+#  Student Brain integration helpers (2026-04-21, Phase 1)
+# ═══════════════════════════════════════════════════════════════════
+
+def _load_student_brain(model_dir: str | None):
+    """Load a StudentBrain instance from ``model_dir`` (or return None).
+
+    Accepts any directory containing student_{entry,sl,tp,size}.pkl.
+    The StudentBrain class itself validates schema_version and will log
+    warnings + disable on mismatch — we propagate that state up.
+    """
+    if not model_dir or not _STUDENT_BRAIN_AVAILABLE:
+        return None
+    cfg = {"student_brain": {"enabled": True, "models_dir": str(model_dir),
+                              "accept_threshold": 0.55, "min_rr": 1.5,
+                              "sl_floor": 1.0, "sl_cap": 3.0,
+                              "tp_floor": 0.5, "tp_cap": 10.0,
+                              "size_floor": 0.5, "size_cap": 2.0}}
+    try:
+        sb = _StudentBrain(cfg)
+        if not sb.enabled:
+            logger.warning(
+                "Student from %s loaded but disabled (missing heads / schema mismatch). "
+                "Bruteforce will run SMC-only.",
+                model_dir,
+            )
+            return None
+        logger.info("Student-Brain loaded from %s (schema v%s)", model_dir,
+                    sb.schema_version)
+        return sb
+    except Exception as exc:
+        logger.error("Student-Brain load failed (%s) — falling back to SMC-only",
+                     exc)
+        return None
+
+
+def _student_features_from_signal(sig: TradeSignal) -> dict[str, float]:
+    """Convert TradeSignal.meta into the 42-feature dict StudentBrain expects.
+
+    Phase 1 limitation: only the SMC-component flags stored in sig.meta are
+    populated. ATR/RSI/EMA/volume_ratio are 0.0 placeholders until Phase 1.5
+    ports the full feature-extractor into the signal pipeline. The Student
+    has graceful degradation for zero-vectors (entry_prob → low) — this
+    means Student in Phase 1 is *conservative by default*, which is the
+    right direction while the integration matures.
+    """
+    meta = dict(sig.meta or {})
+
+    # Cast bools/ints from meta to float; default 0.0 for missing keys.
+    def _f(k: str, default: float = 0.0) -> float:
+        v = meta.get(k)
+        if v is None:
+            return float(default)
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(default)
+
+    return {
+        # Structural direction (causal SMC): meta carries flags, not signed ints
+        "struct_1d": _f("struct_1d"), "struct_4h": _f("struct_4h"),
+        "struct_1h": _f("struct_1h"), "struct_15m": _f("struct_15m"),
+        "struct_5m": _f("struct_5m"),
+        # Break decay
+        "decay_1d": _f("decay_1d"), "decay_4h": _f("decay_4h"),
+        "decay_1h": _f("decay_1h"), "decay_15m": _f("decay_15m"),
+        "decay_5m": _f("decay_5m"),
+        # Premium/discount
+        "premium_discount": _f("premium_discount"),
+        # Component flags
+        "h4_confirms": _f("h4_confirms"), "h4_poi": _f("h4_poi"),
+        "h1_confirms": _f("h1_confirms"), "h1_choch": _f("h1_choch"),
+        "precision_trigger": _f("precision_trigger"),
+        "volume_ok": _f("volume_ok"),
+        # Placeholders: bar-buffer-derived features not yet in meta (Phase 1.5)
+        "ema20_dist_5m": 0.0, "ema50_dist_5m": 0.0,
+        "ema20_dist_1h": 0.0, "ema50_dist_1h": 0.0,
+        "atr_5m_norm": 0.0, "atr_1h_norm": 0.0, "atr_daily_norm": 0.0,
+        "rsi_5m": 0.5, "rsi_1h": 0.5,
+        "volume_ratio": _f("volume_ratio", 1.0), "adx_1h": _f("adx_value", 20.0) / 50.0,
+        # Time encoding
+        "hour_sin": _f("hour_sin"), "hour_cos": _f("hour_cos"),
+        # SMC counters
+        "fvg_bull_active": _f("fvg_bull_active"), "fvg_bear_active": _f("fvg_bear_active"),
+        "ob_bull_active": _f("ob_bull_active"), "ob_bear_active": _f("ob_bear_active"),
+        "liq_above_count": _f("liq_above_count"), "liq_below_count": _f("liq_below_count"),
+        # Symbol ranks / class id (Phase 1.5: load from symbol_ranks.json)
+        "symbol_volatility_rank": 0.5, "symbol_liquidity_rank": 0.5,
+        "symbol_spread_rank": 0.5,
+        "asset_class_id": 0.0,  # crypto = 0 in ENTRY_QUALITY schema
+        # Style = day in Scalp-Day Hybrid
+        "style_id": 0.5,
+        # Alignment score — the SSOT input, always present
+        "alignment_score": float(sig.alignment_score),
+    }
+
+
 def _simulate_with_params(
     params: dict[str, Any],
     precomputed_signals: list[TradeSignal],
     config: dict[str, Any],
     symbol_to_asset: dict[str, str] | None = None,
+    student_brain: Any = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """
     Filter precomputed signals with params, simulate trades, return (trades_df, metrics).
 
     This consolidates the repeated pattern from objective, OOS eval, and stability check.
+
+    ``student_brain`` (Phase 1, 2026-04-21): when provided, an additional entry
+    gate runs after the alignment+rr filter. Signals the Student rejects
+    (entry_prob < accept_threshold) are skipped — letting the bruteforce
+    produce a side-by-side SMC-only vs SMC+Student report. When None, behavior
+    is bit-identical to the v1.11-robustness-plus baseline (regression-guarded
+    by tests/test_wf_student_gate.py).
     """
     alignment_th = params.get("alignment_threshold", 0.65)
     min_rr = params.get("risk_reward", 2.0)
@@ -1130,11 +1248,21 @@ def _simulate_with_params(
 
     # Filter signals
     filtered: list[TradeSignal] = []
+    student_rejects = 0
     for sig in precomputed_signals:
         if sig.alignment_score < alignment_th:
             continue
         if sig.risk_reward < min_rr:
             continue
+        if student_brain is not None:
+            try:
+                pred = student_brain.predict(_student_features_from_signal(sig))
+                if not pred.accept:
+                    student_rejects += 1
+                    continue
+            except Exception as exc:
+                logger.debug("Student predict failed for %s: %s — passing through",
+                             sig.symbol, exc)
         filtered.append(TradeSignal(
             timestamp=sig.timestamp, symbol=sig.symbol,
             direction=sig.direction, style=sig.style,
@@ -1144,6 +1272,15 @@ def _simulate_with_params(
             leverage=leverage,
             alignment_score=sig.alignment_score, meta=sig.meta,
         ))
+    if student_brain is not None:
+        logger.info(
+            "Student gate: %d/%d signals accepted (%d rejected by Student)",
+            len(filtered), len(precomputed_signals) - student_rejects - (
+                sum(1 for s in precomputed_signals
+                    if s.alignment_score < alignment_th or s.risk_reward < min_rr)
+            ),
+            student_rejects,
+        )
 
     if not filtered:
         return pd.DataFrame(), compute_metrics(pd.DataFrame(), account_size=account_size)
